@@ -3,7 +3,7 @@
 > 面向「半年后回来看」而写：**记录的重点是为什么这么做，以及踩过哪些坑**。
 > 代码怎么写看代码，本文档只讲代码里看不出来的判断依据。
 >
-> 最后更新：2026-08-28（v0.1 骨架完成，instruments 全量 + bar 抽试）
+> 最后更新：2026-08-28（v0.1：ETL 骨架 + instruments 全量 + bar 同步器）
 > 相关：[ROADMAP.md](ROADMAP.md) · [SCHEMA.md](SCHEMA.md) · [v0.0 探针结论](probe/REPORT-v0.0.md)
 
 ---
@@ -43,6 +43,7 @@ C1（未来函数防护）与 C5（可复现性）。
 | `etl/sources/external.py` | 非 Python 数据源的接入（见 [ingest/README.md](../ingest/README.md)） |
 | `etl/build_instruments.py` | 构建 instruments + calendar（全量） |
 | `etl/build_bars.py` | 构建 bar + adj_factor（抽试 / 全量），含质检 |
+| `etl/sync_bars.py` | **bar 全量拉取与每日增量**，断点续跑、并发、自愈、逐年质检 |
 | `etl/dump.py` | 查看 Parquet 内容，还原定点与枚举 |
 
 ---
@@ -58,6 +59,14 @@ python etl/build_instruments.py
 
 # 行情抽试：40 只个股（含 10 只已退市）+ 20 只 ETF
 python etl/build_bars.py --stocks 40 --etfs 20 --start 2018-01-01
+
+# --- 行情同步（全量 / 每日增量，同一个入口） ---
+python etl/sync_bars.py --limit 8            # 试跑 8 只
+python etl/sync_bars.py --workers 12         # 全量或增量（按状态自动判断）
+python etl/sync_bars.py --status             # 查看进度
+python etl/sync_bars.py --retry-failed       # 重试失败标的
+python etl/sync_bars.py --compact            # 合并分片并去重
+python etl/sync_bars.py --verify             # 逐年质检
 
 # 查看数据
 python etl/dump.py instruments --where "board==3" --limit 10
@@ -250,13 +259,14 @@ date        open   high   low   close  preclose  volume  amount  turn  tradestat
 | 2 | ETF `preclose` 由前一日 close 补齐 | 除权日的 ETF 涨跌停判定会失真 | 同上，依赖 #1 |
 | 3 | ETF `turn` 恒为 0 | 新浪不提供流通份额；用换手率的策略不可用于 ETF | 需在 Web 端提示 |
 | 4 | ETF `board` 统一记为主板 | 跟踪创业板/科创板指数的 ETF 实为 20% 涨跌停 | v0.2 由 Market 模块按类别配置 |
-| 5 | `is_st` 个别日期存疑 | 抽试中 82279 行里 2 行越界（002214，2026-07-09/10） | 见下 |
-| 6 | 标的名称不做时变 | 回看历史报告显示当前名称 | 已确认接受 |
+| 5 | 标的名称不做时变 | 回看历史报告显示当前名称 | 已确认接受 |
 
-关于 #5：002214 大立科技 `is_st=1` 连续 308 个交易日，其中 **306 天严格守在
-±5% 内**，说明标记本身是对的。越界的 2 天成交量是平时的 3 倍，
-更像是 **ST 状态变更日**（ST ↔ *ST 转换当日的涨跌幅规则）这条尚未建模的规则，
-而非数据错误。占比 0.002%，记录待查，不强行修数据。
+> **已澄清**：早前把 `is_st` 列为「数据存疑」是**误判**。
+> 当时观察到 002214 大立科技在 2026-07-09/10 的涨跌幅超出 ST 的 5% 限制，
+> 疑为数据错误；扩大样本后发现越界全部集中在 2026-07-06 之后且涉及多只 ST 股，
+> 查证确认是**规则变更**而非数据问题（见 6.6）。`is_st` 字段本身可信。
+>
+> 教训：单只标的的 2 行异常不足以判断数据源质量，**先扩样本再下结论**。
 
 ---
 
