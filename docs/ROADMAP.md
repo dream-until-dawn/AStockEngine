@@ -254,18 +254,20 @@ Go 写 → Python 读（含可空/布尔/字符串字段）、`CGO_ENABLED=0` �
 A 股专用 schema 大 **2.0%**（356 MB vs 349 MB），跨市场兼容近乎免费，
 因此**直接采用统一 schema，不做 A 股专用版**。
 
-#### 层 1：bar 核心 9 列 —— 全市场严格统一
+#### 层 1：bar 核心 10 列 —— 全市场严格统一
 
 ```
-instrument_id  uint32    引擎内部 ID，非 symbol
-ts             int64     UTC 毫秒，bar 的结束时刻
+instrument_id  int32     引擎内部 ID，非 symbol
+ts_open        int64     UTC 毫秒，bar 起始时刻（策略侧不得使用）
+ts_close       int64     UTC 毫秒，bar 结束时刻（时间游标用此列）
 trading_day    int32     YYYYMMDD，业务语义的交易日
 open/high/low/close  int64   定点整数
 volume         int64     定点整数
 amount         int64     计价币种最小单位
 ```
 
-引擎核心循环只读这 9 列，其名称与语义**不可变更**。
+引擎核心循环只读这 10 列，其名称与语义**不可变更**。
+逐字段定义见 [SCHEMA.md](SCHEMA.md)。
 
 #### 层 2：市场特定列 —— 直接附于同表
 
@@ -301,7 +303,8 @@ instruments 仅数万行，全量载入内存后解析 JSON 无性能顾虑，
 |---|---|
 | 价格用 **int64 定点**而非 float64 | **不是为了体积**（实测仅省 6%），而是约束 C5 可复现性：浮点累加顺序不同结果不同，并发海选下无法保证逐笔一致。加密还需跨 13 个数量级的精度 |
 | `price_scale` / `qty_scale` 存于 instruments | A 股 1e3 够用，加密需 1e8；每标的自带 scale，引擎按标的解释 |
-| `ts` 与 `trading_day` **都存** | `ts` 用于跨市场对齐、加密 24×7、美股夏令时；`trading_day` 用于业务语义。delta 编码后冗余代价近乎为零 |
+| `ts_open` / `ts_close` **两端都存** | 数据源惯例相反（Binance kline `[0]` 与 OKX `ts` 均为**开始时刻**），而引擎的时间游标需要的是「信息可得时刻」= 结束时刻。只存一端就要推导另一端，而 A 股日线时长非固定时段（含午休），推导正是未来函数 off-by-one 的高发处。用**字段名**消除歧义，实测代价 +1.22% |
+| `trading_day` 与时间戳并存 | 时间戳用于跨市场对齐、加密 24×7、美股夏令时；`trading_day` 用于业务语义。delta 编码后冗余代价近乎为零 |
 | 用 `instrument_id` 而非 symbol | 跨市场 symbol 会冲突；4 字节整数比字符串 cache 友好，实测反而净省空间 |
 
 ### 明确不纳入数据 schema 的三项
