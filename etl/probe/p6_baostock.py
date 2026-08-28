@@ -124,26 +124,34 @@ def main() -> None:
 
     probe.check("bs.pit_universe", "历史某日的 point-in-time 股票池", point_in_time_universe)
 
-    def minute_depth():
-        """分钟线深度——对应 v0.5。BaoStock 无 1 分钟，最细为 5 分钟。"""
+    def minute_capability():
+        """分钟线能力**登记**（非深度测量）。
+
+        A 股范围已明确只做日线，分钟线是远期其他市场（美股/日经/加密）的需求。
+        这里只用一个极小窗口确认接口存在与字段形态，供将来选型时参考；
+        全历史深度测量成本高且当前无用，不做。
+        """
         out = {}
-        for freq in ("5", "15", "30", "60"):
+        for freq in ("5", "60"):
             rs = bs.query_history_k_data_plus(
                 "sh.600519", MINUTE_FIELDS,
-                start_date="2015-01-01", end_date="2026-08-28",
+                start_date="2026-08-03", end_date="2026-08-28",
                 frequency=freq, adjustflag="3",
             )
             df = _to_df(rs)
             out[f"{freq}min"] = {
                 "error_code": rs.error_code,
                 "rows": int(len(df)),
-                "earliest": str(df["date"].iloc[0]) if len(df) else None,
-                "latest": str(df["date"].iloc[-1]) if len(df) else None,
+                "columns": list(df.columns),
+                "head": df.head(1).to_dict(orient="records"),
             }
-        deep = sum(1 for v in out.values() if v["rows"] > 10000)
-        return {"by_freq": out, "deep_freqs": deep, "ok": deep > 0}
+        return {
+            "by_freq": out,
+            "note": "BaoStock 最细为 5 分钟，无 1 分钟；A 股当前范围不使用",
+            "ok": any(v["rows"] > 0 for v in out.values()),
+        }
 
-    probe.check("bs.minute_depth", "分钟线历史深度（5/15/30/60）", minute_depth)
+    probe.check("bs.minute_capability", "分钟线接口能力登记（不测深度）", minute_capability)
 
     def calendar_and_dividend():
         rs_cal = bs.query_trade_dates(start_date="2015-01-01", end_date="2026-12-31")
