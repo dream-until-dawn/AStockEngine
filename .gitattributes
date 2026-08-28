@@ -1,0 +1,10 @@
+# 统一换行符：仓库内一律 LF，检出时由 core.autocrlf 决定
+* text=auto eol=lf
+
+# 二进制/数据文件不做换行转换
+*.png binary
+*.jpg binary
+*.xlsx binary
+*.parquet binary
+*.pkl binary
+*.h5 binary
