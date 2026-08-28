@@ -131,7 +131,7 @@ v0.0 实测证据（详见 `docs/probe/REPORT-v0.0.md` 2.3）：
 若用 `close.shift(1)` 推导涨跌停价，Broker 会在每个大比例送转的除权日
 误判「跌停不能卖 / 涨停不能买」。大比例送转每年都有，不是边缘情况。
 
-→ `bar_daily` 必须存 `preclose` 字段。
+→ `bar` 表必须存 `preclose` 字段（A 股扩展列）。
 
 ### C9. 数据源与市场的独立性
 
@@ -153,7 +153,7 @@ T+0 交收、做空、无涨跌停、24×7 连续交易、非整数最小交易�
 
 引擎只消费量价数据。不采集、不存储、不计算市盈率、市净率、财报等基本面字段。
 
-这一约束同时作用于 schema（`bar_daily` 不含估值列）、ETL（不拉财务接口）
+这一约束同时作用于 schema（`bar` 表不含估值列）、ETL（不拉财务接口）
 与策略层（不应出现基本面信号）。
 
 ---
@@ -215,6 +215,157 @@ Go 的 `plugin` 包**在 Windows 上完全不支持**，且要求主程序与插
 
 ---
 
+## 数据存储设计
+
+### 选型：本地 Parquet 文件，不引入数据库
+
+依据 v0.0 的 P8 / P9 基准（30.7 万行真实样本，详见 `docs/probe/REPORT-v0.0.md`）。
+
+**理由是访问模式，不是体积。** 回测不做随机点查，而是「一次加载、反复顺序扫描」：
+全市场 2000 万行日线约 **350 MB**，载入内存后所有访问都是指针运算。
+数据库的索引、事务、MVCC、连接池在这个场景全是纯开销。
+
+更关键的是海选场景：**N 个 worker 共享同一份只读内存数据，零拷贝** ——
+这是 Go 相对 Python 的核心优势，数据放进数据库这个优势就消失了。
+
+同时 Parquet 是云上一等公民：对象存储直接放，DuckDB / Athena / BigQuery / Spark
+都能直查，支持 range request 按行组读取，Hive 分区被普遍识别。
+
+### 实测结论
+
+| 变体 | 字节/行 | 全市场外推 | vs 基线 |
+|---|---|---|---|
+| **定点整数 + DELTA_BINARY_PACKED + zstd** | **18.30** | **349 MB** | 0.61x |
+| 定点整数 + zstd(L9) | 22.64 | 432 MB | 0.76x |
+| 定点整数 + zstd(L3) | 23.03 | 439 MB | 0.77x |
+| float64 + zstd | 24.52 | 468 MB | 0.82x |
+| float64 + snappy | 29.77 | 568 MB | 1.00x |
+
+跨语言链路三个方向全部实测通过：Python 写 → Go 读（6/6 变体校验和一致）、
+Go 写 → Python 读（含可空/布尔/字符串字段）、`CGO_ENABLED=0` 编译通过。
+
+**保守子集原则**：只用各语言实现都成熟支持的压缩（zstd）与编码
+（dictionary / plain / RLE / DELTA_BINARY_PACKED，后者已实测 Go 可读）。
+不为多省几个百分点使用冷门编码 —— 那正是跨语言兼容性出问题的地方。
+
+### 跨市场统一 schema
+
+范围要求兼容远期的美股、期货、加密货币。P9 实测：统一 schema 仅比
+A 股专用 schema 大 **2.0%**（356 MB vs 349 MB），跨市场兼容近乎免费，
+因此**直接采用统一 schema，不做 A 股专用版**。
+
+#### 层 1：bar 核心 9 列 —— 全市场严格统一
+
+```
+instrument_id  uint32    引擎内部 ID，非 symbol
+ts             int64     UTC 毫秒，bar 的结束时刻
+trading_day    int32     YYYYMMDD，业务语义的交易日
+open/high/low/close  int64   定点整数
+volume         int64     定点整数
+amount         int64     计价币种最小单位
+```
+
+引擎核心循环只读这 9 列，其名称与语义**不可变更**。
+
+#### 层 2：市场特定列 —— 直接附于同表
+
+```
+ashare  : + preclose, turn, tradestatus, is_st
+us      : + preclose, pre_market_volume
+futures : + open_interest, settlement
+crypto  : + funding_rate
+```
+
+该方案的前提「Go 可用仅含核心列的 struct 读取扩展列文件」已由
+`engine/cmd/subsetread` 实测验证通过，因此**无需拆分扩展表做 join**
+（分表方案实测多占 1.3% 体积且读取更复杂）。
+
+Go 侧对应两个 struct：`CoreBar`（跨市场通用）与 `AShareBar`（含扩展列）。
+
+#### 层 3：instruments —— 统一列 + `attrs` JSON
+
+```
+instrument_id, market, symbol, name, type,
+price_scale, qty_scale, quote_ccy,
+list_date, delist_date, board,
+attrs  string(JSON)   市场特定属性
+```
+
+`attrs` 承载期货的到期日与合约乘数、加密的基础币种与合约类型。
+instruments 仅数万行，全量载入内存后解析 JSON 无性能顾虑，
+换来的是 **schema 稳定：新增市场不改表结构**。
+
+### 关键类型决策
+
+| 决策 | 理由 |
+|---|---|
+| 价格用 **int64 定点**而非 float64 | **不是为了体积**（实测仅省 6%），而是约束 C5 可复现性：浮点累加顺序不同结果不同，并发海选下无法保证逐笔一致。加密还需跨 13 个数量级的精度 |
+| `price_scale` / `qty_scale` 存于 instruments | A 股 1e3 够用，加密需 1e8；每标的自带 scale，引擎按标的解释 |
+| `ts` 与 `trading_day` **都存** | `ts` 用于跨市场对齐、加密 24×7、美股夏令时；`trading_day` 用于业务语义。delta 编码后冗余代价近乎为零 |
+| 用 `instrument_id` 而非 symbol | 跨市场 symbol 会冲突；4 字节整数比字符串 cache 友好，实测反而净省空间 |
+
+### 明确不纳入数据 schema 的三项
+
+1. **交易规则**（涨跌停、T+1、保证金、最小变动价位）→ 属 `configs/market/*.json`，是 Market 模块配置
+2. **复权因子** → 仅对股票 / ETF 有意义。期货的「主力连续」是拼接规则生成的**派生数据**，应作为独立合成标的，与复权无关
+3. **多空与杠杆** → 属 Portfolio / Broker 模块
+
+### 目录布局
+
+`data/` 不进 git，因此布局由代码定义、可一键重建 ——
+**单一事实源是 [`etl/layout.py`](../etl/layout.py)**，各处不得硬编码路径字符串。
+
+```
+data/                                     gitignored
+├── bar/market=ashare/freq=1d/year=YYYY/  行情，Hive 分区
+├── meta/                                 元数据表（Parquet + CSV 镜像）
+│   ├── instruments.parquet  + .csv
+│   ├── calendar.parquet     + .csv
+│   ├── adj_factor.parquet   + .csv
+│   └── corporate_action.parquet + .csv
+├── results/                              海选结果，Go 引擎写入
+│   └── equity/                           净值曲线分片
+├── snapshots/                            引擎状态快照（v0.4）
+└── cache/                                ETL 中间缓存，可安全删除
+configs/                                  进 git
+├── fee/  market/  strategy/
+```
+
+一键重建：
+
+```bash
+python etl/layout.py
+```
+
+### CSV 镜像规则
+
+**元数据表同时输出 CSV 镜像**：Parquet 为权威副本，CSV 仅供人眼检查与 diff。
+
+- 适用范围：仅 `META_TABLES` 四张元数据表；bar 表体量 2000 万行级，**不做镜像**
+- **任何程序都不得读取 CSV** —— 它是调试产物，不是数据接口
+- 由 `etl/layout.py: write_meta()` 统一写出，避免各处各写一份
+
+### 数据源与格式的分界
+
+```
+数据源 ETL 产出  →  Parquet   （data/，gitignored）
+人手写的配置     →  JSON      （configs/，进 git）
+```
+
+配置用 JSON 而非 YAML：Go 标准库原生支持，无需第三方库；
+且 v0.3 的 ParamSpec 需生成 JSON Schema 供 Web 端表单使用，格式统一。
+
+### 一个被省掉的表
+
+原计划的 point-in-time 股票池表**不需要**：BaoStock 停牌日照常返回行，
+因此 `bar` 表本身即是 point-in-time 的 ——
+`某日股票池 = SELECT DISTINCT instrument_id FROM bar WHERE trading_day = d`。
+上市前无行、退市后无行、停牌有行且 `tradestatus=0`，语义完整。
+
+若按每日快照单独存表，7200 × 8000 天 ≈ **5760 万行，比 bar 表还大**，纯浪费。
+
+---
+
 ## 版本排期
 
 标记：⭐ 关键路径（做错要返工） · 🔗 依赖前置版本
@@ -240,22 +391,26 @@ ETF 复权无来源（v0.1 待收口）。
 **目标**：拿到干净、可复现、含退市股与 ETF 的本地日线数据集。
 
 - 数据源适配器接口（BaoStock + 新浪两个实现，验证 C9 的可换性）
-- Schema 定义（5 张表，纯技术面，无估值/财务列）：
-  - `instruments` — 标的信息：代码、名称、**类型（个股/ETF）**、上市日、退市日、板块
+- 落地「数据存储设计」一节定义的 schema（1 张 bar 表 + 4 张元数据表，
+  纯技术面，无估值 / 财务列）：
+  - `bar` — 核心 9 列 + A 股扩展列（`preclose` / `turn` / `tradestatus` / `is_st`）
+  - `instruments` — 统一列 + `attrs` JSON；含 `price_scale` / `qty_scale`
   - `calendar` — 交易日历
-  - `bar_daily` — 日线：OHLCV、成交额、换手率、**`preclose`**、**`tradestatus`**、**`isST`**
-  - `adj_factor` — 复权因子（事件式，见 C2；因子以字符串/Decimal 存储保精度）
+  - `adj_factor` — 复权因子（事件式，见 C2；以 Decimal 解析保 16 位精度）
   - `corporate_action` — 分红送配
-- 分区布局：日线按 `year=`
+- 编码：定点整数 + `DELTA_BINARY_PACKED` + zstd；分区 `market=/freq=/year=`
+- 元数据表输出 CSV 镜像（`etl/layout.py: write_meta()`）
 - 增量更新 + 断点续传 + 限流退避
 - 数据质量校验器：缺失交易日、价格跳变、复权因子突变、量价矛盾、
-  **ETF 字段不一致**（新浪部分标的缺 `prevclose`）
+  **ETF 字段不一致**（新浪部分标的缺 `prevclose`）、
+  **退市股双源交叉核对**（BaoStock 337 只 vs AkShare 名单 367 只，见报告第 4 节）
 - 🟡 **收口项**：ETF 复权方案
 
 > 停牌不再需要独立表 —— BaoStock 的 `tradestatus` 已覆盖，且停牌日照常返回行，
-> 日线表可直接与交易日历对齐。
+> bar 表可直接与交易日历对齐，同时天然具备 point-in-time 语义。
 
-**验收**：一条命令拉取全量 A 股个股 + ETF 日线落 Parquet，并产出质量报告。 **量级 L**
+**验收**：一条命令拉取全量 A 股个股 + ETF 日线落 Parquet，产出质量报告；
+Go 侧用 `CoreBar` struct 能正确读回。 **量级 L**
 
 ---
 
