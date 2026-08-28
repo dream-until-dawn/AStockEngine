@@ -13,6 +13,13 @@ Parquet 是二进制，无法 `cat`。元数据表虽有 CSV 镜像，但 bar �
 
 from __future__ import annotations
 
+# 依赖检查必须先于第三方包导入 —— 用错解释器时失败点会落在 import pandas，
+# 报出的栈掩盖真正原因。见 etl/_venv_guard.py
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+import _venv_guard  # noqa: F401,E402
+
 import argparse
 import sys
 from pathlib import Path

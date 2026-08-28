@@ -29,6 +29,13 @@
 
 from __future__ import annotations
 
+# 依赖检查必须先于第三方包导入 —— 用错解释器时失败点会落在 import pandas，
+# 报出的栈掩盖真正原因。见 etl/_venv_guard.py
+import sys as _sys
+from pathlib import Path as _Path
+_sys.path.insert(0, str(_Path(__file__).resolve().parent))
+import _venv_guard  # noqa: F401,E402
+
 import argparse
 import json
 import logging
@@ -247,8 +254,16 @@ def build_tasks(inst: pd.DataFrame, state: dict, args) -> tuple[list[dict], list
             continue
 
         prev_last = int(st.get("last_day", 0))
+        synced = int(st.get("synced_through", 0))
+
+        # 用「已同步到哪一天」而非「最后一根 bar 的日期」判断是否需要更新。
+        # 二者对在市标的等价，但对已退市 / 长期停牌的标的不等价 ——
+        # 退市股的 last_day 永远停在退市日，若以它为准则每次增量都会被重拉。
+        if synced >= end_ymd:
+            skipped += 1
+            continue
+
         if prev_last:
-            # 增量：从已有数据的次日开始
             nxt = sc.int_to_date(prev_last) + timedelta(days=1)
             start = nxt.strftime("%Y-%m-%d")
             if int(nxt.strftime("%Y%m%d")) > end_ymd:
@@ -300,9 +315,15 @@ def run_group(tasks: list[dict], kind: str, workers: int, state: dict,
                 failed += 1
                 log.warning("失败 %s: %s", res["symbol"], res["error"][:160])
 
+            prev = state["instruments"].get(str(res["iid"]), {})
             state["instruments"][str(res["iid"])] = {
                 "symbol": res["symbol"], "status": res["status"],
-                "last_day": res["last_day"], "rows": res["rows"],
+                # last_day 只增不减：本轮无新数据时保留既有值
+                "last_day": max(int(res["last_day"] or 0), int(prev.get("last_day", 0))),
+                # 成功即记为已同步至本轮 end，失败则保留原值以便下轮重试
+                "synced_through": (int(args.end.replace("-", "")) if res["status"] == "done"
+                                   else int(prev.get("synced_through", 0))),
+                "rows": int(prev.get("rows", 0)) + res["rows"],
                 "attempts": res["attempts"], "error": res["error"],
                 "updated_at": datetime.now().isoformat(timespec="seconds"),
             }

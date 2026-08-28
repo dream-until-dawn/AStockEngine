@@ -50,28 +50,35 @@ C1（未来函数防护）与 C5（可复现性）。
 
 ## 3. 常用命令
 
-```bash
+> ⚠️ **必须用项目虚拟环境的解释器**，裸 `python` 会取到系统 Python
+> （缺 baostock / akshare，且报错栈落在 `import pandas` 上，看不出真正原因）。
+> 各入口脚本已内置 `etl/_venv_guard.py` 前置检查，用错解释器会直接提示正确命令。
+>
+> 下方以 PowerShell 写法为例；Bash 下把 `.\.venv\Scripts\python.exe`
+> 换成 `./.venv/Scripts/python.exe`（Linux/macOS 为 `./.venv/bin/python`）。
+
+```powershell
 # 重建目录结构（data/ 不进 git，clone 后先跑这个）
-python etl/layout.py
+.\.venv\Scripts\python.exe etl\layout.py
 
 # 标的清单与交易日历（全量，约 2 分钟）
-python etl/build_instruments.py
+.\.venv\Scripts\python.exe etluild_instruments.py
 
 # 行情抽试：40 只个股（含 10 只已退市）+ 20 只 ETF
-python etl/build_bars.py --stocks 40 --etfs 20 --start 2018-01-01
+.\.venv\Scripts\python.exe etluild_bars.py --stocks 40 --etfs 20 --start 2018-01-01
 
 # --- 行情同步（全量 / 每日增量，同一个入口） ---
-python etl/sync_bars.py --limit 8            # 试跑 8 只
-python etl/sync_bars.py --workers 12         # 全量或增量（按状态自动判断）
-python etl/sync_bars.py --status             # 查看进度
-python etl/sync_bars.py --retry-failed       # 重试失败标的
-python etl/sync_bars.py --compact            # 合并分片并去重
-python etl/sync_bars.py --verify             # 逐年质检
+.\.venv\Scripts\python.exe etl\sync_bars.py --limit 8       # 试跑 8 只
+.\.venv\Scripts\python.exe etl\sync_bars.py --workers 12    # 全量或增量（按状态自动判断）
+.\.venv\Scripts\python.exe etl\sync_bars.py --status        # 查看进度
+.\.venv\Scripts\python.exe etl\sync_bars.py --retry-failed  # 重试失败标的
+.\.venv\Scripts\python.exe etl\sync_bars.py --compact       # 合并分片并去重
+.\.venv\Scripts\python.exe etl\sync_bars.py --verify        # 逐年质检
 
 # 查看数据
-python etl/dump.py instruments --where "board==3" --limit 10
-python etl/dump.py bar --symbol 600519 --limit 15
-python etl/dump.py --schema bar
+.\.venv\Scripts\python.exe etl\dump.py instruments --where "board==3" --limit 10
+.\.venv\Scripts\python.exe etl\dump.py bar --symbol 600519 --limit 15
+.\.venv\Scripts\python.exe etl\dump.py --schema bar
 ```
 
 ---
