@@ -16,3 +16,6 @@ cache/
 .idea/
 .DS_Store
 Thumbs.db
+
+# 探针原始结果（每次运行重新生成）
+docs/probe/*.json
