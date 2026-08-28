@@ -42,9 +42,36 @@ _BOARD_LIMIT = {
     int(sc.Board.STAR): 0.20,
     int(sc.Board.BSE): 0.30,
 }
-# ST 的 5% 限制**只适用于主板**。创业板与科创板的 ST 股仍为 20%，
-# 首版校验对全部 ST 一律按 5% 判定，导致创业板 ST 股大量误报。
+# ST 的 5% 限制**只适用于主板**。创业板与科创板的 ST 股仍为 20%。
 _ST_LIMIT_MAIN = 0.05
+
+# --- 涨跌幅规则的时间维度 ---
+#
+# 涨跌幅限制不是常量，会随监管规则变更。以下生效日均由**数据实测定位**后
+# 查证确认，不是凭记忆写的：
+#
+#   20260706  沪深北新版交易规则实施，主板风险警示股（ST/*ST）涨跌幅
+#             由 5% 放宽至 10%，与主板普通股一致
+#   20200824  创业板注册制改革，涨跌幅由 10% 放宽至 20%
+#
+# v0.2 的 Market 模块必须同样按日期分段实现，不能写成静态常量 ——
+# 否则回测 2026-07-06 之前的 ST 股会放行本该被拦截的成交。
+_ST_MAIN_LIMIT_RELAXED_FROM = 20260706
+_CHINEXT_LIMIT_RELAXED_FROM = 20200824
+
+
+def limit_ratio(board: int, is_st: int, trading_day: int) -> float:
+    """给定板块、ST 状态与交易日，返回当日涨跌幅限制比例。"""
+    if board == int(sc.Board.CHINEXT):
+        return 0.20 if trading_day >= _CHINEXT_LIMIT_RELAXED_FROM else 0.10
+    if board == int(sc.Board.STAR):
+        return 0.20
+    if board == int(sc.Board.BSE):
+        return 0.30
+    # 主板
+    if is_st == 1 and trading_day < _ST_MAIN_LIMIT_RELAXED_FROM:
+        return _ST_LIMIT_MAIN
+    return 0.10
 
 # 退市整理期首日无涨跌幅限制，其后仍受限。缺少「进入退市整理期」的准确日期，
 # 以退市前若干交易日近似圈定，该区间内的越界降级为提示而非错误。
@@ -161,14 +188,22 @@ def check_bars(bars: pd.DataFrame, inst: pd.DataFrame, cal: pd.DataFrame) -> lis
     meta = inst.set_index("instrument_id")[["board", "symbol", "type", "status"]]
     j = bars.join(meta, on="instrument_id")
     j = j[(j["tradestatus"] == 1) & (j["preclose"] > 0)]
+    # 复牌首日不设涨跌幅限制。2005-2007 股权分置改革期间尤为集中 ——
+    # 对价送股造成的自然除权使复牌当日跌幅普遍在 -16% ~ -27%。
+    # 实测：该区间 113 行越界中，113 行的前一交易日均为停牌，相关性 100%。
+    prev_status = bars.groupby("instrument_id")["tradestatus"].shift(1)
+    j = j[~(prev_status.reindex(j.index) == 0)]
+
     # 新股上市初期不设涨跌幅限制，整体排除：
     # 创业板 / 科创板一直如此；主板自 2023-04-10 全面注册制起同样为前 5 个交易日。
     # 保守起见对所有板块一律排除前 N 日，宁可漏报不可误报。
     j = j[j.groupby("instrument_id").cumcount() >= _IPO_FREE_DAYS]
 
-    pct = j["board"].map(_BOARD_LIMIT).fillna(0.10)
-    # ST 收窄至 5% 仅限主板
-    pct = pct.where(~((j["is_st"] == 1) & (j["board"] == int(sc.Board.MAIN))), _ST_LIMIT_MAIN)
+    # 逐行按「板块 + ST + 交易日」取限制比例 —— 规则有时间维度，不能用静态映射
+    pct = pd.Series(
+        [limit_ratio(int(b), int(st), int(d))
+         for b, st, d in zip(j["board"], j["is_st"], j["trading_day"])],
+        index=j.index)
 
     limit_up = [limit_price(p, r, True) for p, r in zip(j["preclose"], pct)]
     limit_down = [limit_price(p, r, False) for p, r in zip(j["preclose"], pct)]
