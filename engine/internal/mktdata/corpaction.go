@@ -41,6 +41,12 @@ type CorpActions struct {
 	byDay map[int32][]CorpAction
 	keys  map[int64]bool // instrument<<32 | ex_date，用于判定「是否有记录」
 	total int
+	// all 保留**全部**行（含 HasEffect 为假的全零行）。
+	// 引擎用不到它，但数据核对必须能看到原始表里真实存在的行 ——
+	// 「有一行但全零」与「根本没有这行」是两种不同的数据状况。
+	all []CorpAction
+	// byInst 惰性构建，仅核对路径使用
+	byInst map[InstrumentID][]CorpAction
 }
 
 // LoadCorpActions 从 corporate_action.parquet 读入。
@@ -52,6 +58,7 @@ func LoadCorpActions(path string) (*CorpActions, error) {
 	ca := &CorpActions{
 		byDay: make(map[int32][]CorpAction, 4096),
 		keys:  make(map[int64]bool, len(rows)),
+		all:   make([]CorpAction, 0, len(rows)),
 	}
 	for i := range rows {
 		r := &rows[i]
@@ -62,6 +69,7 @@ func LoadCorpActions(path string) (*CorpActions, error) {
 			RightsRatio:   r.RightsRatio, RightsPrice: r.RightsPrice,
 		}
 		ca.keys[key64(a.Instrument, a.ExDate)] = true
+		ca.all = append(ca.all, a)
 		if !a.HasEffect() {
 			continue
 		}
