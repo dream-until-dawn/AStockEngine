@@ -30,6 +30,10 @@ type Store struct {
 	Fee  trading.Fee
 	Mkt  *trading.AShareMarket
 
+	// Sessions 单步调试会话（v0.4）。与 Store 的其余字段不同，
+	// 它是**可变的** —— 会话有自己的锁，Store 本身依然只读
+	Sessions *SessionStore
+
 	// InstStats 是逐标的的派生统计，启动时算好。
 	// 「这只标的到底有没有行情、覆盖到哪天」是核对时第一个要问的问题。
 	InstStats map[mktdata.InstrumentID]InstStat
@@ -60,7 +64,7 @@ type InstStat struct {
 // LoadStore 载入全部数据。progress 用于把进度打到控制台 ——
 // 30 秒的静默启动会让人以为卡死了。
 func LoadStore(dataRoot, feePath string, progress func(string, ...any)) (*Store, error) {
-	s := &Store{DataRoot: dataRoot}
+	s := &Store{DataRoot: dataRoot, Sessions: newSessionStore()}
 	meta := filepath.Join(dataRoot, "meta")
 
 	must := func(name string, fn func() error) error {

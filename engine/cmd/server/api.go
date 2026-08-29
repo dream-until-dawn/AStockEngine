@@ -360,8 +360,8 @@ func (s *Store) handleInstrumentDetail(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(corpOnly, func(i, j int) bool { return corpOnly[i] < corpOnly[j] })
 
 	writeJSON(w, map[string]any{
-		"instrument": s.dto(in),
-		"factors":    fRows,
+		"instrument":  s.dto(in),
+		"factors":     fRows,
 		"corpActions": cRows,
 		"reconcile": map[string]any{
 			"factorOnly": factorOnly, // 有因子跳变但表里没有分红送配记录
@@ -439,13 +439,13 @@ func (s *Store) handleFactorsAll(w http.ResponseWriter, r *http.Request) {
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 
 	type row struct {
-		ID     int32   `json:"id"`
-		Symbol string  `json:"symbol"`
-		Name   string  `json:"name"`
-		ExDate int32   `json:"exDate"`
-		Factor int64   `json:"factor"`
-		Ratio  float64 `json:"ratio"`
-		HasCorp bool   `json:"hasCorp"`
+		ID      int32   `json:"id"`
+		Symbol  string  `json:"symbol"`
+		Name    string  `json:"name"`
+		ExDate  int32   `json:"exDate"`
+		Factor  int64   `json:"factor"`
+		Ratio   float64 `json:"ratio"`
+		HasCorp bool    `json:"hasCorp"`
 	}
 	rows := make([]row, 0, 1024)
 	for _, in := range s.Uni.All() {

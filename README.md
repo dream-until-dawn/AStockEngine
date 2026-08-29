@@ -138,7 +138,7 @@ engine/        Go 回测引擎
   internal/mktdata/     列式加载、时间游标、复权、公司行动
   internal/indicator/   增量指标（MA / MACD / KDJ）
   internal/trading/     Fee / Market / Portfolio / Broker
-  internal/engine/      Step() 状态机与策略接口
+  internal/engine/      Step() 状态机与策略接口（含单步调试的只读入口）
   internal/strategies/  样例策略（趋势 / 均值回归 / 突破 / 网格）
   internal/spec/        参数自描述（喂 Web 表单 / 海选网格 / 配置校验）
   internal/registry/    泛型容器：按名字取实现

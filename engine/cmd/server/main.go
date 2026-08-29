@@ -66,6 +66,18 @@ func main() {
 	mux.HandleFunc("POST /api/backtest", store.handleBacktest)
 	mux.HandleFunc("POST /api/universe", store.handleUniverse)
 
+	// 单步调试会话（v0.4）。纯 HTTP，不用 WebSocket ——
+	// 步进是用户驱动的请求/响应，没有服务端主动产生的事件。理由见 session.go
+	mux.HandleFunc("GET /api/session", store.handleSessionList)
+	mux.HandleFunc("POST /api/session", store.handleSessionCreate)
+	mux.HandleFunc("GET /api/session/{id}", store.handleSessionGet)
+	mux.HandleFunc("DELETE /api/session/{id}", store.handleSessionDelete)
+	mux.HandleFunc("POST /api/session/{id}/step", store.handleSessionStep)
+	mux.HandleFunc("POST /api/session/{id}/reset", store.handleSessionReset)
+	mux.HandleFunc("GET /api/session/{id}/inspect", store.handleSessionInspect)
+	mux.HandleFunc("GET /api/session/{id}/snapshot", store.handleSessionSnapshot)
+	mux.HandleFunc("POST /api/session/{id}/restore", store.handleSessionRestore)
+
 	// 前端产物存在就一并伺服，这样 `go run` 一条命令即可用；
 	// 开发时走 Vite（它把 /api 代理到这里），不依赖本分支。
 	if st, err := os.Stat(*webDir); err == nil && st.IsDir() {

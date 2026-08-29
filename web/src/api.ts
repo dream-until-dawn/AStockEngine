@@ -1,4 +1,7 @@
-import type { Instrument, InstrumentDetail, Kline, Meta, Paged } from './types'
+import type {
+  Inspect, Instrument, InstrumentDetail, Kline, Meta, Paged,
+  SessionBrief, SessionState, StepReq, StepResult,
+} from './types'
 
 export class ApiError extends Error {}
 
@@ -109,4 +112,31 @@ export const runApi = {
   universe: (u: import('./types').UniverseSpec) =>
     post<import('./types').UniversePreview>('/universe', u),
   backtest: (cfg: unknown) => post<import('./types').RunResult>('/backtest', cfg),
+}
+
+// ---- 单步调试会话（v0.4）----
+//
+// 纯 HTTP，没有 WebSocket：步进是**用户驱动的请求/响应**，
+// 点一下走一步，等的就是这一步的结果。服务端这里没有主动产生的事件，
+// 换成 WS 只会多一套连接生命周期与断线对齐。理由详见服务端 session.go。
+
+export const dbgApi = {
+  list: () => get<{ sessions: SessionBrief[]; max: number }>('/session'),
+  create: (cfg: unknown) => post<{ state: SessionState }>('/session', cfg),
+  get: (id: string) => get<{ state: SessionState }>(`/session/${id}`),
+  step: (id: string, req: StepReq) => post<StepResult>(`/session/${id}/step`, req),
+  reset: (id: string) => post<{ state: SessionState }>(`/session/${id}/reset`, {}),
+  inspect: (id: string, instrument: string) =>
+    get<Inspect>(`/session/${id}/inspect`, { instrument }),
+  restore: (id: string, snap: string) =>
+    post<{ state: SessionState }>(`/session/${id}/restore`, snap),
+  drop: (id: string) => del<{ ok: boolean }>(`/session/${id}`),
+  snapshotURL: (id: string) => `/api/session/${id}/snapshot`,
+}
+
+async function del<T>(path: string): Promise<T> {
+  const res = await fetch(`/api${path}`, { method: 'DELETE' })
+  const text = await res.text()
+  if (!res.ok) throw new ApiError(JSON.parse(text).error ?? text)
+  return JSON.parse(text) as T
 }

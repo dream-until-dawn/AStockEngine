@@ -194,44 +194,16 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 	// 服务端手里只有启动时载入的这一份
 	cfg.SetDataRoot(mustAbs(s.DataRoot))
 
-	ids, err := cfg.ResolveUniverse(s.Uni, s.Adj)
+	// 装配与单步会话走同一条路径（session.go: assembleFor）——
+	// 里面有一处「基准必须在裁子集之前取」的顺序，两处各写一遍迟早漏掉
+	e, ds, err := s.assembleFor(cfg)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "%v", err)
 		return
 	}
-	if len(ids) > maxUniverseForWeb {
-		writeErr(w, http.StatusBadRequest,
-			"标的池 %d 只，超过服务端回测上限 %d —— 装配时要把全量列式数据"+
-				"裁成子集，那是一次拷贝，太大会把服务端撑爆。"+
-				"请收窄 universe，或用命令行跑：go run ./cmd/backtest -config ...",
-			len(ids), maxUniverseForWeb)
-		return
-	}
-
-	ds := &config.DataSet{
-		Universe: s.Uni, Adjuster: s.Adj, CorpAct: s.Corp,
-		Calendar: s.Cal, Root: mustAbs(s.DataRoot),
-	}
-	// 基准要在**裁子集之前**从全量数据里取 —— 它不在标的池里，
-	// 裁完就没了。这一步顺序错了不会报错，只会让报告里的对标区块凭空消失
-	if cfg.Metrics.Benchmark != "" {
-		in := s.Uni.BySymbol(cfg.Metrics.Benchmark)
-		if in == nil {
-			writeErr(w, http.StatusBadRequest,
-				"metrics.benchmark: 未找到标的 %q", cfg.Metrics.Benchmark)
-			return
-		}
-		if !ds.SetBenchmark(s.Col, in.ID) {
-			writeErr(w, http.StatusBadRequest,
-				"metrics.benchmark: %q 没有行情数据", cfg.Metrics.Benchmark)
-			return
-		}
-	}
-	ds.Columns = s.narrowCached(cfg, ids)
-
-	e, err := cfg.Assemble(ds)
+	ids, err := cfg.ResolveUniverse(s.Uni, s.Adj)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "装配失败: %v", err)
+		writeErr(w, http.StatusBadRequest, "%v", err)
 		return
 	}
 

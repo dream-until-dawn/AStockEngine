@@ -294,3 +294,91 @@ export type UniversePreview = {
     bars: number; firstDay: number; lastDay: number
   }[]
 }
+
+// ---- 单步调试会话（v0.4）----
+
+export interface SessionBrief {
+  id: string; name: string; step: number; totalSteps: number; created: string
+}
+
+export interface DbgSignal {
+  id: number; symbol: string; name: string
+  kind: string; side: string; strength: number; tag?: string
+}
+
+export interface DbgOrder {
+  id: number; symbol: string; name: string; side: string; qty: number; tag?: string
+}
+
+export interface DbgPending {
+  id: number; symbol: string; name: string; side: string; qty: number
+  signalDay: number; priceRef: string; tried: number; maxSteps: number; tag?: string
+}
+
+export interface DbgPosition {
+  id: number; symbol: string; name: string
+  qty: number; available: number; cost: number
+  last: number; value: number; pnl: number; suspended: boolean
+}
+
+/** 一步的全部动静。无事发生的步不会出现在列表里 —— 只计入 quiet 计数。 */
+export interface StepEvent {
+  step: number; day: number
+  equity: number; cash: number; positions: number
+  signals?: DbgSignal[]
+  orders?: DbgOrder[]
+  fills?: RunFill[]
+  rejects?: RunReject[]
+}
+
+export interface SessionState {
+  id: string; name: string
+  step: number; totalSteps: number
+  day: number; firstDay: number; lastDay: number
+  done: boolean; started: boolean; universe: number
+  equity: number; cash: number; initial: number; peak: number
+  realized: number; fee: number; slippage: number
+  holdings: DbgPosition[]
+  pending: DbgPending[]
+  indicators: string[]
+  warnings?: string[]
+  disclosures?: string[]
+}
+
+/** 三种停法可叠加，谁先到停在谁。until 是最有用的那个。 */
+export interface StepReq {
+  n?: number
+  day?: number
+  until?: '' | 'signal' | 'fill' | 'reject' | 'end'
+}
+
+export interface StepResult {
+  state: SessionState
+  steps: StepEvent[]
+  advanced: number
+  quiet: number
+  stoppedBy: string
+  truncated: boolean
+  elapsedMs: number
+}
+
+export interface DbgIndicator {
+  key: string
+  names?: string[]
+  values?: number[]
+  /** false 时 values 是垃圾（预热未完成）——界面必须把这件事说出来 */
+  ready: boolean
+}
+
+export interface Inspect {
+  id: number; symbol: string; name: string; day: number
+  hasBar: boolean
+  open: number; high: number; low: number; close: number; preclose: number
+  volume: number; amount: number
+  suspended: boolean; isST: boolean
+  limitUp: number; limitDn: number; hasLimit: boolean
+  adjClose: number; priceScale: number
+  held: number; available: number; cost: number
+  indicators: DbgIndicator[]
+  pending?: DbgPending[]
+}

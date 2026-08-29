@@ -690,3 +690,81 @@ func (e *Engine) marks() map[mktdata.InstrumentID]int64 {
 
 // Liquidations 返回累计的强平记录。现货账本下恒为空。
 func (e *Engine) Liquidations() []trading.Liquidation { return e.liquidations }
+
+// ---- 单步调试的只读入口（v0.4）----
+//
+// 这一组存在的理由只有一个：**回答「这一天为什么是这个决定」**。
+//
+// 批量回测只需要知道「发生了什么」，单步调试要知道「为什么」，
+// 而「为什么」不在成交记录里 —— 它在指标值、在途队列、可卖数量里。
+// 这些量此前只经 StepContext 给策略看，策略之外拿不到，
+// 于是「今天 MACD 是多少」这种最基本的问题只能靠加日志。
+
+// Pending 返回当前尚未成交的订单队列。
+//
+// **单步调试最常问的问题是「为什么今天没买」**，而最常见的答案是
+// 「单还在队列里等着」—— T+1 的卖单、次日开盘执行的买单都在这里。
+// 看不到这个队列，就只能得出「策略没发信号」这个错误结论。
+func (e *Engine) Pending() []trading.PendingOrder { return e.pending }
+
+// NumSteps 返回本次运行总共有多少个时点。
+func (e *Engine) NumSteps() int { return e.col.NumSteps() }
+
+// Now 返回当前所处的时点。尚未开始时 ok 为 false。
+func (e *Engine) Now() (mktdata.TimePoint, bool) {
+	if e.steps <= 0 || e.steps > e.col.NumSteps() {
+		return mktdata.TimePoint{}, false
+	}
+	return e.col.StepAt(e.steps - 1), true
+}
+
+// PeekAt 返回第 i 个时点（0 起）。用于「跑到某日」前先算出目标步数。
+func (e *Engine) PeekAt(i int) (mktdata.TimePoint, bool) {
+	if i < 0 || i >= e.col.NumSteps() {
+		return mktdata.TimePoint{}, false
+	}
+	return e.col.StepAt(i), true
+}
+
+// IndicatorKeys 返回本次装配声明了哪些指标（策略在 Init 里 Use 的那些）。
+func (e *Engine) IndicatorKeys() []string {
+	out := make([]string, len(e.keys))
+	copy(out, e.keys)
+	return out
+}
+
+// IndicatorAt 取某标的在当前时点的指标值。
+//
+// ready 为 false 时值是**垃圾**（预热未完成），调用方必须原样传给界面 ——
+// 把未就绪的指标画成 0 会让人以为「指标是 0 所以没信号」，
+// 而真相是「指标还没算出来」。这两件事在调试时天差地别。
+func (e *Engine) IndicatorAt(id mktdata.InstrumentID, key string) (
+	names []string, values []float64, ready, ok bool,
+) {
+	m, exists := e.indicators[key]
+	if !exists {
+		return nil, nil, false, false
+	}
+	ind, exists := m[id]
+	if !exists {
+		return nil, nil, false, false
+	}
+	v := ind.Values()
+	cp := make([]float64, len(v))
+	copy(cp, v) // Values 返回内部切片的视图，下一步会被改写
+	return ind.Names(), cp, ind.Ready(), true
+}
+
+// BarAt 取某标的在当前时点的 bar（**原始价**，与撮合口径一致）。
+func (e *Engine) BarAt(id mktdata.InstrumentID) (mktdata.Bar, bool) {
+	return e.cur.Bar(id)
+}
+
+// AvailableAt 取某标的当前可卖数量（已考虑 T+1）。
+func (e *Engine) AvailableAt(id mktdata.InstrumentID) int64 {
+	tp, ok := e.Now()
+	if !ok {
+		return 0
+	}
+	return e.led.Available(id, tp.TsClose)
+}

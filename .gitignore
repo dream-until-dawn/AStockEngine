@@ -22,3 +22,7 @@ docs/probe/*.json
 
 # Go 构建产物
 engine/*.exe
+
+# 前端构建产物（clone 后跑 npm run build 生成）
+web/dist/
+web/node_modules/

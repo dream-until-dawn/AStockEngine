@@ -3,6 +3,7 @@ import { api } from './api'
 import { ErrBox, Loading, useAsync } from './components/ui'
 import Overview from './views/Overview'
 import Backtest from './views/Backtest'
+import Debug from './views/Debug'
 import Instruments from './views/Instruments'
 import Kline from './views/Kline'
 import CalendarView from './views/Calendar'
@@ -25,6 +26,7 @@ function useHash(): string {
 const NAV = [
   { path: '/overview', label: '概览' },
   { path: '/backtest', label: '回测' },
+  { path: '/debug', label: '单步调试' },
   { path: '/instruments', label: '标的列表' },
   { path: '/calendar', label: '交易日历' },
   { path: '/factors', label: '复权因子' },
@@ -81,6 +83,7 @@ function Route({ hash, meta }: { hash: string; meta: Meta }) {
   const k = /^\/kline\/([^/?]+)/.exec(hash)
   if (k) return <Kline key={k[1]} id={k[1]} meta={meta} />
   if (hash.startsWith('/backtest')) return <Backtest meta={meta} />
+  if (hash.startsWith('/debug')) return <Debug meta={meta} />
   if (hash.startsWith('/instruments')) return <Instruments meta={meta} />
   if (hash.startsWith('/calendar')) return <CalendarView />
   if (hash.startsWith('/factors')) return <Factors meta={meta} />
