@@ -129,12 +129,26 @@ def build_factors(bars: pd.DataFrame, events: pd.DataFrame, iid: int) -> tuple[l
 
         cash = float(e.cash)
         if cash > 0:
-            # 现金分红且金额已知：比例可精确计算
+            # 现金分红且金额已知：该部分比例可精确计算
             if cash >= prev_close:
                 warns.append(f"{d} 分红 {cash} 不小于前收 {prev_close}，跳过")
                 continue
-            ratio = Decimal(str(prev_close)) / Decimal(str(prev_close - cash))
+            after_div = prev_close - cash
+            ratio = Decimal(str(prev_close)) / Decimal(str(after_div))
             kind = "dividend"
+
+            # 分红与折算**可以同日发生**，两者不互斥。
+            # 159922 嘉实中证500ETF 2024-12-02：事件表报分红 0.1292，
+            # 但价格从 6.159 跌到开盘 2.461，实为分红叠加约 2.5 倍折算。
+            # 只按分红算比例会得到 1.0214，远不足以修正断点。
+            # 故扣除分红后再检查残余比值是否仍达到折算量级。
+            residual = after_div / today_open
+            if residual >= _SPLIT_THRESHOLD:
+                k, ok = snap_ratio(residual)
+                if not ok:
+                    warns.append(f"{d} 分红后残余比值 {residual:.4f} 未落在常见比例上，按原值使用")
+                ratio = ratio * Decimal(str(k))
+                kind = "dividend+split"
         else:
             # 「累计分红 = 0」意味着**金额未知**，不是「没有分红」——
             # 159919 的事件表里 2019-01-14 累计分红为 0，而 2020-09-14 才 0.1520，
@@ -191,7 +205,7 @@ def main() -> int:
     bars = load_etf_bars(inst)
     print(f"  ETF bar {len(bars)} 行 / {bars['instrument_id'].nunique()} 只", flush=True)
 
-    all_rows, all_warns, stats = [], [], {"dividend": 0, "split": 0, "estimated": 0,
+    all_rows, all_warns, stats = [], [], {"dividend": 0, "split": 0, "estimated": 0, "dividend+split": 0,
                                           "no_event": 0, "failed": 0}
     started = time.perf_counter()
     for i, r in enumerate(etfs.itertuples(index=False), 1):
@@ -216,6 +230,7 @@ def main() -> int:
             print(f"  {i}/{len(etfs)}  {el:.0f}s  因子 {len(all_rows)} 行", flush=True)
 
     print(f"\n事件统计：现金分红 {stats['dividend']}，份额折算 {stats['split']}，"
+          f"分红+折算同日 {stats['dividend+split']}，"
           f"无事件 {stats['no_event']} 只，查询失败 {stats['failed']} 只")
 
     if not all_rows:
