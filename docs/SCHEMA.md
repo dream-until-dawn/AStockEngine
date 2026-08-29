@@ -196,7 +196,8 @@ date        open   high   low   close  preclose  volume  amount  turn  tradestat
 | `exchange` | INT8 | `int8` | 否 | 枚举 |
 | `name` | STRING | `string` | 否 | 当前/最终名称。**不做时变**，见下方说明 |
 | `type` | INT8 | `int8` | 否 | 1=个股 2=ETF |
-| `board` | INT8 | `int8` | 否 | 决定涨跌停幅度，Market 模块使用 |
+| `board` | INT8 | `int8` | 否 | 标的自身所属板块 |
+| `tracked_board` | INT8 | `int8` | 否 | **决定涨跌停幅度**，Market 模块使用。见 2.5 |
 | `price_scale` | INT32 | `int32` | 否 | A 股 = 1000 |
 | `qty_scale` | INT32 | `int32` | 否 | A 股 = 1 |
 | `quote_ccy` | INT8 | `int8` | 否 | A 股 = 1 (CNY) |
@@ -221,6 +222,26 @@ date        open   high   low   close  preclose  volume  amount  turn  tradestat
 >
 > 卖出零股（不足最小单位的余股）必须一次性全部卖出 —— 这是 Broker 的规则，
 > 不在本表体现。
+
+### 2.5 `tracked_board` 与 `board` 的区别
+
+个股的两者相同。**ETF 不同**：ETF 的涨跌停由其**跟踪的指数**决定 ——
+跟踪创业板 / 科创板指数者为 20%，其余为 10% —— 而 ETF 自身不属于任何板块，
+`board` 对 ETF 统一记为主板。
+
+判定由 `etl/infer_etf_board.py` 完成，**价格实证为主、名称为辅**：
+
+- 价格证据：历史上 `|涨跌幅| > 10.5%` 的**次数** ≥ 2
+- 名称关键词：科创 / 创业板 / 双创等（价格证据不足时的兜底）
+
+用「次数」而非「最大值」，是为了打破一个循环依赖：要判断某个 19% 的涨幅
+是否不可能，得先知道该 ETF 的涨跌停，而涨跌停正是待推断的对象。
+次数则不循环 —— 真正 20% 限制的 ETF 会**多次**超限，
+而一个未修正的折算事件只贡献**一次**。
+
+> 该判定顺带成了复权缺口的探测器：「恰好一次超限且名称无关键词」
+> 高度指向尚未修正的折算事件。当前检出 1 只（510100 于 2023-02-13），
+> 已列入已知缺口。
 
 ### 2.2 关于 `name` 不做时变
 

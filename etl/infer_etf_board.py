@@ -54,6 +54,9 @@ _DUAL_WORDS = ("双创",)  # 双创 = 创业板 + 科创板，同为 20%
 _OVER_10 = 10.5
 # 上市初期不设涨跌幅限制，一律排除
 _IPO_FREE_DAYS = 5
+# 需要至少这么多个超限日才采信价格证据。取 2 是为了把「未修正的单个折算事件」
+# 与「真实的 20% 限制」区分开 —— 前者只贡献一次。
+_MIN_OVER_DAYS = 2
 
 
 def name_hint(name: str) -> int:
@@ -98,16 +101,30 @@ def main() -> int:
     ok = bars[(bars["tradestatus"] == 1) & (bars["preclose"] > 0)
               & (~bars["is_event"]) & (bars["seq"] >= _IPO_FREE_DAYS)].copy()
     ok["chg"] = (ok["close"] / ok["preclose"] - 1.0) * 100.0
-    stat = ok.groupby("instrument_id")["chg"].agg(
-        max_abs=lambda s: s.abs().max(), days="size")
+    # 用「超过 10.5% 的**次数**」而非「最大值」作为价格证据。
+    #
+    # 这是为了打破一个循环依赖：要判断某个 19% 的涨幅是否不可能，
+    # 得先知道该 ETF 的涨跌停；而涨跌停正是待推断的对象。
+    #
+    # 次数则不循环：真正 20% 限制的 ETF 在足够长的历史里会**多次**超过 10.5%，
+    # 而一个未修正的折算事件只贡献**一次**。
+    # 510100 易方达上证50ETF 即是后者 —— 它只有 20230213 一天超限，
+    # 那是一个仍未修正的事件，而非其限制为 20% 的证据。
+    ok["over"] = ok["chg"].abs() > _OVER_10
+    stat = ok.groupby("instrument_id").agg(
+        max_abs=("chg", lambda s: s.abs().max()),
+        over_days=("over", "sum"),
+        days=("chg", "size"))
 
     meta = inst[inst["type"] == int(sc.InstrumentType.ETF)][
         ["instrument_id", "symbol", "name", "board"]].copy()
     meta = meta.merge(stat, left_on="instrument_id", right_index=True, how="left")
     meta["max_abs"] = meta["max_abs"].fillna(0.0)
     meta["days"] = meta["days"].fillna(0).astype(int)
+    meta["over_days"] = meta["over_days"].fillna(0).astype(int)
 
-    meta["price_says_20"] = meta["max_abs"] > _OVER_10
+    # 至少两次才算证据，一次视为疑似未修正的事件
+    meta["price_says_20"] = meta["over_days"] >= _MIN_OVER_DAYS
     meta["name_says"] = meta["name"].map(name_hint)
 
     def decide(r) -> tuple[int, str]:
@@ -132,6 +149,15 @@ def main() -> int:
     print(summary.to_string())
 
     # 冲突：价格说 20% 但名称说不出所以然，或名称说 20% 但价格从未超 10.5%
+    # 恰好一次超限且名称无 20% 关键词的，很可能是**尚未修正的折算事件** ——
+    # 板块推断顺带成了复权缺口的探测器
+    suspect = meta[(meta["over_days"] == 1) & (meta["name_says"] == 0)]
+    if len(suspect):
+        print(f"\n=== 疑似未修正的折算事件 {len(suspect)} 只 ===")
+        print("（恰好一天超过 10.5% 且名称无 20% 关键词，按主板计但值得复查）")
+        print(suspect[["symbol", "name", "max_abs", "over_days", "days"]]
+              .sort_values("max_abs", ascending=False).head(args.show).to_string(index=False))
+
     conflict = meta[
         (meta["price_says_20"] & (meta["name_says"] == 0))
         | ((~meta["price_says_20"]) & (meta["name_says"] != 0) & (meta["days"] > 250))
