@@ -6,6 +6,7 @@ import (
 
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/indicator"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 )
 
 // Config 是一次运行的装配配置。
@@ -14,39 +15,83 @@ type Config struct {
 	// IndicatorAdjMode 指标喂入的复权方式。默认后复权 —— 序列必须连续，
 	// 否则除权日会产生假信号（设计 6.1）。
 	IndicatorAdjMode mktdata.AdjMode
+	// InitialCashCents 初始资金（分）
+	InitialCashCents int64
+	// DividendTaxPPM 红利税率（百万分之一）。税率属规则不属数据，
+	// 实际随持股期限分档，本刀先用固定值。
+	DividendTaxPPM int64
+	// ImplySplitFromFactor 当某日有复权因子事件却无 corporate_action 记录时，
+	// 是否按因子比例推算送转并入账。
+	//
+	// 默认开启（评审决议 2）：ETL 侧约 6,770 个因子事件缺记录，
+	// 完全不处理会让这些日期出现「价格跳变但账户没变」的失真。
+	// 这是有损近似，Portfolio 会逐条留痕。
+	ImplySplitFromFactor bool
 }
 
 // Engine 是回测的核心状态机。
 //
 // **它不含任何内部 for 循环**（C4）：每调用一次 Step 前进一个事件时点。
-// 单步调试、批量海选、实盘增量三种模式因此可以共用同一个核心，
-// 只需换外层的 Driver 与 Recorder。
+// 单步调试、批量海选、实盘增量三种模式因此共用同一个核心。
 type Engine struct {
 	col      *mktdata.Columns
 	cur      *mktdata.Cursor
 	adj      *mktdata.Adjuster
+	uni      *mktdata.Universe
+	corp     *mktdata.CorpActions
+	broker   *trading.Broker
+	market   trading.Market
+	pf       *trading.Portfolio
 	strategy Strategy
 	cfg      Config
 
-	// 指标由引擎持有（评审决议 2）：indicators[key][instrument]
-	factories map[string]IndicatorFactory
-	keys      []string // 稳定顺序，保证快照的确定性
+	factories  map[string]IndicatorFactory
+	keys       []string
 	indicators map[string]map[mktdata.InstrumentID]indicator.Indicator
 
+	pending []trading.PendingOrder
+	fills   []trading.Fill
+	rejects []trading.Rejection
+
 	steps int
-	ctx   *stepCtx // 复用同一实例，避免每步分配
+	ctx   *stepCtx
+	// prices 复用同一张表用于估值，避免每步分配
+	prices map[mktdata.InstrumentID]int64
 }
 
-// New 装配一个引擎。adj 可为 nil，此时不做复权。
-func New(col *mktdata.Columns, adj *mktdata.Adjuster, s Strategy, cfg Config) (*Engine, error) {
-	if col == nil || s == nil {
-		return nil, fmt.Errorf("列式数据与策略均不可为空")
+// Deps 是引擎依赖的数据与模块。
+type Deps struct {
+	Columns   *mktdata.Columns
+	Universe  *mktdata.Universe
+	Adjuster  *mktdata.Adjuster
+	CorpAct   *mktdata.CorpActions
+	Market    trading.Market
+	Broker    *trading.Broker
+	Portfolio *trading.Portfolio
+}
+
+// New 装配一个引擎。
+func New(d Deps, s Strategy, cfg Config) (*Engine, error) {
+	if d.Columns == nil || d.Universe == nil || s == nil {
+		return nil, fmt.Errorf("列式数据、标的表与策略均不可为空")
+	}
+	if d.Market == nil {
+		d.Market = trading.NewAShareMarket()
+	}
+	if d.Broker == nil {
+		d.Broker = trading.NewBroker(d.Market, trading.ZeroFee{}, nil,
+			trading.DefaultBrokerConfig())
+	}
+	if d.Portfolio == nil {
+		d.Portfolio = trading.NewPortfolio(cfg.InitialCashCents)
 	}
 	e := &Engine{
-		col: col, cur: mktdata.NewCursor(col), adj: adj,
-		strategy: s, cfg: cfg,
+		col: d.Columns, cur: mktdata.NewCursor(d.Columns), adj: d.Adjuster,
+		uni: d.Universe, corp: d.CorpAct, broker: d.Broker, market: d.Market,
+		pf: d.Portfolio, strategy: s, cfg: cfg,
 		factories:  make(map[string]IndicatorFactory),
 		indicators: make(map[string]map[mktdata.InstrumentID]indicator.Indicator),
+		prices:     make(map[mktdata.InstrumentID]int64, 1024),
 	}
 	if e.cfg.Params == nil {
 		e.cfg.Params = Params{}
@@ -60,45 +105,55 @@ func New(col *mktdata.Columns, adj *mktdata.Adjuster, s Strategy, cfg Config) (*
 
 // ---- InitContext ----
 
-func (e *Engine) Params() Params { return e.cfg.Params }
+func (e *Engine) Params() Params                   { return e.cfg.Params }
+func (e *Engine) Universe() []mktdata.InstrumentID { return e.col.Instruments() }
+
+func (e *Engine) Instrument(id mktdata.InstrumentID) *mktdata.Instrument {
+	return e.uni.Get(id)
+}
 
 func (e *Engine) Use(key string, f IndicatorFactory) {
 	if _, dup := e.factories[key]; dup {
-		return // 重复声明取首次，避免策略里无意覆盖
+		return
 	}
 	e.factories[key] = f
 	e.keys = append(e.keys, key)
 	e.indicators[key] = make(map[mktdata.InstrumentID]indicator.Indicator, 1024)
 }
 
-func (e *Engine) Universe() []mktdata.InstrumentID { return e.col.Instruments() }
-
 // ---- 状态机 ----
 
-// Done 报告是否已走完全部时点。
-func (e *Engine) Done() bool { return e.cur.Done() }
+func (e *Engine) Done() bool                    { return e.cur.Done() }
+func (e *Engine) Steps() int                    { return e.steps }
+func (e *Engine) Portfolio() *trading.Portfolio { return e.pf }
 
-// Steps 返回已推进的步数。
-func (e *Engine) Steps() int { return e.steps }
-
-// Step 前进一个事件时点：更新指标 → 调用策略。
+// Step 前进一个事件时点。
 //
-// 顺序不可颠倒：策略在 OnBar 里读到的指标必须**已包含当前 bar**，
-// 否则策略看到的是滞后一根的指标值 —— 那是另一种未来函数的镜像错误
-// （不是看到未来，而是本该可见的当下没看到），同样会让回测失真。
+// 阶段顺序不可颠倒，每一处都有理由：
+//
+//	1. 推进游标           当前 bar 变为可见
+//	2. 更新指标           策略读到的指标必须**已含当前 bar**
+//	3. 公司行动入账        除权除息在开盘前生效，**必须先于撮合** ——
+//	                      否则除权日的成交价与持仓基准会错配
+//	4. 撮合到期订单        **必须先于策略** —— 否则策略看不到已成交结果会重复下单
+//	5. 调用策略           策略此时看到的是最新持仓与指标
+//	6. 新订单定价入队      由 Market 决定最早可执行时点；
+//	                      可在本时点成交的（盘后定价）立即撮合
 func (e *Engine) Step() (mktdata.TimePoint, error) {
 	tp, updated, ok := e.cur.Advance()
 	if !ok {
 		return mktdata.TimePoint{}, fmt.Errorf("已到末尾")
 	}
 	e.steps++
+	e.fills = e.fills[:0]
+	e.rejects = e.rejects[:0]
 
+	// 2. 指标
 	for _, id := range updated {
 		bar, ok := e.cur.Bar(id)
 		if !ok {
 			continue
 		}
-		// 指标喂**后复权**价：序列连续才不会在除权日产生假信号
 		fed := bar
 		if e.adj != nil && e.cfg.IndicatorAdjMode != mktdata.AdjNone {
 			fed = e.adj.AdjustBar(id, bar, e.cfg.IndicatorAdjMode)
@@ -114,17 +169,166 @@ func (e *Engine) Step() (mktdata.TimePoint, error) {
 		}
 	}
 
-	e.ctx.time = tp
-	e.ctx.universe = updated
-	if err := e.strategy.OnBar(e.ctx); err != nil {
+	// 3. 公司行动
+	e.applyCorporateActions(tp, updated)
+
+	// 4. 撮合到期订单
+	e.matchPending(tp)
+
+	// 5. 策略
+	orders, err := e.strategy.OnBar(e.ctxFor(tp, updated))
+	if err != nil {
 		return tp, fmt.Errorf("策略在 %d 报错: %w", tp.TradingDay, err)
 	}
+
+	// 6. 定价入队；可在本时点成交的立即撮合
+	e.enqueue(orders, tp)
 	return tp, nil
 }
 
-// RunAll 是便利方法：一直步进到结束。
-//
-// **注意它只是 Step 的外壳**，核心仍是状态机 —— 单步调试与海选都不走这里。
+// applyCorporateActions 处理当日的分红送配。
+func (e *Engine) applyCorporateActions(tp mktdata.TimePoint, updated []mktdata.InstrumentID) {
+	if e.corp != nil {
+		for _, a := range e.corp.OnDay(tp.TradingDay) {
+			if e.pf.Position(a.Instrument) == nil {
+				continue // 未持仓则无需入账
+			}
+			e.pf.ApplyCorporateAction(trading.CorporateAction{
+				Instrument: a.Instrument, ExDate: a.ExDate,
+				CashBeforeTax: a.CashBeforeTax,
+				StockDividend: a.StockDividend, StockTransfer: a.StockTransfer,
+				RightsRatio:   a.RightsRatio, RightsPrice: a.RightsPrice,
+			}, e.cfg.DividendTaxPPM, tp.TsClose)
+		}
+	}
+
+	// 有因子事件却无分红记录时按因子推算（评审决议 2）。
+	// 只对**持仓中**的标的做，避免在全市场上做无谓的查表。
+	if !e.cfg.ImplySplitFromFactor || e.adj == nil {
+		return
+	}
+	for id, p := range e.pf.Positions {
+		if p.Total <= 0 {
+			continue
+		}
+		ratio, isEvent := e.adj.EventRatio(id, tp.TradingDay)
+		if !isEvent || ratio <= 1.0 {
+			continue
+		}
+		if e.corp != nil && e.corp.Has(id, tp.TradingDay) {
+			continue // 已有记录，按记录处理即可
+		}
+		e.pf.ApplyImpliedSplit(id, tp.TradingDay, ratio, tp.TsClose)
+	}
+}
+
+// matchPending 撮合已到期的订单，并淘汰过期的。
+func (e *Engine) matchPending(tp mktdata.TimePoint) {
+	if len(e.pending) == 0 {
+		return
+	}
+	keep := e.pending[:0]
+	for i := range e.pending {
+		po := e.pending[i]
+		if po.NotBefore > tp.TsClose {
+			keep = append(keep, po)
+			continue
+		}
+		if e.tryMatch(&po, tp) {
+			continue // 已成交
+		}
+		po.Tried++
+		if po.Tried >= po.MaxSteps {
+			// 过期而非无限挂着。涨停买不进的订单若一直存活，
+			// 会在几个月后突然成交 —— 隐蔽但严重的回测失真。
+			e.rejects = append(e.rejects, trading.Rejection{
+				Order: po.Order, At: tp, Reason: trading.RejectExpired,
+				Detail: fmt.Sprintf("信号于 %d 发出，%d 次尝试未成交",
+					po.SignalAt.TradingDay, po.Tried),
+			})
+			continue
+		}
+		keep = append(keep, po)
+	}
+	e.pending = keep
+}
+
+// tryMatch 尝试撮合一笔订单，成交则记账。返回是否成交。
+func (e *Engine) tryMatch(po *trading.PendingOrder, tp mktdata.TimePoint) bool {
+	inst := e.uni.Get(po.Instrument)
+	if inst == nil {
+		e.rejects = append(e.rejects, trading.Rejection{
+			Order: po.Order, At: tp, Reason: trading.RejectNotListed,
+			Detail: "标的表中不存在",
+		})
+		return true // 不再重试
+	}
+	bar, ok := e.cur.Bar(po.Instrument)
+	if !ok {
+		return false // 该时点无 bar，留待下次
+	}
+	fill, rej, ok := e.broker.Match(po, inst, bar, tp, e.pf)
+	if !ok {
+		e.rejects = append(e.rejects, rej)
+		return false
+	}
+	sellable := e.market.SellableFrom(inst, tp)
+	if err := e.pf.ApplyFill(fill, sellable); err != nil {
+		// 撮合已校验过资金与持仓，走到这里说明有内部不一致，必须留痕
+		e.rejects = append(e.rejects, trading.Rejection{
+			Order: po.Order, At: tp, Reason: trading.RejectInsufficientCash,
+			Detail: "记账失败: " + err.Error(),
+		})
+		return false
+	}
+	e.fills = append(e.fills, fill)
+	return true
+}
+
+// enqueue 给新订单定价并入队；可在本时点成交的立即撮合。
+func (e *Engine) enqueue(orders []trading.Order, tp mktdata.TimePoint) {
+	for _, o := range orders {
+		if o.Qty <= 0 {
+			continue
+		}
+		inst := e.uni.Get(o.Instrument)
+		if inst == nil {
+			e.rejects = append(e.rejects, trading.Rejection{
+				Order: o, At: tp, Reason: trading.RejectNotListed,
+				Detail: "标的表中不存在",
+			})
+			continue
+		}
+		w, ok := e.market.NextExecutable(inst, tp)
+		if !ok {
+			continue
+		}
+		po := trading.PendingOrder{
+			Order: o, SignalAt: tp, NotBefore: w.NotBefore,
+			PriceRef: w.PriceRef, MaxSteps: w.MaxSteps,
+		}
+		if po.MaxSteps < 1 {
+			po.MaxSteps = 1
+		}
+		// 盘后固定价格交易：同一时点即可成交
+		if po.NotBefore <= tp.TsClose {
+			if e.tryMatch(&po, tp) {
+				continue
+			}
+			po.Tried++
+			if po.Tried >= po.MaxSteps {
+				e.rejects = append(e.rejects, trading.Rejection{
+					Order: po.Order, At: tp, Reason: trading.RejectExpired,
+					Detail: "盘后定价当日未成交",
+				})
+				continue
+			}
+		}
+		e.pending = append(e.pending, po)
+	}
+}
+
+// RunAll 一直步进到结束。**它只是 Step 的外壳**，核心仍是状态机。
 func (e *Engine) RunAll() error {
 	for !e.Done() {
 		if _, err := e.Step(); err != nil {
@@ -134,20 +338,48 @@ func (e *Engine) RunAll() error {
 	return nil
 }
 
-// ---- 快照（C6：实盘每天从快照恢复，而非重算多年）----
-
-type snapshot struct {
-	Steps      int                                     `json:"steps"`
-	Cursor     mktdata.CursorState                     `json:"cursor"`
-	Indicators map[string]map[string]indicator.State   `json:"indicators"`
+// EquityCents 按当前时点的收盘价计算总权益。
+func (e *Engine) EquityCents() int64 {
+	for id := range e.prices {
+		delete(e.prices, id)
+	}
+	for id, p := range e.pf.Positions {
+		if p.Total <= 0 {
+			continue
+		}
+		if b, ok := e.cur.Bar(id); ok {
+			e.prices[id] = b.Close
+		}
+	}
+	return e.pf.EquityCents(e.prices)
 }
 
-// Snapshot 导出引擎状态。
+// ---- 快照（C6）----
+
+type snapshot struct {
+	Steps      int                                   `json:"steps"`
+	Cursor     mktdata.CursorState                   `json:"cursor"`
+	Indicators map[string]map[string]indicator.State `json:"indicators"`
+	Portfolio  trading.PortfolioState                `json:"portfolio"`
+	// Pending 必须进快照 —— 否则实盘恢复后，昨日挂出的未成交单会凭空消失
+	Pending []trading.PendingOrder `json:"pending"`
+	// Strategy 策略自身的跨步状态。实现 StatefulStrategy 的策略才有。
+	Strategy []byte `json:"strategy,omitempty"`
+}
+
 func (e *Engine) Snapshot() ([]byte, error) {
 	s := snapshot{
-		Steps:      e.steps,
-		Cursor:     e.cur.Snapshot(),
+		Steps: e.steps, Cursor: e.cur.Snapshot(),
 		Indicators: make(map[string]map[string]indicator.State, len(e.keys)),
+		Portfolio:  e.pf.Snapshot(),
+		Pending:    append([]trading.PendingOrder(nil), e.pending...),
+	}
+	if ss, ok := e.strategy.(StatefulStrategy); ok {
+		b, err := ss.SnapshotState()
+		if err != nil {
+			return nil, fmt.Errorf("策略状态快照失败: %w", err)
+		}
+		s.Strategy = b
 	}
 	for _, key := range e.keys {
 		m := make(map[string]indicator.State, len(e.indicators[key]))
@@ -159,10 +391,6 @@ func (e *Engine) Snapshot() ([]byte, error) {
 	return json.Marshal(s)
 }
 
-// Restore 从快照恢复。
-//
-// 快照必须来自**同一份数据集**：Cursor 存的是全局行号，数据变了行号即失效。
-// 调用方需先校验 data_version（SCHEMA.md 6 的 _manifest.json）。
 func (e *Engine) Restore(data []byte) error {
 	var s snapshot
 	if err := json.Unmarshal(data, &s); err != nil {
@@ -190,7 +418,18 @@ func (e *Engine) Restore(data []byte) error {
 		}
 		e.indicators[key] = m
 	}
+	e.pf.Restore(s.Portfolio)
+	e.pending = append([]trading.PendingOrder(nil), s.Pending...)
 	e.steps = s.Steps
+	if ss, ok := e.strategy.(StatefulStrategy); ok {
+		if len(s.Strategy) == 0 {
+			return fmt.Errorf("策略 %s 声明了跨步状态，但快照中没有 —— "+
+				"该快照可能由另一个策略产生", e.strategy.Name())
+		}
+		if err := ss.RestoreState(s.Strategy); err != nil {
+			return fmt.Errorf("恢复策略状态失败: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -202,10 +441,29 @@ type stepCtx struct {
 	universe []mktdata.InstrumentID
 }
 
-func (c *stepCtx) Time() mktdata.TimePoint                 { return c.time }
-func (c *stepCtx) Universe() []mktdata.InstrumentID        { return c.universe }
-func (c *stepCtx) History(id mktdata.InstrumentID) mktdata.History { return c.e.cur.History(id) }
+func (e *Engine) ctxFor(tp mktdata.TimePoint, u []mktdata.InstrumentID) *stepCtx {
+	e.ctx.time, e.ctx.universe = tp, u
+	return e.ctx
+}
+
+func (c *stepCtx) Time() mktdata.TimePoint          { return c.time }
+func (c *stepCtx) Universe() []mktdata.InstrumentID { return c.universe }
+func (c *stepCtx) History(id mktdata.InstrumentID) mktdata.History {
+	return c.e.cur.History(id)
+}
 func (c *stepCtx) Bar(id mktdata.InstrumentID) (mktdata.Bar, bool) { return c.e.cur.Bar(id) }
+func (c *stepCtx) Instrument(id mktdata.InstrumentID) *mktdata.Instrument {
+	return c.e.uni.Get(id)
+}
+func (c *stepCtx) Portfolio() *trading.Portfolio      { return c.e.pf }
+func (c *stepCtx) Pending() []trading.PendingOrder    { return c.e.pending }
+func (c *stepCtx) Fills() []trading.Fill              { return c.e.fills }
+func (c *stepCtx) Rejections() []trading.Rejection    { return c.e.rejects }
+func (c *stepCtx) EquityCents() int64                 { return c.e.EquityCents() }
+
+func (c *stepCtx) Available(id mktdata.InstrumentID) int64 {
+	return c.e.pf.Available(id, c.time.TsClose)
+}
 
 func (c *stepCtx) Indicator(id mktdata.InstrumentID, key string) (indicator.Indicator, bool) {
 	m, ok := c.e.indicators[key]
@@ -216,10 +474,6 @@ func (c *stepCtx) Indicator(id mktdata.InstrumentID, key string) (indicator.Indi
 	return ind, ok
 }
 
-// AdjClose 返回复权后的收盘价。
-//
-// **拒绝 AdjQFQ**：前复权锚定末日，用于决策即构成未来函数（C1）
-// 且不可复现（C5）。展示层若需要前复权，应走独立接口，不经由 StepContext。
 func (c *stepCtx) AdjClose(id mktdata.InstrumentID, back int, mode mktdata.AdjMode) (int64, bool) {
 	if mode == mktdata.AdjQFQ {
 		return 0, false
