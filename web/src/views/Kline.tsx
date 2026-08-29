@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { api, fmtCompact, fmtDay, fmtNum, labelOf } from '../api'
 import CandleChart from '../components/CandleChart'
+import InstrumentTables from '../components/InstrumentTables'
 import {
   DataTable, DayInput, ErrBox, Field, Loading, downloadCSV, useAsync, type Col,
 } from '../components/ui'
@@ -20,6 +21,7 @@ export default function Kline({ id, meta }: { id: string; meta: Meta }) {
   const [kdj, setKdj] = useState('9,3,3')
   const [hover, setHover] = useState<KBar | null>(null)
   const [showTable, setShowTable] = useState(false)
+  const [showMeta, setShowMeta] = useState(false)
 
   const params = { adj, from, to, ma, macd, kdj }
   const res = useAsync<KlineData>(() => api.kline(id, params), [id, ...Object.values(params)])
@@ -100,7 +102,10 @@ export default function Kline({ id, meta }: { id: string; meta: Meta }) {
           <button onClick={() => { setFrom(String(meta.stats.lastDay - 10000)); setTo('') }}>近一年</button>
           <button onClick={exportCSV} disabled={!bars.length}>导出 CSV</button>
           <button onClick={() => setShowTable(!showTable)}>
-            {showTable ? '隐藏数据表' : '显示数据表'}
+            {showTable ? '隐藏逐日数值' : '逐日数值'}
+          </button>
+          <button onClick={() => setShowMeta(!showMeta)}>
+            {showMeta ? '隐藏因子/分红' : '因子 · 分红送配'}
           </button>
         </div>
         <p className="note">
@@ -159,6 +164,7 @@ export default function Kline({ id, meta }: { id: string; meta: Meta }) {
             )}
           </div>
 
+          {showMeta && <InstrumentTables id={id} meta={meta} />}
           {showTable && <BarTable bars={bars} data={res.data} scale={scale} />}
         </>
       )}
