@@ -51,3 +51,20 @@ func (c *CorpActions) ByInstrument(id InstrumentID) []CorpAction {
 
 // TotalRows 返回 corporate_action 表的原始行数（含全零行）。
 func (c *CorpActions) TotalRows() int { return len(c.all) }
+
+// Series 返回某标的的 (交易日, 收盘价) 序列，原始价。
+//
+// 它是**横向取数**，与引擎按时点纵向推进的访问模式相反 ——
+// 供基准比较、数据核对使用，策略拿不到它（策略只能经 History 看到
+// 当前时点之前的部分）。返回的是拷贝。
+func (c *Columns) Series(id InstrumentID) (days []int32, closes []int64, ok bool) {
+	sp, ok := c.spans[id]
+	if !ok || sp.n == 0 {
+		return nil, nil, false
+	}
+	days = make([]int32, sp.n)
+	closes = make([]int64, sp.n)
+	copy(days, c.tradingDay[sp.start:sp.start+sp.n])
+	copy(closes, c.close[sp.start:sp.start+sp.n])
+	return days, closes, true
+}

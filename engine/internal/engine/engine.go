@@ -6,6 +6,7 @@ import (
 
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/indicator"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/record"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 )
 
@@ -45,6 +46,7 @@ type Engine struct {
 	strategy Strategy
 	sizer    trading.Sizer
 	risk     trading.RiskChain
+	rec      record.Recorder
 	cfg      Config
 
 	factories  map[string]IndicatorFactory
@@ -86,6 +88,11 @@ type Deps struct {
 	Sizer trading.Sizer
 	// Risk 缺省为空链（不拦截）
 	Risk trading.RiskChain
+	// Recorder 缺省为 summary 级内存记录器。
+	//
+	// **记录由引擎发起而不是由驱动方发起**：单步驱动、批量海选、实盘增量
+	// 三种模式共用同一个核心（C4），记录逻辑若写在驱动里就要写三遍。
+	Recorder record.Recorder
 }
 
 // New 装配一个引擎。
@@ -110,10 +117,14 @@ func New(d Deps, s Strategy, cfg Config) (*Engine, error) {
 		}
 		d.Sizer = sz
 	}
+	if d.Recorder == nil {
+		d.Recorder = record.NewMemory(record.Summary, 0)
+	}
 	e := &Engine{
 		col: d.Columns, cur: mktdata.NewCursor(d.Columns), adj: d.Adjuster,
 		uni: d.Universe, corp: d.CorpAct, broker: d.Broker, market: d.Market,
-		pf: d.Portfolio, strategy: s, sizer: d.Sizer, risk: d.Risk, cfg: cfg,
+		pf: d.Portfolio, strategy: s, sizer: d.Sizer, risk: d.Risk,
+		rec: d.Recorder, cfg: cfg,
 		factories:  make(map[string]IndicatorFactory),
 		indicators: make(map[string]map[mktdata.InstrumentID]indicator.Indicator),
 		prices:     make(map[mktdata.InstrumentID]int64, 1024),
@@ -156,17 +167,17 @@ func (e *Engine) Portfolio() *trading.Portfolio { return e.pf }
 //
 // 阶段顺序不可颠倒，每一处都有理由：
 //
-//	1. 推进游标           当前 bar 变为可见
-//	2. 更新指标           策略读到的指标必须**已含当前 bar**
-//	3. 公司行动入账        除权除息在开盘前生效，**必须先于撮合** ——
-//	                      否则除权日的成交价与持仓基准会错配
-//	4. 撮合到期订单        **必须先于策略** —— 否则策略看不到已成交结果会重复下单
-//	5. 结算权益与峰值      Sizer 与 Risk 共用同一个权益快照，同一步里不会各算各的
-//	6. 调用策略           策略此时看到的是最新持仓与指标，只出**信号**
-//	7. Sizer 折算数量      信号 → 订单
-//	8. Risk 链逐单把关 + 定价入队
-//	                      由 Market 决定最早可执行时点；
-//	                      可在本时点成交的（盘后定价）立即撮合
+//  1. 推进游标           当前 bar 变为可见
+//  2. 更新指标           策略读到的指标必须**已含当前 bar**
+//  3. 公司行动入账        除权除息在开盘前生效，**必须先于撮合** ——
+//     否则除权日的成交价与持仓基准会错配
+//  4. 撮合到期订单        **必须先于策略** —— 否则策略看不到已成交结果会重复下单
+//  5. 结算权益与峰值      Sizer 与 Risk 共用同一个权益快照，同一步里不会各算各的
+//  6. 调用策略           策略此时看到的是最新持仓与指标，只出**信号**
+//  7. Sizer 折算数量      信号 → 订单
+//  8. Risk 链逐单把关 + 定价入队
+//     由 Market 决定最早可执行时点；
+//     可在本时点成交的（盘后定价）立即撮合
 func (e *Engine) Step() (mktdata.TimePoint, error) {
 	tp, updated, ok := e.cur.Advance()
 	if !ok {
@@ -226,7 +237,26 @@ func (e *Engine) Step() (mktdata.TimePoint, error) {
 
 	// 8. Risk 把关、定价入队；可在本时点成交的立即撮合
 	e.enqueue(orders, tp)
+
+	// 9. 记录。**放在最后** —— 盘后定价的单会在第 8 步就成交，
+	//    提前记会漏掉它们
+	e.rec.OnStep(record.Step{
+		Time: tp, EquityCents: e.stepEquity, CashCents: e.pf.Cash,
+		Positions:  countPositions(e.pf),
+		NumSignals: len(e.signals), NumFills: len(e.fills), NumRejects: len(e.rejects),
+		Signals: e.signals, Sized: e.sized, Fills: e.fills, Rejections: e.rejects,
+	})
 	return tp, nil
+}
+
+func countPositions(pf *trading.Portfolio) int {
+	n := 0
+	for _, p := range pf.Positions {
+		if p.Total > 0 {
+			n++
+		}
+	}
+	return n
 }
 
 // applyCorporateActions 处理当日的分红送配。
@@ -240,7 +270,7 @@ func (e *Engine) applyCorporateActions(tp mktdata.TimePoint, updated []mktdata.I
 				Instrument: a.Instrument, ExDate: a.ExDate,
 				CashBeforeTax: a.CashBeforeTax,
 				StockDividend: a.StockDividend, StockTransfer: a.StockTransfer,
-				RightsRatio:   a.RightsRatio, RightsPrice: a.RightsPrice,
+				RightsRatio: a.RightsRatio, RightsPrice: a.RightsPrice,
 			}, e.cfg.DividendTaxPPM, tp.TsClose)
 		}
 	}
@@ -601,3 +631,6 @@ func (e *Engine) Sizer() trading.Sizer { return e.sizer }
 
 // Risk 返回装配的风控链。
 func (e *Engine) Risk() trading.RiskChain { return e.risk }
+
+// Recorder 返回装配的记录器。
+func (e *Engine) Recorder() record.Recorder { return e.rec }

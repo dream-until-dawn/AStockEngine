@@ -17,6 +17,7 @@ import (
 
 	eng "github.com/dream-until-dawn/AStockEngine/engine/internal/engine"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/record"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/spec"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 )
@@ -299,29 +300,12 @@ func parseAdj(s string) (mktdata.AdjMode, error) {
 	return 0, fmt.Errorf("未知的 indicator_adj %q，可选：none / hfq", s)
 }
 
-// RecordLevel 记录级别。
-type RecordLevel int8
-
-const (
-	RecordNone RecordLevel = iota
-	RecordSummary
-	RecordFull
-)
-
-func parseLevel(s string) (RecordLevel, error) {
-	switch strings.ToLower(s) {
-	case "none":
-		return RecordNone, nil
-	case "summary":
-		return RecordSummary, nil
-	case "full":
-		return RecordFull, nil
-	}
-	return 0, fmt.Errorf("未知的 recorder.level %q，可选：none / summary / full", s)
+func parseLevel(s string) (record.Level, error) {
+	return record.ParseLevel(strings.ToLower(s))
 }
 
 // Level 返回解析后的记录级别。调用前配置须已通过 Validate。
-func (c *Config) Level() RecordLevel {
+func (c *Config) Level() record.Level {
 	l, _ := parseLevel(c.Recorder.Level)
 	return l
 }

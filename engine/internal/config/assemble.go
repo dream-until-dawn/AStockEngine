@@ -10,6 +10,7 @@ import (
 
 	eng "github.com/dream-until-dawn/AStockEngine/engine/internal/engine"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/record"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 )
 
@@ -26,6 +27,10 @@ type DataSet struct {
 	Calendar *mktdata.Calendar
 	Stats    mktdata.LoadStats
 	Root     string
+
+	// BenchmarkID 基准标的。它在 Columns 里但**不在标的池里**
+	BenchmarkID  mktdata.InstrumentID
+	HasBenchmark bool
 }
 
 // LoadDataSet 按配置载入数据。
@@ -57,6 +62,27 @@ func LoadDataSet(c *Config) (*DataSet, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 基准标的一并载入，但**不进标的池** —— Assemble 会把它裁掉。
+	// 不然策略会把基准当成可交易标的，超额收益就成了自己跟自己比。
+	benchID, hasBench := mktdata.InstrumentID(0), false
+	if c.Metrics.Benchmark != "" {
+		in := uni.BySymbol(c.Metrics.Benchmark)
+		if in == nil {
+			return nil, fmt.Errorf("metrics.benchmark: 未找到标的 %q", c.Metrics.Benchmark)
+		}
+		benchID, hasBench = in.ID, true
+		inPool := false
+		for _, id := range ids {
+			if id == benchID {
+				inPool = true
+				break
+			}
+		}
+		if !inPool {
+			ids = append(ids, benchID)
+			sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+		}
+	}
 	col, st, err := mktdata.Load(mktdata.LoadOptions{
 		Root: filepath.Join(root, "bar",
 			"market="+c.Data.Market, "freq="+c.Data.Freq),
@@ -66,10 +92,37 @@ func LoadDataSet(c *Config) (*DataSet, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DataSet{
+	ds := &DataSet{
 		Columns: col, Universe: uni, Adjuster: adj, CorpAct: corp,
 		Calendar: cal, Stats: st, Root: root,
-	}, nil
+	}
+	if hasBench {
+		ds.BenchmarkID, ds.HasBenchmark = benchID, true
+	}
+	return ds, nil
+}
+
+// BenchmarkCurve 抽出基准的净值序列，**用后复权收盘价**。
+//
+// 后复权而非原始价：基准的总回报要含分红再投，否则会系统性低估基准、
+// 让策略的超额收益虚高。
+//
+// 覆盖不到的交易日直接缺席，由 metrics 按交集处理 ——
+// 数据里没有指数（C10 纯技术面，ETL 没拉指数行情），只能用 ETF 代理，
+// 而宽基 ETF 最早到 2012（510300 / 159919 都是 2012-05-28 起）。
+func (ds *DataSet) BenchmarkCurve() (days []int32, equity []int64, ok bool) {
+	if !ds.HasBenchmark {
+		return nil, nil, false
+	}
+	days, closes, ok := ds.Columns.Series(ds.BenchmarkID)
+	if !ok {
+		return nil, nil, false
+	}
+	equity = make([]int64, len(closes))
+	for i, c := range closes {
+		equity[i] = ds.Adjuster.Adjust(ds.BenchmarkID, days[i], c, mktdata.AdjHFQ)
+	}
+	return days, equity, true
 }
 
 // ResolveUniverse 把配置里的过滤条件解析成一组标的 ID。
@@ -204,7 +257,8 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 
 	return eng.New(eng.Deps{
 		Columns: col, Universe: ds.Universe, Adjuster: ds.Adjuster, CorpAct: ds.CorpAct,
-		Market: market,
+		Recorder: record.NewMemory(c.Level(), 0),
+		Market:   market,
 		Broker: trading.NewBroker(market, fee, slip, trading.BrokerConfig{
 			VolumeCapPPM: c.Broker.VolumeCapPPM, AllowPartialFill: allowPartial,
 		}),

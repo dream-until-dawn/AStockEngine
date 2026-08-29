@@ -19,24 +19,15 @@ import (
 
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/config"
 	eng "github.com/dream-until-dawn/AStockEngine/engine/internal/engine"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/metrics"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/record"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 
 	// 策略经 init() 注册进 engine.Strategies，必须导入才会生效。
 	// 这是唯一需要空导入的地方 —— trading 的模块随包一起进来。
 	_ "github.com/dream-until-dawn/AStockEngine/engine/internal/strategies"
 )
-
-// equityPoint 是净值曲线上的一个点。全部为整数（分），
-// 保留原始精度供下游自行换算，避免在这里就损失信息。
-type equityPoint struct {
-	TradingDay   int32
-	EquityCents  int64
-	CashCents    int64
-	Positions    int
-	SignalsToday int
-	FillsToday   int
-	RejectsToday int
-}
 
 func main() {
 	cfgPath := flag.String("config", "", "配置文件路径（必填）")
@@ -77,39 +68,36 @@ func main() {
 	fmt.Println()
 
 	// ---- 主回测 ----
+	//
+	// 逐步记录由**引擎内的 Recorder** 负责，这里只做拒单归类与快照 ——
+	// 记录逻辑写在驱动里就得写三遍（单步 / 海选 / 实盘），而三者
+	// 共用同一个核心正是 C4 的意义。
 	initial := cfg.Portfolio.InitialCashCents
-	curve := make([]equityPoint, 0, 4096)
 	var snap []byte
 	var signals, fills, rejects int
 	rejectBy := map[string]int{}
 
 	t1 := time.Now()
 	for !e.Done() {
-		tp, err := e.Step()
-		if err != nil {
+		if _, err := e.Step(); err != nil {
 			fatal(err)
 		}
-		ns := len(e.Signals())
 		nf, nr := e.LastCounts()
-		signals += ns
+		signals += len(e.Signals())
 		fills += nf
 		rejects += nr
 		for _, r := range e.Rejections() {
 			rejectBy[reasonKey(r)]++
 		}
-		pf := e.Portfolio()
-		curve = append(curve, equityPoint{
-			TradingDay: tp.TradingDay, EquityCents: e.EquityCents(),
-			CashCents: pf.Cash, Positions: countPositions(pf),
-			SignalsToday: ns, FillsToday: nf, RejectsToday: nr,
-		})
 		if *snapAt > 0 && e.Steps() == *snapAt {
+			var err error
 			if snap, err = e.Snapshot(); err != nil {
 				fatal(err)
 			}
 		}
 	}
 	dur := time.Since(t1)
+	rec := e.Recorder()
 
 	pf := e.Portfolio()
 	final := e.EquityCents()
@@ -143,27 +131,25 @@ func main() {
 		fmt.Printf("  账本告警 %d 条，首条：%s\n", n, pf.Warnings[0])
 	}
 
-	// 净值序列的简单描述性统计。**不是绩效指标** —— 那是第二刀的 Metrics 模块，
-	// 这里只报告序列本身的形态，便于确认曲线是否合理。
-	if len(curve) > 0 {
-		peak, maxDD := curve[0].EquityCents, 0.0
-		for _, p := range curve {
-			if p.EquityCents > peak {
-				peak = p.EquityCents
-			}
-			if peak > 0 {
-				if dd := float64(peak-p.EquityCents) / float64(peak); dd > maxDD {
-					maxDD = dd
-				}
-			}
+	if m, ok := rec.(*record.Memory); ok {
+		if len(m.Warnings) > 0 {
+			fmt.Println(warnLine(m.Warnings))
 		}
-		fmt.Printf("  净值序列 %d 点，区间 %d ~ %d，峰值回撤 %.2f%%\n",
-			len(curve), curve[0].TradingDay, curve[len(curve)-1].TradingDay, maxDD*100)
 	}
 	fmt.Println()
 
+	// ---- 绩效 ----
+	if rec.Level() == record.None {
+		fmt.Println("=== 绩效 ===")
+		fmt.Println("  recorder.level = none，没有逐步记录，算不了绩效指标。")
+		fmt.Println("  海选内层用 none 省内存；要看指标请改成 summary。")
+		fmt.Println()
+	} else {
+		printReport(computeMetrics(cfg, ds, rec))
+	}
+
 	if *equityOut != "" {
-		if err := writeCurve(*equityOut, curve); err != nil {
+		if err := writeCurve(*equityOut, rec.Steps()); err != nil {
 			fatal(err)
 		}
 		fmt.Printf("净值序列已写出 -> %s\n\n", *equityOut)
@@ -242,7 +228,33 @@ func printModules() {
 	show("strategy", eng.Strategies.Names(), eng.Strategies.Specs)
 }
 
-func writeCurve(path string, curve []equityPoint) error {
+// computeMetrics 把记录喂给绩效模块。
+//
+// 年化系数**由日历数出来**（按本次样本区间实测），不是 252 ——
+// 252 是美股惯例，A 股实测年均 242.90 天。
+func computeMetrics(cfg *config.Config, ds *config.DataSet, rec record.Recorder) metrics.Result {
+	m, _ := rec.(*record.Memory)
+	days, eq := m.Curve()
+	in := metrics.Input{
+		Curve:        metrics.Curve{Days: days, Equity: eq},
+		InitialCents: cfg.Portfolio.InitialCashCents,
+		Fills:        rec.Fills(),
+		RiskFreePPM:  cfg.Metrics.RiskFreePPM,
+	}
+	var from, to int32
+	if len(days) > 0 {
+		from, to = days[0], days[len(days)-1]
+	}
+	in.TradingDaysPerYear = ds.Calendar.TradingDaysPerYear(mktdata.MarketAShare, from, to)
+
+	if bd, be, ok := ds.BenchmarkCurve(); ok {
+		in.Benchmark = &metrics.Curve{Days: bd, Equity: be}
+		in.BenchmarkName = cfg.Metrics.Benchmark
+	}
+	return metrics.Compute(in)
+}
+
+func writeCurve(path string, curve []record.Step) error {
 	if dir := filepath.Dir(path); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return err
@@ -265,13 +277,13 @@ func writeCurve(path string, curve []equityPoint) error {
 	}
 	for _, p := range curve {
 		if err := w.Write([]string{
-			strconv.FormatInt(int64(p.TradingDay), 10),
+			strconv.FormatInt(int64(p.Time.TradingDay), 10),
 			strconv.FormatInt(p.EquityCents, 10),
 			strconv.FormatInt(p.CashCents, 10),
 			strconv.Itoa(p.Positions),
-			strconv.Itoa(p.SignalsToday),
-			strconv.Itoa(p.FillsToday),
-			strconv.Itoa(p.RejectsToday),
+			strconv.Itoa(p.NumSignals),
+			strconv.Itoa(p.NumFills),
+			strconv.Itoa(p.NumRejects),
 		}); err != nil {
 			return err
 		}
