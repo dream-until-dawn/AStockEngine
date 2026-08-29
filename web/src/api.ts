@@ -82,3 +82,27 @@ export function fmtCompact(v: number): string {
 export function labelOf(items: { code: number; label: string }[] | undefined, code: number): string {
   return items?.find((i) => i.code === code)?.label ?? String(code)
 }
+
+// ---- 回测 ----
+
+export const runApi = {
+  configs: () =>
+    get<{ dir: string; configs: import('./types').ConfigItem[] }>('/configs'),
+  backtest: async (cfg: unknown): Promise<import('./types').RunResult> => {
+    const res = await fetch('/api/backtest', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: typeof cfg === 'string' ? cfg : JSON.stringify(cfg),
+    })
+    const text = await res.text()
+    if (!res.ok) {
+      try {
+        throw new ApiError(JSON.parse(text).error ?? text)
+      } catch (e) {
+        if (e instanceof ApiError) throw e
+        throw new ApiError(`HTTP ${res.status}: ${text.slice(0, 400)}`)
+      }
+    }
+    return JSON.parse(text)
+  },
+}

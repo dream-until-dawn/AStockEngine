@@ -33,9 +33,11 @@ type Store struct {
 	InstStats map[mktdata.InstrumentID]InstStat
 
 	DataRoot string
-	LoadedAt time.Time
-	LoadMS   int64
-	BarStats mktdata.LoadStats
+	// ConfigDir 回测配置所在目录。也是从浏览器传来的配置里相对路径的解析基准
+	ConfigDir string
+	LoadedAt  time.Time
+	LoadMS    int64
+	BarStats  mktdata.LoadStats
 }
 
 // InstStat 是单个标的的数据覆盖情况。

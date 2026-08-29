@@ -129,21 +129,41 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("读取配置 %s 失败: %w", path, err)
 	}
+	c, err := Parse(b, filepath.Dir(path))
+	if err != nil {
+		return nil, fmt.Errorf("配置 %s：%w", path, err)
+	}
+	return c, nil
+}
+
+// Parse 解析并校验一份配置。dir 是相对路径的解析基准
+// （通常是配置文件所在目录；配置由网络传来时用一个约定的基准目录）。
+//
+// 与 Load 分开是为了让 Web 端能把改过参数的配置直接 POST 回来跑，
+// 而不必先落盘。
+func Parse(b []byte, dir string) (*Config, error) {
 	var c Config
 	dec := json.NewDecoder(strings.NewReader(string(b)))
 	// 拒绝未知字段：把 "sizer" 写成 "sizor" 时若静默忽略，
 	// 引擎会用默认值跑完并给出看似正常的结果 —— 比报错难查得多
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&c); err != nil {
-		return nil, fmt.Errorf("解析配置 %s 失败: %w", path, err)
+		return nil, fmt.Errorf("解析失败: %w", err)
 	}
-	c.dir = filepath.Dir(path)
+	c.dir = dir
 	c.applyDefaults()
 	if err := c.Validate(); err != nil {
-		return nil, fmt.Errorf("配置 %s 校验失败: %w", path, err)
+		return nil, fmt.Errorf("校验失败: %w", err)
 	}
 	return &c, nil
 }
+
+// SetDataRoot 覆盖数据根目录。
+//
+// 服务端用它把配置指向自己已经载入的那份数据 —— 否则一份从浏览器传来的
+// 配置可能指向别处，而服务端手里只有启动时载入的那一份，
+// 用它跑却按配置里的路径算指纹，两者对不上。
+func (c *Config) SetDataRoot(abs string) { c.Data.Root = abs }
 
 func (c *Config) applyDefaults() {
 	if c.Data.Root == "" {
