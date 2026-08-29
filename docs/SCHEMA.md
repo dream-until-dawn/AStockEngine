@@ -1,0 +1,431 @@
+# 数据 Schema 定义
+
+> **状态：待评审**（v0.1 开工前需定稿）
+> 最后更新：2026-08-28
+> 依据：[ROADMAP.md](ROADMAP.md) 的「数据存储设计」章节与 [v0.0 探针结论](probe/REPORT-v0.0.md)
+
+本文档是 **Python ETL 与 Go 引擎唯一的契约**。两侧实现必须严格一致，
+任何字段变更都是双边改动，因此本文档定稿后的修改需同步升级 `schema_version`。
+
+---
+
+## 0. 通用约定
+
+### 0.1 类型选择原则
+
+沿用 ROADMAP 的**保守子集原则**：只使用各语言 Parquet 实现都成熟支持的类型。
+
+- 整数一律用**有符号**类型（`INT8` / `INT32` / `INT64`）。
+  无符号类型在部分实现中支持不一致，而 `INT32` 的 21 亿容量远超本项目需求。
+- 不使用 `DECIMAL` 逻辑类型 —— 跨语言支持参差，改用**定点整数 + scale**。
+- 不使用 `DATE` / `TIMESTAMP` 逻辑类型 —— 时区语义在各实现间存在分歧，
+  改用显式的 `INT32 (YYYYMMDD)` 与 `INT64 (UTC 毫秒)`。
+- 布尔语义用 `INT8`（0/1）而非 `BOOLEAN`，便于与多值枚举统一处理。
+
+### 0.2 定点整数约定
+
+| 概念 | 表示 | scale 来源 |
+|---|---|---|
+| 价格 | `INT64` | `instruments.price_scale`（A 股 = 1000，即最小单位 0.001 元） |
+| 数量 | `INT64` | `instruments.qty_scale`（A 股 = 1，即最小单位 1 股/份） |
+| 金额 | `INT64` | 固定为计价币种最小单位（A 股 = 分，即 1e-2 元） |
+| 比率 | `INT32` | 固定 1e6（如换手率 0.256% 存为 `256000`） |
+
+> 价格用定点整数**不是为了体积**（实测仅比 float64 省 6%），
+> 而是为了约束 C5 可复现性：浮点累加顺序不同会导致结果不同，
+> 并发海选下无法保证逐笔一致。详见 ROADMAP「关键类型决策」。
+
+### 0.3 时间约定
+
+| 字段 | 类型 | 定义 |
+|---|---|---|
+| `ts_open` | `INT64` | **UTC 毫秒**，bar 的**起始时刻**。A 股日线 = 09:30 CST = 01:30 UTC |
+| `ts_close` | `INT64` | **UTC 毫秒**，bar 的**结束时刻**。A 股日线 = 15:00 CST = 07:00 UTC |
+| `trading_day` | `INT32` | `YYYYMMDD`，业务语义的交易日 |
+| 其余日期字段 | `INT32` | `YYYYMMDD` |
+
+#### 为什么两端都存
+
+**单一的 `ts` 字段名本身就是缺陷**：它不表明指向哪一端，
+而不同数据源的惯例恰好相反 ——
+
+| 来源 | 惯例 |
+|---|---|
+| Binance kline | `[0]` 为 **Open time**，`[6]` 为 Close time |
+| OKX candlesticks | `ts` 为 K 线**开始时间** |
+| 传统日线数据 | 通常只给交易日期，无时刻语义 |
+
+若沿用外部惯例只存起始时刻，引擎必须自行推导结束时刻；
+而 A 股日线的「时长」并非固定时段（09:30 开、15:00 收，中间有午休），
+推导依赖交易时段知识 —— **这正是产生未来函数 off-by-one 的典型位置**，
+直接违背首要约束 C1。
+
+因此两端都存，且**用名称消除歧义**。实测代价 **+1.22%**（全市场 +4.3 MB），
+与 `trading_day` 的刻意冗余同理。
+
+#### 引擎使用规则
+
+- **时间游标一律使用 `ts_close`** —— 它才是「该 bar 信息可得」的时刻
+- `ts_open` 仅用于与外部数据源对齐、图表展示，以及远期 24×7 市场的自然索引
+- **策略侧不得访问 `ts_open`**，避免误用为决策时点
+
+> **已定**：A 股开盘价实际产生于 09:25 的集合竞价，但**本项目不建模集合竞价**
+> （见 ROADMAP C8「明确不建模的机制」），故 `ts_open` 取 09:30（连续竞价开始）。
+> 该约定在仅日线的范围下不产生歧义 —— 日线数据本就不含竞价阶段的委托明细。
+
+### 0.4 枚举定义
+
+枚举值的含义以本文档为准，Python 与 Go 两侧各自实现为编译期常量。
+**0 一律保留为「未知/无效」**，便于识别未初始化数据。
+
+```
+market      1=ashare                     远期：2=us  3=hk  4=futures  5=crypto
+exchange    1=SSE(上交所)  2=SZSE(深交所)  3=BSE(北交所)
+type        1=stock(个股)  2=etf
+board       1=主板  2=创业板  3=科创板  4=北交所
+quote_ccy   1=CNY                        远期：2=USD  3=USDT
+status      1=在市  2=已退市
+```
+
+### 0.5 排序保证
+
+`bar` 表的每个文件内部必须按 **`(instrument_id, ts_close)` 严格升序**。
+
+这不是可选优化：`DELTA_BINARY_PACKED` 编码的压缩效果依赖于此，
+引擎的顺序扫描也假定此前提。ETL 必须在写出前排序，质检需校验。
+
+---
+
+## 1. `bar` —— 行情时序
+
+**路径**：`data/bar/market={market}/freq={freq}/year={YYYY}/part-*.parquet`
+**主键**：`(instrument_id, ts_close)`
+**规模**：A 股日线全量约 2000 万行 / 约 360 MB
+**编码**：定点整数 + `DELTA_BINARY_PACKED` + zstd(level 3)
+
+### 1.1 核心列 —— 全市场严格统一
+
+引擎核心循环只读这 10 列。**其名称与语义不可变更**，新增市场必须能填满它们。
+
+| 字段 | Parquet | Go | 可空 | 说明 |
+|---|---|---|---|---|
+| `instrument_id` | INT32 | `int32` | 否 | 引擎内部 ID，见 `instruments` |
+| `ts_open` | INT64 | `int64` | 否 | UTC 毫秒，bar 起始时刻。**策略侧不得使用** |
+| `ts_close` | INT64 | `int64` | 否 | UTC 毫秒，bar 结束时刻。**时间游标用此列** |
+| `trading_day` | INT32 | `int32` | 否 | YYYYMMDD |
+| `open` | INT64 | `int64` | 否 | 定点价格 |
+| `high` | INT64 | `int64` | 否 | 定点价格 |
+| `low` | INT64 | `int64` | 否 | 定点价格 |
+| `close` | INT64 | `int64` | 否 | 定点价格 |
+| `volume` | INT64 | `int64` | 否 | 定点数量 |
+| `amount` | INT64 | `int64` | 否 | 成交额，单位为分 |
+
+> **均为不可空**。停牌日的处理不是「置空」而是写入零成交行并由
+> `tradestatus` 标记 —— 见 1.3。
+
+### 1.2 A 股扩展列
+
+直接附于同表。Go 侧用只含核心列的 `CoreBar` struct 亦可读取
+（已由 `engine/cmd/subsetread` 实测验证）。
+
+| 字段 | Parquet | Go | 可空 | 说明 |
+|---|---|---|---|---|
+| `preclose` | INT64 | `int64` | 否 | **除权调整后的前收盘价**，涨跌停基准（C8.1） |
+| `turn` | INT32 | `int32` | 否 | 换手率，百分数 ×1e6 |
+| `tradestatus` | INT8 | `int8` | 否 | 1=正常交易 0=停牌 |
+| `is_st` | INT8 | `int8` | 否 | 1=ST 0=非 ST。**影响涨跌停幅度**（ST 为 5%） |
+
+远期其他市场的扩展列（不在 v0.1 实现）：
+`us` → `pre_market_volume`；`futures` → `open_interest` / `settlement`；
+`crypto` → `funding_rate`。
+
+### 1.3 停牌行的语义
+
+BaoStock 在停牌日**照常返回行**，因此 `bar` 表与交易日历对齐，
+且天然具备 point-in-time 语义：
+
+```
+某日标的池 = SELECT DISTINCT instrument_id FROM bar WHERE trading_day = d
+```
+
+停牌行的取值（**v0.0 已实测确认**，保千里 84 个停牌日、乐视网 107 个停牌日）：
+
+- `tradestatus = 0`
+- `volume = 0`、`amount = 0`
+- `open = high = low = close = preclose` = 停牌前最后收盘价
+  （价格序列因此保持连续，指标计算不会出现空洞，无需 ETL 回填）
+
+```
+date        open   high   low   close  preclose  volume  amount  turn  tradestatus
+2019-04-26  1.0400 1.0400 1.0400 1.0400  1.0400      0   0.0000  (空)      0
+```
+
+> ⚠️ **解析注意**：停牌行的 `turn` 是**空字符串**而非 `0`。
+> ETL 必须以 `pd.to_numeric(errors="coerce").fillna(0)` 之类的方式容错，
+> 直接 `float("")` 会抛异常。
+
+### 1.4 ETF 的字段缺口
+
+新浪 `fund_etf_hist_sina` **不提供 `preclose`**（仅少数标的带 `prevclose`），
+也不提供 `turn` / `tradestatus` / `is_st`。ETF 行的处理约定：
+
+| 字段 | ETF 取值 |
+|---|---|
+| `preclose` | 由 `corporate_action` 推算；无除权则取前一交易日 `close` |
+| `turn` | 0（新浪不提供流通份额，无法计算） |
+| `tradestatus` | 1（新浪无停牌标记，缺行即视为停牌/未上市） |
+| `is_st` | 0（ETF 无 ST 概念） |
+
+> ⚠️ 这是**已知的数据质量降级**，必须在质检报告中单独计数，
+> 且 Web 端在回测 ETF 时应提示 `turn` 不可用。
+
+---
+
+## 2. `instruments` —— 标的静态属性
+
+**路径**：`data/meta/instruments.parquet`（+ `instruments.csv` 镜像）
+**主键**：`instrument_id`
+**唯一约束**：`(market, symbol)`
+**规模**：约 7200 行（A 股个股 5549 + ETF 1651）
+
+| 字段 | Parquet | Go | 可空 | 说明 |
+|---|---|---|---|---|
+| `instrument_id` | INT32 | `int32` | 否 | 主键，从 1 开始 |
+| `market` | INT8 | `int8` | 否 | 枚举，见 0.4 |
+| `symbol` | STRING | `string` | 否 | 市场内唯一。A 股为 6 位数字，**不含交易所前缀** |
+| `exchange` | INT8 | `int8` | 否 | 枚举 |
+| `name` | STRING | `string` | 否 | 当前/最终名称。**不做时变**，见下方说明 |
+| `type` | INT8 | `int8` | 否 | 1=个股 2=ETF |
+| `board` | INT8 | `int8` | 否 | 决定涨跌停幅度，Market 模块使用 |
+| `price_scale` | INT32 | `int32` | 否 | A 股 = 1000 |
+| `qty_scale` | INT32 | `int32` | 否 | A 股 = 1 |
+| `quote_ccy` | INT8 | `int8` | 否 | A 股 = 1 (CNY) |
+| `min_order_qty` | INT32 | `int32` | 否 | 最小申报数量 |
+| `qty_step` | INT32 | `int32` | 否 | 申报数量递增单位 |
+| `list_date` | INT32 | `int32` | 否 | 上市日 YYYYMMDD |
+| `delist_date` | INT32 | `int32` | **是** | 退市日；在市为 null |
+| `status` | INT8 | `int8` | 否 | 1=在市 2=已退市 |
+| `attrs` | STRING | `string` | **是** | 市场特定属性，JSON |
+
+### 2.1 `min_order_qty` / `qty_step` 取值
+
+| 板块 | `min_order_qty` | `qty_step` |
+|---|---|---|
+| 主板 / 创业板（个股） | 100 | 100 |
+| 科创板（个股） | 200 | 1 |
+| ETF | 100 | 100 |
+| 北交所 | 100 | 1 |
+
+> 北交所规则**已核实**：单笔申报不低于 100 股，以 **1 股**为单位递增
+> （来源：广发基金、证券时报对《北交所交易规则》的解读）。
+>
+> 卖出零股（不足最小单位的余股）必须一次性全部卖出 —— 这是 Broker 的规则，
+> 不在本表体现。
+
+### 2.2 关于 `name` 不做时变
+
+严格说名称是时变的（`乐视网` → `*ST视退`），标准做法是
+`(instrument_id, name, valid_from, valid_to)` 区间表。本项目**刻意不做**：
+
+- 策略不消费名称，它只影响展示
+- BaoStock 不提供历史名称，做区间表需引入新数据源
+
+代价：回看 2019 年的回测报告时，显示的是标的**当前/最终**名称。
+
+> **已确认**（2026-08-28 评审）：接受此代价。
+> 若将来判定不可接受，再补 `instrument_name` 区间表，不影响其他表。
+
+### 2.3 `attrs` JSON
+
+v0.1 的 A 股标的此列为 null。远期市场用于承载：
+
+```json
+// futures
+{"contract_multiplier": 300, "expiry_date": 20240315, "underlying": "IF"}
+// crypto
+{"base_ccy": "BTC", "contract_type": "perpetual", "venue": "binance"}
+```
+
+instruments 仅数万行，全量载入内存后解析 JSON 无性能顾虑，
+换来的是**新增市场不改表结构**。
+
+### 2.4 `instrument_id` 分配规则
+
+**这条规则关系到增量更新的正确性，必须严格遵守：**
+
+1. 按 `(market, symbol)` **首次出现**时分配，单调递增，从 1 开始
+2. **永不复用**，即使标的退市
+3. ETL 每次运行必须先读取已有 `instruments.parquet` 取得现有映射，
+   仅为新标的分配新 ID
+4. 若 `instruments.parquet` 丢失，则所有 ID 会重新分配，
+   **既有的 `bar` 分区文件随之全部失效**，必须整体重建
+
+> 因此 `instruments.parquet` 是整个数据集里最关键的单个文件。
+> 质检需校验其单调性与唯一性；建议 ETL 每次运行前自动备份该文件。
+
+---
+
+## 3. `calendar` —— 交易日历
+
+**路径**：`data/meta/calendar.parquet`（+ CSV 镜像）
+**主键**：`(market, date)`
+**规模**：约 9000 行/市场
+
+| 字段 | Parquet | Go | 可空 | 说明 |
+|---|---|---|---|---|
+| `market` | INT8 | `int8` | 否 | 枚举 |
+| `date` | INT32 | `int32` | 否 | YYYYMMDD |
+| `is_trading_day` | INT8 | `int8` | 否 | 1=交易日 0=非交易日 |
+
+日历包含非交易日（`is_trading_day = 0`），便于直接做日期区间运算，
+无需另行判断周末与节假日。
+
+---
+
+## 4. `adj_factor` —— 复权因子
+
+**路径**：`data/meta/adj_factor.parquet`（+ CSV 镜像）
+**主键**：`(instrument_id, ex_date)`
+**规模**：约 20 万行（每标的数十行）
+**语义**：**事件式**，仅在除权日给出一行；**自 `ex_date` 当日起生效**（前向填充）
+
+| 字段 | Parquet | Go | 可空 | 说明 |
+|---|---|---|---|---|
+| `instrument_id` | INT32 | `int32` | 否 | |
+| `ex_date` | INT32 | `int32` | 否 | 除权除息日 YYYYMMDD |
+| `hfq_factor` | INT64 | `int64` | 否 | 后复权因子，定点 **scale = 1e12** |
+| `hfq_factor_raw` | STRING | `string` | 否 | 数据源原始字符串，保留 16 位精度用于审计 |
+
+### 4.1 为什么存两份
+
+数据源（新浪）返回的因子是 **16 位精度的字符串**，直接 `float()` 会丢精度。
+
+- `hfq_factor`：定点 int64，scale 1e12，供引擎直接使用，**无需 Go 端引入 Decimal 库**
+- `hfq_factor_raw`：原样保留字符串，用于审计与将来重算
+
+精度核算：因子实际范围约 1~10000，`10000 × 1e12 = 1e16 < 9.2e18`（int64 上限），
+不会溢出；scale 1e12 提供 13 位有效数字，而 v0.0 实测的还原相对误差为 4.19e-07
+（受限于数据源后复权价的 2 位小数），13 位有效数字远超所需。
+
+### 4.2 使用方式
+
+```
+后复权价(d) = 原始价(d) × hfq_factor(最近一个 ex_date <= d) / 1e12
+```
+
+无匹配记录时（标的上市至今无除权）因子取 `1e12`（即 1.0）。
+
+> **前复权价禁止持久化**（C2）：它锚定在最后一个交易日，
+> 每次新除权都会改写全部历史值，既不可复现，本身也是未来函数。
+
+---
+
+## 5. `corporate_action` —— 分红送配
+
+**路径**：`data/meta/corporate_action.parquet`（+ CSV 镜像）
+**主键**：`(instrument_id, ex_date)`
+**用途**：Portfolio 模块据此将现金分红入账、送转股增加持仓（C2）
+
+| 字段 | Parquet | Go | 可空 | 说明 |
+|---|---|---|---|---|
+| `instrument_id` | INT32 | `int32` | 否 | |
+| `ex_date` | INT32 | `int32` | 否 | 除权除息日 |
+| `record_date` | INT32 | `int32` | 是 | 股权登记日 |
+| `pay_date` | INT32 | `int32` | 是 | 派息日。当前数据源不提供，恒为 null（见 5.3） |
+| `cash_before_tax` | INT64 | `int64` | 否 | **每股**税前现金红利，定点 scale 1e6（元） |
+| `stock_dividend` | INT64 | `int64` | 否 | **每股**送股数，定点 scale 1e6 |
+| `stock_transfer` | INT64 | `int64` | 否 | **每股**转增股数，定点 scale 1e6 |
+| `rights_ratio` | INT64 | `int64` | 否 | **每股**配股数，定点 scale 1e6 |
+| `rights_price` | INT64 | `int64` | 否 | 配股价格，定点（见 `price_scale`） |
+
+### 5.2 配股为何单列两个字段
+
+配股同样导致除权，但 Portfolio 的处理与分红送转**完全不同**：
+配股需要股东按 `rights_price` 掏钱认购 `rights_ratio` 份额，不认购则被稀释。
+回测须显式选择「参与 / 不参与」，因此价格与比例两者都要存。
+
+数据源的 `分红` 与 `配股` 是同一接口的不同 `indicator`，字段结构也不同，
+须分别抓取。v0.1 首轮只取了 `分红`，导致 7889 个复权因子事件找不到对应记录
+（如 600001 于 2000-05-29 的配股）。
+
+### 5.3 不存税后金额
+
+BaoStock 的 `dividCashPsAfterTax` 存在 `"27.7884或30.876"` 这类
+**非数值字符串**（税率分档所致）。
+
+红利税属于**规则**而非数据：税率随持股期限变化，应由 `Fee` / `Portfolio`
+模块按 `configs/fee/*.json` 计算。因此本表**只存税前金额**。
+
+> **已确认**（2026-08-28 评审）：税率计算归 Fee 模块。
+
+---
+
+## 6. `_manifest.json` —— 数据版本指纹
+
+**路径**：`data/meta/_manifest.json`
+
+约束 C5 要求结果指纹包含**数据版本**。每次 ETL 产出后写出：
+
+```json
+{
+  "schema_version": "1.0.0",
+  "data_version": "2026-08-28T21:40:00+08:00",
+  "generated_at": "2026-08-28T21:40:00+08:00",
+  "sources": {
+    "stock_bar": "baostock-0.9.3",
+    "etf_bar": "akshare-1.18.94/fund_etf_hist_sina",
+    "adj_factor": "akshare-1.18.94/stock_zh_a_daily:hfq-factor"
+  },
+  "row_counts": {"bar": 19923117, "instruments": 7200, "adj_factor": 198433},
+  "trading_day_range": [20050104, 20260828],
+  "content_hash": "sha256:..."
+}
+```
+
+引擎启动时读取，并将 `data_version` + `content_hash` 纳入回测结果指纹。
+`schema_version` 不匹配时引擎应**拒绝启动**，而非静默按旧 schema 解析。
+
+---
+
+## 7. 尚未定义的表
+
+| 表 | 版本 | 说明 |
+|---|---|---|
+| `results` | v0.5 | 海选结果，由 Go 写入。字段依赖 Metrics 模块的最终指标集，届时定义 |
+| `equity` | v0.5 | 净值曲线分片 |
+| `snapshot` | v0.4 | 引擎状态快照，非 Parquet（JSON / gob） |
+
+---
+
+## 8. 评审记录与剩余开放项
+
+### 已确认（2026-08-28 评审）
+
+| # | 事项 | 结论 |
+|---|---|---|
+| 1 | 停牌行 OHLC 取值（1.3） | ✅ 实测确认：OHLC 全等于停牌前收盘价，量额为 0，无需回填 |
+| 2 | 北交所申报单位（2.1） | ✅ 核实确认：100 股起，1 股递增 |
+| 3 | `name` 不做时变（2.2） | ✅ 接受展示层代价 |
+| 4 | 不存税后分红（5.1） | ✅ 税率计算归 Fee 模块 |
+| 5 | 集合竞价（0.3） | ✅ **不建模**，`ts_open` 取 09:30 |
+
+### 剩余开放项
+
+| # | 事项 | 阻塞于 |
+|---|---|---|
+| 1 | **ETF 的 `preclose` 推算方式**（1.4） | ETF 复权方案的收口结果（v0.1） |
+| 2 | **`is_st` 数据可信度** | 见下 |
+
+#### `is_st` 需要交叉校验
+
+v0.0 抽样时发现：乐视网（sz.300104）2019-04-26 至 05-08 期间 `isST=0`，
+而该标的当时可能已被实施退市风险警示。样本量不足以断言数据源有误，
+但 `is_st` **直接决定涨跌停幅度**（ST 为 5%），标记错误会导致 Broker 误判。
+
+由于不保留历史名称（2.2），无法用「名称含 ST 前缀」交叉核对。
+改用**自洽校验**，列入 v0.1 质检项：
+
+- `is_st = 1` 的交易日，其 `(close - preclose) / preclose` 不应超过 ±5%
+- `is_st = 0` 的主板标的，不应超过 ±10%
+
+（均需排除上市首日与除权日）越界即说明 `is_st` 或 `board` 标记有误。

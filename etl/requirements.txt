@@ -1,0 +1,10 @@
+# ETL 层依赖（Python 3.14）
+# 安装：.venv/Scripts/python.exe -m pip install --no-cache-dir -r etl/requirements.txt
+#
+# 注意：若用户名含非 ASCII 字符，pip 缓存目录会触发 PermissionError，
+# 必须带 --no-cache-dir。
+
+akshare>=1.18.94        # 新浪原始价与复权因子、东财退市股行情
+baostock>=0.9.3         # 备用源：停牌/ST 标记、point-in-time 股票池
+pandas>=3.0.0
+pyarrow>=25.0.0         # Parquet 落盘

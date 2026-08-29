@@ -1,0 +1,10 @@
+{
+  "name": "example-go",
+  "language": "go",
+  "mode": "raw",
+  "capabilities": ["STOCK_BARS"],
+  "markets": ["crypto"],
+  "build": ["go", "build", "-o", "bin/ingest", "./cmd/ingest"],
+  "run": ["bin/ingest", "--symbol", "{symbol}", "--exchange", "{exchange}", "--start", "{start}", "--end", "{end}", "--out", "{out}"],
+  "output_format": "jsonl"
+}
