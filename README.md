@@ -55,7 +55,30 @@ python -m venv .venv
 
 再次运行 `sync_bars.py` 即为增量更新，只补新交易日。
 
-### 3. 跑回测
+### 3. 打开数据核对台
+
+在改策略之前，先确认数据是对的。核对台把四张非行情表、日线行情
+与**引擎算出的指标**摆在同一个页面上：
+
+```bash
+cd engine && go run ./cmd/server
+```
+
+```bash
+cd web && npm install && npm run build
+```
+
+构建完前端后访问 http://127.0.0.1:8123 。开发前端时改用 `npm run dev`
+（热更新，把 `/api` 代理到后端），访问 http://localhost:5173 。
+
+后端首次启动约 30 秒 —— 它把全部 1,767 万行日线一次性载入内存（1.25 GB）。
+原因和用法见 [WEB.md](docs/WEB.md)。
+
+K 线页上的 MACD / KDJ / 均线**由后端引擎算出**，走的是与回测逐字节相同的
+代码路径。切换复权模式时，读数面板会把「所选基准」与「回测基准（后复权）」
+两组指标值并排给出。
+
+### 4. 跑回测
 
 ```bash
 cd engine && go run ./cmd/backtest -strategy macd_cross -equity-out ../data/results/macd.csv
@@ -91,7 +114,11 @@ engine/        Go 回测引擎
   internal/trading/     Fee / Market / Portfolio / Broker
   internal/engine/      Step() 状态机与策略接口
   internal/strategies/  样例策略
-  cmd/                  命令行入口
+  cmd/backtest          回测命令行
+  cmd/server            数据核对服务（HTTP API）
+web/           数据核对台前端（React + Vite）
+  src/views/            五个视图：概览 / 标的 / K线 / 日历 / 因子 / 分红
+  src/components/       图表与通用表格
 configs/       费率 / 市场 / 策略配置
 data/          数据与结果（**不入 git**）
 docs/          设计文档
@@ -104,6 +131,7 @@ docs/          设计文档
 | [ROADMAP.md](docs/ROADMAP.md) | **活文档**：10 条架构约束（C1–C10）、存储设计、版本排期 |
 | [SCHEMA.md](docs/SCHEMA.md) | 表结构契约，Python 与 Go 都以此为准 |
 | [ETL.md](docs/ETL.md) | 数据管道说明；**第 6 节「踩过的坑」是全项目信息密度最高的一节** |
+| [WEB.md](docs/WEB.md) | 数据核对台：接口、五个视图、七条设计决策 |
 | [DESIGN-v0.2-dataflow.md](docs/DESIGN-v0.2-dataflow.md) | 行情数据流设计评审 |
 | [DESIGN-v0.2-trading.md](docs/DESIGN-v0.2-trading.md) | 交易语义设计评审 |
 | [probe/REPORT-v0.0.md](docs/probe/REPORT-v0.0.md) | 技术选型的实测依据 |
