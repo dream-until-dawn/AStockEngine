@@ -127,6 +127,11 @@ func main() {
 		fmt.Printf("  %s %.2f", k, cents(pf.FeeCents[k]))
 	}
 	fmt.Println()
+	// 滑点单列。它以前藏在成交价里，报告只看得到佣金印花税，
+	// 看不到执行摩擦到底吃掉多少 —— 而它经常比佣金还大
+	fmt.Printf("  滑点合计 %.2f 元（占初始 %.2f%%）  摩擦合计 %.2f 元\n",
+		cents(pf.SlippageCents), float64(pf.SlippageCents)/float64(initial)*100,
+		cents(pf.TotalFeeCents()+pf.SlippageCents))
 
 	if len(rejectBy) > 0 {
 		fmt.Println("  拒单原因分布：")

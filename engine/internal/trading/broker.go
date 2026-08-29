@@ -90,10 +90,17 @@ func (r RejectReason) String() string {
 // Fill 是一笔成交。
 type Fill struct {
 	Order
-	At    mktdata.TimePoint
+	At mktdata.TimePoint
+	// Price 是**市场参考价**，不含滑点。滑点单独记在 SlippageCents 里 ——
+	// 混进价格会让「成交价」既不是市场上真实存在的价格，
+	// 也无法与行情数据核对。
 	Price int64 // 定点成交价
 	Qty   int64
 	Fee   FeeBreakdown
+	// SlippageCents 执行摩擦（分）。它不是「费用」——
+	// 佣金印花税过户费是付给第三方的真金白银，滑点是执行质量的损耗，
+	// 两者分开记，费用合计才能与券商对账单对得上。
+	SlippageCents int64
 }
 
 // Rejection 是一次拒单。Detail 给出可读的数值依据，
@@ -110,32 +117,64 @@ type Rejection struct {
 }
 
 // Slippage 滑点模型，可插拔。
+//
+// **它返回成本（分）而不是调整后的价格。** 这一点换过一次，理由是实测出来的：
+//
+// 价格是定点整数，单位厘。5 bp 的滑点在 20 元以下的标的上不足一厘，
+// 于是无论怎么取整都错得很离谱 —— 0.594 元的标的：向下取整 −100%、
+// 向上取整 +237%；1.071 元：−100% / +87%；3.132 元：−36% / +28%。
+//
+// 实测（buy_and_hold，成交额约 99.3 万元，配置 5.00 bp）：
+//
+//	向下取整（原实现）  3.67 bp   −26.5%
+//	向上取整            5.63 bp   +12.7%
+//	四舍五入            5.34 bp    +6.7%
+//	本实现（按成本）    5.00 bp     精确
+//
+// **问题不在取整方向，在于施加的位置。**
+//
+// 改成按成交总额计成本后，粒度从厘变成分、基数从单价变成总额，
+// 相对误差降到可忽略（10 万元一笔 5 bp = 5000 分，取整误差 0.02%）。
+// 附带的好处是滑点从此在账本里可见 —— 以前它藏在成交价里，
+// 报告只看得到佣金印花税，看不到执行摩擦到底吃掉多少。
 type Slippage interface {
 	Name() string
-	// Apply 返回考虑滑点后的成交价
-	Apply(side Side, refPrice int64, b mktdata.Bar, qty int64) int64
+	// CostCents 返回这笔成交因滑点付出的额外成本（分，恒为非负）。
+	// 买入时加到成本上，卖出时从收入里扣掉。
+	CostCents(side Side, price int64, qty int64, b mktdata.Bar) int64
 }
 
 // NoSlippage 无滑点，用于隔离测试。
 type NoSlippage struct{}
 
 func (NoSlippage) Name() string { return "none" }
-func (NoSlippage) Apply(_ Side, ref int64, _ mktdata.Bar, _ int64) int64 { return ref }
 
-// BpsSlippage 固定基点滑点：买入价上浮、卖出价下压。
+func (NoSlippage) CostCents(Side, int64, int64, mktdata.Bar) int64 { return 0 }
+
+// BpsSlippage 固定基点滑点：按成交额的万分之 Bps/10 计成本。
 type BpsSlippage struct{ Bps int64 }
 
 func (s BpsSlippage) Name() string { return "fixed_bps" }
-func (s BpsSlippage) Apply(side Side, ref int64, _ mktdata.Bar, _ int64) int64 {
-	adj := ref * s.Bps / 10_000
-	if side == SideBuy {
-		return ref + adj
+
+func (s BpsSlippage) CostCents(_ Side, price, qty int64, _ mktdata.Bar) int64 {
+	if s.Bps <= 0 || qty <= 0 {
+		return 0
 	}
-	v := ref - adj
-	if v < 1 {
-		v = 1
+	amount := AmountCents(price, qty)
+	if amount <= 0 {
+		return 0
 	}
-	return v
+	// 四舍五入到分。这里的取整误差是 1 分对上万分，无关紧要 ——
+	// 与原来「1 厘对 1 厘」的困境完全不是一个量级。
+	return roundHalfUp(amount*s.Bps, 10_000)
+}
+
+// roundHalfUp 计算 a/b 四舍五入，要求 a >= 0 且 b > 0。
+func roundHalfUp(a, b int64) int64 {
+	if a <= 0 {
+		return 0
+	}
+	return (a + b/2) / b
 }
 
 // BrokerConfig 撮合参数。
@@ -249,16 +288,10 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 		}
 	}
 
-	price := br.Slippage.Apply(po.Side, ref, b, po.Qty)
-	// 滑点不得把成交价推出涨跌停区间 —— 那是不可能发生的成交
-	if hasLimit {
-		if price > up {
-			price = up
-		}
-		if price < down {
-			price = down
-		}
-	}
+	// 成交价就是参考价。滑点不再推动价格（见 Slippage 接口注释）——
+	// 因此也不再需要「把滑点推出去的价格夹回涨跌停区间」那一步：
+	// ref 已经在上面校验过不在涨跌停上。
+	price := ref
 
 	// 限价单：买单要求成交价不高于限价，卖单不低于限价
 	if po.Type == OrderLimit {
@@ -317,8 +350,11 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 		Instrument: inst, Side: po.Side, Qty: qty,
 		AmountCents: amount, TradingDay: b.TradingDay,
 	})
+	slip := br.Slippage.CostCents(po.Side, price, qty, b)
 	if po.Side == SideBuy {
-		need := amount + fee.Total
+		// 滑点与费用一样要占用现金 —— 漏掉它会让「买得起」的判断偏松，
+		// 成交之后账本才发现钱不够
+		need := amount + fee.Total + slip
 		if need > pf.Cash {
 			return rej(RejectInsufficientCash,
 				fmt.Sprintf("需 %.2f 元，可用 %.2f 元",
@@ -329,8 +365,10 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 			fmt.Sprintf("申报卖出 %d，可卖 %d", qty, held))
 	}
 
-	return Fill{Order: po.Order, At: now, Price: price, Qty: qty, Fee: fee},
-		Rejection{}, true
+	return Fill{
+		Order: po.Order, At: now, Price: price, Qty: qty,
+		Fee: fee, SlippageCents: slip,
+	}, Rejection{}, true
 }
 
 func positionTotal(pf *Portfolio, id mktdata.InstrumentID) int64 {

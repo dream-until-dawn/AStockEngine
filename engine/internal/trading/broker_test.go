@@ -188,3 +188,67 @@ func TestLimitOrderNotReached(t *testing.T) {
 		t.Errorf("限价内应成交且价格不高于限价，得到 ok=%v price=%d", ok, fill.Price)
 	}
 }
+
+// TestBpsSlippageCostOnNotional 钉住滑点的施加位置。
+//
+// 早期版本把滑点加在**单价**上（厘），5 bp 在 20 元以下的标的上不足一厘，
+// 于是三种取整方向实测分别给出 3.67 / 5.34 / 5.63 bp（下取整 / 四舍五入 /
+// 上取整），而配置写的是 5.00 —— 问题不在取整方向，在于施加的位置。
+// 现在按成交总额算（分），相对误差可忽略。
+func TestBpsSlippageCostOnNotional(t *testing.T) {
+	s := BpsSlippage{Bps: 5}
+	var bar mktdata.Bar
+
+	cases := []struct {
+		price, qty int64
+		want       int64 // 期望滑点成本（分）
+		note       string
+	}{
+		// 成交额 = price×qty/10 分；5 bp = ×5/10000
+		{594, 100_000, 2_970, "0.594 元 × 10 万股 = 5.94 万元 → 29.70 元"},
+		{1_071, 100_000, 5_355, "1.071 元 × 10 万股 = 10.71 万元 → 53.55 元"},
+		{9_000, 10_000, 4_500, "9.000 元 × 1 万股 = 9 万元 → 45.00 元"},
+		{100_000, 1_000, 5_000, "100 元 × 1000 股 = 10 万元 → 50.00 元"},
+		{1_297_400, 100, 6_487, "1297.4 元 × 100 股 = 12.974 万元 → 64.87 元"},
+	}
+	for _, c := range cases {
+		got := s.CostCents(SideBuy, c.price, c.qty, bar)
+		if got != c.want {
+			t.Errorf("%s：期望 %d 分，得到 %d 分", c.note, c.want, got)
+		}
+		// 买卖两侧成本相同 —— 方向由账本决定（买加、卖减），不由滑点模型决定
+		if sell := s.CostCents(SideSell, c.price, c.qty, bar); sell != got {
+			t.Errorf("%s：买卖两侧滑点应相同，得到 %d / %d", c.note, got, sell)
+		}
+	}
+}
+
+// TestBpsSlippageAccuracy 无论价位高低，实际生效的 bp 都应贴近配置值。
+// 这正是旧实现做不到的（0.594 元的标的误差 −100% ~ +237%）。
+func TestBpsSlippageAccuracy(t *testing.T) {
+	s := BpsSlippage{Bps: 5}
+	var bar mktdata.Bar
+	for _, price := range []int64{594, 1_071, 1_228, 1_936, 3_132, 5_675, 9_000, 100_000} {
+		qty := int64(100_000)
+		amount := AmountCents(price, qty)
+		got := s.CostCents(SideBuy, price, qty, bar)
+		effBP := float64(got) / float64(amount) * 10_000
+		if effBP < 4.99 || effBP > 5.01 {
+			t.Errorf("价 %.3f 元：实际生效 %.4f bp，偏离配置的 5 bp", float64(price)/1000, effBP)
+		}
+	}
+}
+
+// TestBpsSlippageZero 0 bp 必须真的是 0。
+func TestBpsSlippageZero(t *testing.T) {
+	s := BpsSlippage{Bps: 0}
+	var bar mktdata.Bar
+	for _, ref := range []int64{100, 9_000, 1_297_400} {
+		if got := s.CostCents(SideBuy, ref, 10_000, bar); got != 0 {
+			t.Errorf("0 bp：期望 0，得到 %d", got)
+		}
+	}
+	if got := (NoSlippage{}).CostCents(SideBuy, 9_000, 10_000, bar); got != 0 {
+		t.Errorf("NoSlippage：期望 0，得到 %d", got)
+	}
+}
