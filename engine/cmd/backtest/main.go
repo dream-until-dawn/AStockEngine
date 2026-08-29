@@ -67,6 +67,12 @@ func main() {
 	}
 	loadDur := time.Since(t0)
 
+	uniIDs, err := cfg.ResolveUniverse(ds.Universe, ds.Adjuster)
+	if err != nil {
+		fatal(err)
+	}
+	discl := cfg.Disclosures(ds.Universe, uniIDs)
+
 	e, err := cfg.Assemble(ds)
 	if err != nil {
 		fatal(err)
@@ -176,6 +182,15 @@ func main() {
 		fmt.Println()
 	} else {
 		printReport(computeMetrics(cfg, ds, rec, e.Market()))
+	}
+
+	if ds := discl; len(ds) > 0 {
+		fmt.Println("=== 本次回测未计入 ===")
+		for _, d := range ds {
+			fmt.Printf("  · %s\n", d)
+		}
+		fmt.Println("  报告里的每个数字都在说「发生了什么」，这一段说的是「什么没算」。")
+		fmt.Println()
 	}
 
 	fmt.Println("=== 指纹（C5）===")

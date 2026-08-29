@@ -122,14 +122,17 @@ type runResult struct {
 	Config      json.RawMessage `json:"config"`
 	Stats       runStats        `json:"stats"`
 	Fingerprint fingerprints    `json:"fingerprint"`
-	Metrics     metrics.Result  `json:"metrics"`
-	Curve       []curvePoint    `json:"curve"`
-	Fills       []fillDTO       `json:"fills"`
-	Rejections  []rejectDTO     `json:"rejections"`
-	RejectTotal int             `json:"rejectTotal"`
-	RejectBy    map[string]int  `json:"rejectBy"`
-	RoundTrips  []tripDTO       `json:"roundTrips"`
-	Warnings    []string        `json:"warnings,omitempty"`
+	// Disclosures 本次回测**已知未计入**的成本与机制。
+	// 前端必须显示 —— 漏算的成本不报错，只是让结果一致地偏乐观
+	Disclosures []string       `json:"disclosures"`
+	Metrics     metrics.Result `json:"metrics"`
+	Curve       []curvePoint   `json:"curve"`
+	Fills       []fillDTO      `json:"fills"`
+	Rejections  []rejectDTO    `json:"rejections"`
+	RejectTotal int            `json:"rejectTotal"`
+	RejectBy    map[string]int `json:"rejectBy"`
+	RoundTrips  []tripDTO      `json:"roundTrips"`
+	Warnings    []string       `json:"warnings,omitempty"`
 }
 
 // handleConfigs 列出 configs 目录下的配置，连同解析结果一起给前端。
@@ -337,6 +340,7 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	res.Disclosures = cfg.Disclosures(s.Uni, ids)
 	writeJSON(w, res)
 
 	// 大池子的子集是一大块临时内存（3,194 只约 550 MB）。

@@ -178,6 +178,24 @@ func LoadUniverse(path string) (*Universe, error) {
 	return u, nil
 }
 
+// NewUniverse 由一组标的构造索引，供测试与内存构造使用。
+//
+// 生产路径走 LoadUniverse —— 那里的数据来自 parquet。
+func NewUniverse(insts []*Instrument) *Universe {
+	u := &Universe{
+		byID: make(map[InstrumentID]*Instrument, len(insts)),
+		all:  make([]*Instrument, 0, len(insts)),
+	}
+	for _, in := range insts {
+		if in == nil {
+			continue
+		}
+		u.byID[in.ID] = in
+		u.all = append(u.all, in)
+	}
+	return u
+}
+
 // Get 按 ID 取标的。不存在时返回 nil —— 调用方必须检查，
 // 因为回测涉及已退市标的，「查不到」是需要显式处理的情形而非异常。
 func (u *Universe) Get(id InstrumentID) *Instrument { return u.byID[id] }

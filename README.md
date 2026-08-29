@@ -142,7 +142,7 @@ engine/        Go 回测引擎
   internal/strategies/  样例策略（趋势 / 均值回归 / 突破 / 网格）
   internal/spec/        参数自描述（喂 Web 表单 / 海选网格 / 配置校验）
   internal/registry/    泛型容器：按名字取实现
-  internal/config/      一份 JSON 描述一次运行
+  internal/config/      一份 JSON 描述一次运行 + 未计入成本的显式披露
   internal/record/      三档记录（none / summary / full）
   internal/metrics/     绩效指标
   internal/fingerprint/ 结果指纹（C5）

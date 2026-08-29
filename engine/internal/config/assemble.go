@@ -306,8 +306,19 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 func (c *Config) narrow(
 	col *mktdata.Columns, ids []mktdata.InstrumentID,
 ) (*mktdata.Columns, error) {
+	// 判据是**「col 里的标的都在 ids 里」而不是「两者相等」**。
+	//
+	// 相等这个条件在含退市股的标的池上永远不成立：ResolveUniverse 按
+	// instruments 表返回 3,485 只主板个股，而在 2020 年之后真有行情的
+	// 只有 3,375 只 —— 差着 110 只从没进过这段区间的退市股。
+	// 于是每次 Assemble 都重新 Subset 一份，实测**每次 358 MB**。
+	// 海选 8 个 worker 就是 2.8 GB 的纯重复拷贝（cmd/enginebench 可复现）。
+	//
+	// 放宽成子集关系是安全的：ids 里没有行情的标的，Subset 本来也会丢掉，
+	// 拷完的结果与 col 逐位相同。反过来 col 里有 ids 之外的标的
+	// （典型是基准标的）时仍然必须拷 —— 基准不能进标的池。
 	have := col.Instruments()
-	sameSet := len(have) == len(ids)
+	sameSet := len(have) <= len(ids)
 	if sameSet {
 		want := make(map[mktdata.InstrumentID]bool, len(ids))
 		for _, id := range ids {

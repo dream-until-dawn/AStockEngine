@@ -263,6 +263,9 @@ export type RunResult = {
   rejectBy: Record<string, number>
   roundTrips: RoundTrip[]
   warnings?: string[]
+  // disclosures 本次回测**已知未计入**的成本与机制。
+  // 必须显示 —— 漏算的成本不报错，只让结果一致地偏乐观
+  disclosures?: string[]
 }
 
 // ---- 标的池 ----

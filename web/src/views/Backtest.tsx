@@ -213,6 +213,18 @@ function Result({
         ))}
       </div>
 
+      {!!run.disclosures?.length && (
+        <div className="panel">
+          {/* 报告里的每个数字都在说「发生了什么」，这一块说的是「什么没算」。
+              漏算的成本不报错、不异常，只是让结果一致地偏乐观 —— 所以它
+              必须和绩效放在同一屏，而不是藏在文档里 */}
+          <h3>本次回测未计入</h3>
+          <ul className="note" style={{ margin: 0, paddingLeft: 18 }}>
+            {run.disclosures.map((d, i) => <li key={i}>{d}</li>)}
+          </ul>
+        </div>
+      )}
+
       <div className="panel">
         <h3>指纹（C5）</h3>
         <table style={{ width: 'auto' }}>
