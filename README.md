@@ -55,16 +55,19 @@ python -m venv .venv
 
 再次运行 `sync_bars.py` 即为增量更新，只补新交易日。
 
-加密货币（OKX 永续合约，可选，约 2 分钟）。**不需要 API key** ——
-行情端点是公开的：
+加密货币（OKX 永续合约日线 + 资金费率，可选，约 2 分钟）。
+**不需要 API key** —— 行情端点是公开的：
 
 ```bash
 .\.venv\Scripts\python.exe etl\build_crypto.py
 ```
 
 > 加密数据目前**只到数据层**：可以在核对台里看 K 线与指标，
-> 但还跑不了回测 —— 交易规则（T+0、无涨跌停、365 日年化、资金费率）
-> 尚未实现，引擎会明确拒绝而不是套用 A 股规则给出假结果。
+> 但还跑不了回测 —— 交易规则（T+0、无涨跌停、资金费率计费）尚未实现，
+> 引擎会明确拒绝而不是套用 A 股规则给出假结果。
+>
+> 资金费率**只有约 3 个月**（OKX 公开端点的保留期），
+> 对 6.6 年行情的覆盖率 3.9%，详见 [SCHEMA.md 6.3](docs/SCHEMA.md)。
 
 ### 3. 打开数据核对台
 
@@ -136,7 +139,7 @@ engine/        Go 回测引擎
   internal/indicator/   增量指标（MA / MACD / KDJ）
   internal/trading/     Fee / Market / Portfolio / Broker
   internal/engine/      Step() 状态机与策略接口
-  internal/strategies/  样例策略
+  internal/strategies/  样例策略（趋势 / 均值回归 / 突破 / 网格）
   internal/spec/        参数自描述（喂 Web 表单 / 海选网格 / 配置校验）
   internal/registry/    泛型容器：按名字取实现
   internal/config/      一份 JSON 描述一次运行

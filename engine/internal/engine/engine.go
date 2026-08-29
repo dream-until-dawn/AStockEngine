@@ -177,6 +177,13 @@ func (e *Engine) Done() bool             { return e.cur.Done() }
 func (e *Engine) Steps() int             { return e.steps }
 func (e *Engine) Ledger() trading.Ledger { return e.led }
 
+// Market 返回本次运行的市场规则实现。
+//
+// 报告侧需要它来问「一年有多少个交易日」—— 那个答案是**市场相关**的
+// （A 股 243、加密 365），以前写死成 mktdata.MarketAShare 去查日历，
+// 换了市场就会静默给出错的年化系数。
+func (e *Engine) Market() trading.Market { return e.market }
+
 // Step 前进一个事件时点。
 //
 // 阶段顺序不可颠倒，每一处都有理由：

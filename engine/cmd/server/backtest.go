@@ -285,7 +285,7 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 		InitialCents:       cfg.Portfolio.InitialCashCents,
 		Fills:              rec.Fills(),
 		RiskFreePPM:        cfg.Metrics.RiskFreePPM,
-		TradingDaysPerYear: s.Cal.TradingDaysPerYear(mktdata.MarketAShare, from, to),
+		TradingDaysPerYear: e.Market().AnnualDays(s.Cal, from, to),
 	}
 	benchByDay := map[int32]int64{}
 	if bd, be, ok := ds.BenchmarkCurve(); ok {

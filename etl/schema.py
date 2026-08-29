@@ -101,6 +101,7 @@ QTY_SCALE_ASHARE = 1            # 数量最小单位 1 股/份
 PRICE_SCALE_CRYPTO = 100_000_000   # 1e8，8 位小数
 QTY_SCALE_CRYPTO = 100_000_000     # 1e8，张数也到 8 位小数（OKX lotSz 0.01 张）
 AMOUNT_SCALE = 100              # 金额以分为单位
+FUNDING_RATE_SCALE = 1_000_000_000_000  # 资金费率 1e12，见 FUNDING_SCHEMA 的说明
 RATIO_SCALE = 1_000_000         # 比率（换手率等）固定 1e6
 FACTOR_SCALE = 1_000_000_000_000  # 复权因子 1e12
 PER_SHARE_SCALE = 1_000_000     # 每股分红/送转 1e6
@@ -148,6 +149,17 @@ def ymd_to_int(value) -> int:
 
 def int_to_date(ymd: int) -> date:
     return date(ymd // 10000, ymd // 100 % 100, ymd % 100)
+
+
+def ms_to_ymd_cst(ms) -> int:
+    """毫秒时间戳 → UTC+8 下的 YYYYMMDD。
+
+    加密的日界一律走这里，别在各处各写一遍 ——
+    时区折算写错一次就是整张表偏一天，而且不会报错。
+    """
+    if ms is None or ms == "":
+        return 0
+    return int(datetime.fromtimestamp(int(ms) / 1000, CST).strftime("%Y%m%d"))
 
 
 def crypto_session_ts(ymd: int) -> tuple[int, int]:
@@ -309,12 +321,31 @@ CORPORATE_ACTION_SCHEMA = pa.schema([
     pa.field("rights_price", pa.int64(), nullable=False),   # 配股价格，定点
 ])
 
+FUNDING_SCHEMA = pa.schema([
+    pa.field("instrument_id", pa.int32(), nullable=False),
+    # 结算时刻，UTC 毫秒。**存原始 8h 记录，不预先聚合成日频** ——
+    # 聚合方式（按日求和？按持仓时段加权？）本身会影响结果，
+    # 这个选择必须留在引擎里，由持仓的实际起止时刻决定
+    pa.field("funding_time", pa.int64(), nullable=False),
+    # 结算时刻所属的自然日（UTC+8），供按日 join
+    pa.field("trading_day", pa.int32(), nullable=False),
+    # 费率，scale 1e12。**不是 1e6**：单次费率量级在 1e-5，
+    # 1e6 只剩 1 位有效数字，四舍五入的误差会与费率本身同量级。
+    # 取 1e12 而非 1e9 的额外理由：与 FACTOR_SCALE 一致，
+    # 引擎侧可直接复用 mktdata/adjust.go 的 mulDivFactor 做不溢出的乘除
+    pa.field("rate", pa.int64(), nullable=False),
+    # 原始字符串，与 adj_factor.hfq_factor_raw 同理 ——
+    # 定点换算若哪天被判定错了，还能从原值重算，不必重新拉一遍
+    pa.field("rate_raw", pa.string(), nullable=False),
+])
+
 TABLE_SCHEMAS = {
     "bar": BAR_SCHEMA,
     "instruments": INSTRUMENTS_SCHEMA,
     "calendar": CALENDAR_SCHEMA,
     "adj_factor": ADJ_FACTOR_SCHEMA,
     "corporate_action": CORPORATE_ACTION_SCHEMA,
+    "funding": FUNDING_SCHEMA,
 }
 
 # bar 表中适用 delta 编码的列（实测该组合为最优：18.30 字节/行）

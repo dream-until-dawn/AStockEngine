@@ -16,11 +16,19 @@ instrument_id），行情进 `bar/market=crypto/freq=1d/`，引擎不需要知�
 3. **没有交易日历、没有涨跌停、没有除权、没有停牌**。日历表不写，
    `adj_factor` / `corporate_action` 不写 —— 空表比假数据诚实。
 
-⚠ **资金费率没有拉。** 永续合约每 8 小时结算一次资金费率（多空互付），
-它对持仓成本的影响可能超过手续费，但日线行情里没有这个数据。
-拿现在的数据回测永续合约，结果会**系统性偏乐观**。
-资金费率需要单独一张表（`/api/v5/public/funding-rate-history`），
-等真要跑加密策略时再补 —— 在那之前，这个缺口写在这里、写在 SCHEMA.md 里。
+**资金费率单独一张表**（`funding`，8 小时一条，不聚合）。它不是可选项：
+永续合约靠这笔多空互付把合约价钉在现货附近，实测最近 96 天 BTC 有
+82.4% 的结算是多头付钱、年化约 4.4% —— 比一个年换手 24 倍的 A 股策略的
+全部摩擦还贵。少算它，任何长期做多的加密回测都会系统性偏乐观。
+
+⚠ **两个缺口，都写在这里免得将来忘了：**
+
+1. **OKX 只保留约 3 个月的资金费率**（实测 `after=2024-06-01` 返回 0 条）。
+   6.6 年的行情，费率覆盖不到 4%。这是数据源限制，不是这里的 bug。
+   引擎**不能对未覆盖区间静默按 0 计** —— 那比统一不计更糟，
+   因为它让同一次回测的两段用了不同的成本模型。
+2. **引擎侧尚未计费。** 表建好了、数据拉了，但 Ledger 还不会在
+   持仓期间扣这笔钱 —— 那要等 CryptoMarket。
 """
 
 from __future__ import annotations
@@ -81,8 +89,8 @@ def build_instrument_rows(src: OKXSource, inst_ids: list[str],
             "tick_sz": r.tick_sz, "lot_sz": r.lot_sz, "min_sz": r.min_sz,
             "settle_ccy": r.settle_ccy,
             "source": "okx",
-            # 明示缺口，免得将来有人以为已经算进去了
-            "funding_rate": "not_collected",
+            # 明示状态：数据已采集（funding 表），但引擎还没接上计费
+            "funding_rate": "collected_not_charged",
         }
         rows.append({
             "instrument_id": iid,
@@ -177,6 +185,64 @@ def report_ranges(bars: pd.DataFrame) -> None:
           f" int64 —— 引擎算名义额必须走 mulDiv 拆分")
 
 
+def build_funding(src: OKXSource, symbol: str, iid: int) -> pd.DataFrame:
+    df = src.funding_rates(symbol)
+    if df.empty:
+        return df
+    return pd.DataFrame({
+        "instrument_id": iid,
+        "funding_time": df["funding_time"].astype("int64"),
+        # 结算时刻所属的自然日（UTC+8），供与日线按 trading_day 对齐
+        "trading_day": [sc.ms_to_ymd_cst(t) for t in df["funding_time"]],
+        "rate": [sc.to_fixed(r, sc.FUNDING_RATE_SCALE) for r in df["rate_raw"]],
+        "rate_raw": df["rate_raw"].astype(str),
+    })
+
+
+def check_funding(f: pd.DataFrame) -> list[str]:
+    """资金费率的质检。
+
+    结算间隔恒为 8 小时是这张表最强的约束 —— 缺一条就意味着
+    某天的持仓成本少算 1/3，而它不会以任何形式报错。
+    """
+    problems = []
+    if f.empty:
+        return ["没有资金费率数据"]
+    if f.duplicated(["instrument_id", "funding_time"]).any():
+        problems.append("存在重复的 (标的, 结算时刻)")
+    for iid, g in f.groupby("instrument_id"):
+        g = g.sort_values("funding_time")
+        gaps = g["funding_time"].diff().dropna()
+        bad = gaps[gaps != 8 * 3_600_000]
+        if len(bad):
+            problems.append(
+                f"标的 {iid} 有 {len(bad)} 处结算间隔不是 8 小时"
+                f"（{sorted(set((bad // 3_600_000).astype(int)))[:6]} 小时）")
+    return problems
+
+
+def report_funding(f: pd.DataFrame, bars: pd.DataFrame, id2sym: dict) -> None:
+    print("  资金费率（正=多头付空头）：")
+    for iid, g in f.groupby("instrument_id"):
+        r = g["rate"] / sc.FUNDING_RATE_SCALE
+        days = len(g) / 3
+        print(f"    {id2sym.get(iid, iid):<16} {len(g):>6} 次 / {days:>7,.0f} 天  "
+              f"单次中位 {r.median() * 100:+.4f}%  为正 {(r > 0).mean():>5.1%}  "
+              f"多头累计 {r.sum() * 100:+7.1f}%  年化 {r.sum() / days * 365 * 100:+5.1f}%")
+
+    # 覆盖率必须和行情放在一起报 —— 单看「拉到 289 条」像是成功了
+    print("  对行情的覆盖率：")
+    for iid, g in f.groupby("instrument_id"):
+        b = bars[bars.instrument_id == iid]
+        if b.empty:
+            continue
+        cov = len(set(g.trading_day) & set(b.trading_day))
+        print(f"    {id2sym.get(iid, iid):<16} 行情 {len(b):>5} 天 "
+              f"({int(b.trading_day.min())}~{int(b.trading_day.max())})  "
+              f"费率覆盖 {cov:>4} 天 = {cov / len(b):>5.1%}"
+              f"   未覆盖 {len(b) - cov} 天")
+
+
 def write_bars(bars: pd.DataFrame) -> list[Path]:
     # 每次都是全量重拉，先清空 —— 否则上一轮的年份分区会留在那里，
     # 引擎读的时候会把两批数据拼起来，而且不会报错
@@ -268,9 +334,41 @@ def main() -> None:
     print(f"bar {len(bars)} 行 / {len(paths)} 个年份分区 / {total / 1024:.0f} KB")
     print(f"  -> {layout.bar_dir('crypto', '1d')}")
 
-    print("\n[!] 资金费率未采集。永续合约每 8 小时结算一次资金费率，")
-    print("  它对持仓成本的影响可能超过手续费，而日线行情里没有这个数据。")
-    print("  拿当前数据回测永续合约，结果会系统性偏乐观。")
+    # ---- 资金费率 ----
+    print("\n资金费率（每 8 小时一条，不聚合）")
+    funds = []
+    for r in rows:
+        t0 = time.time()
+        f = build_funding(src, r["symbol"], r["instrument_id"])
+        if f.empty:
+            print(f"  [!] {r['symbol']} 没有资金费率，跳过")
+            continue
+        print(f"  {r['symbol']:<16} {len(f):>6} 条  "
+              f"{int(f.trading_day.min())} ~ {int(f.trading_day.max())}  "
+              f"{time.time() - t0:.1f}s")
+        funds.append(f)
+    if funds:
+        fund = pd.concat(funds, ignore_index=True)
+        probs = check_funding(fund)
+        if probs:
+            print("  质量问题：")
+            for x in probs:
+                print("    x", x)
+            sys.exit(1)
+        report_funding(fund, bars, {r["instrument_id"]: r["symbol"] for r in rows})
+        fund = fund.sort_values(["instrument_id", "funding_time"]).reset_index(drop=True)
+        fund = fund.astype({"instrument_id": "int32", "trading_day": "int32"})
+        sc.validate_columns(fund, "funding")
+        fp, fc = layout.write_meta(fund, "funding")
+        print(f"  funding {len(fund)} 行 -> {fp.name} / {fc.name}")
+
+    print("\n[!] 两件事必须知道：")
+    print("  1. OKX 的公开资金费率只保留约 3 个月（实测 after=2024-06-01 返回 0 条），")
+    print("     所以 6.6 年的行情里只有最近约 96 天有费率。**覆盖率不到 4%。**")
+    print("     引擎不能对未覆盖区间静默按 0 计 —— 那比统一不计更糟：")
+    print("     它会让「有数据的那段」和「没数据的那段」用不同的成本模型。")
+    print("  2. 引擎侧尚未对资金费率计费。表建好了、数据拉了，")
+    print("     但 Ledger 还不会在持仓期间扣这笔钱 —— 那要等 CryptoMarket。")
 
 
 if __name__ == "__main__":

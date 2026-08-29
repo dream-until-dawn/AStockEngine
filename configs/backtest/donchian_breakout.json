@@ -1,0 +1,77 @@
+{
+  "name": "donchian 突破 · 全部主板个股（含退市）+ 流动性风控",
+  "data": {
+    "root": "../../data",
+    "market": "ashare",
+    "freq": "1d",
+    "from": 20200101,
+    "to": 0,
+    "universe": {
+      "market": [
+        "ashare"
+      ],
+      "type": "stock",
+      "board": [
+        "main"
+      ],
+      "status": "all"
+    }
+  },
+  "market": {
+    "impl": "ashare"
+  },
+  "fee": {
+    "impl": "config",
+    "params": {
+      "path": "../fee/ashare_default.json"
+    }
+  },
+  "slippage": {
+    "impl": "fixed_bps",
+    "params": {
+      "bps": 5
+    }
+  },
+  "sizer": {
+    "impl": "equal_weight",
+    "params": {
+      "slots": 10,
+      "base": "initial"
+    }
+  },
+  "risk": [
+    {
+      "impl": "min_turnover",
+      "params": {
+        "amount_wan": 500,
+        "max_share_ppm": 0
+      }
+    }
+  ],
+  "broker": {
+    "volume_cap_ppm": 100000,
+    "allow_partial_fill": true
+  },
+  "portfolio": {
+    "initial_cash_cents": 100000000,
+    "dividend_tax_ppm": 0
+  },
+  "engine": {
+    "indicator_adj": "hfq",
+    "imply_split_from_factor": true
+  },
+  "strategy": {
+    "impl": "donchian_breakout",
+    "params": {
+      "entry": 20,
+      "exit": 10
+    }
+  },
+  "metrics": {
+    "benchmark": "510300",
+    "risk_free_ppm": 0
+  },
+  "recorder": {
+    "level": "summary"
+  }
+}

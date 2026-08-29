@@ -57,6 +57,15 @@ type Market interface {
 	NormalizeQty(inst *mktdata.Instrument, qty int64, side Side, held int64) (int64, bool)
 	// Tradable 报告该标的当日是否可交易
 	Tradable(inst *mktdata.Instrument, b mktdata.Bar) bool
+	// AnnualDays 返回该市场一年有多少个「步」，用于年化收益与波动。
+	//
+	// **放在 Market 而不是 Calendar 上**：A 股由日历实测（含节假日、
+	// 临时休市），而 24×7 市场压根没有日历表 —— 让 Calendar 去回答
+	// 「加密一年几天」只能得到兜底值 252，而正确值是 365。
+	// 45% 的偏差会直接改变「这个策略行不行」的结论。
+	//
+	// cal 可以为 nil（不依赖日历的市场直接返回常数）。
+	AnnualDays(cal *mktdata.Calendar, from, to int32) float64
 }
 
 // ---- A 股实现 ----
@@ -103,6 +112,17 @@ func NewAShareMarket() *AShareMarket {
 }
 
 func (m *AShareMarket) Name() string { return "ashare" }
+
+// AnnualDays 由交易日历实测，而不是用「252」这个约定俗成的数。
+//
+// 252 是美股的口径。A 股因春节、国庆等长假，实测年均交易日在 242~245，
+// 用 252 会让年化收益虚低约 3%、年化波动虚高约 2%。
+func (m *AShareMarket) AnnualDays(cal *mktdata.Calendar, from, to int32) float64 {
+	if cal == nil {
+		return 252
+	}
+	return cal.TradingDaysPerYear(mktdata.MarketAShare, from, to)
+}
 
 // limitPPM 返回该标的当日的涨跌幅限制（百万分之一）。
 //

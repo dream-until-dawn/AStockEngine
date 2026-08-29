@@ -178,6 +178,46 @@ class OKXSource(DataSource):
             prev_close = c
         return pd.DataFrame(out)
 
+    # --- 资金费率 ---
+
+    def funding_rates(self, inst_id: str) -> pd.DataFrame:
+        """全历史资金费率，每 8 小时一条。
+
+        列：funding_time（UTC 毫秒）/ rate_raw（原始字符串）。
+        **不做聚合**：一天 3 条原样返回，由构建器落成 8h 粒度的表。
+
+        为什么它不能省：永续合约没有交割日，靠这笔多空互付把合约价
+        钉在现货附近。实测最近 96 天 BTC 有 82.4% 的结算是多头付钱，
+        年化约 4.4% —— 比一个年换手 24 倍的 A 股策略的全部摩擦还贵。
+        少算这一项，任何长期做多的加密回测都会系统性偏乐观。
+        """
+        rows: list[dict] = []
+        seen: set[str] = set()
+        cursor = ""
+        while True:
+            path = (f"/api/v5/public/funding-rate-history?instId={inst_id}"
+                    f"&limit={_PAGE}")
+            if cursor:
+                path += f"&after={cursor}"
+            data = self._get(path).get("data") or []
+            if not data:
+                break
+            for r in data:
+                t = r.get("fundingTime")
+                if t in seen:
+                    continue
+                seen.add(t)
+                rows.append({"funding_time": int(t),
+                             "rate_raw": str(r.get("realizedRate")
+                                             or r.get("fundingRate") or "0")})
+            # 与 K 线同一套翻页规则：游标取**这一页最旧的一条**
+            cursor = data[-1]["fundingTime"]
+            if len(data) < _PAGE:
+                break
+            time.sleep(self.pause)
+        rows.sort(key=lambda x: x["funding_time"])
+        return pd.DataFrame(rows)
+
     def _fetch_all(self, inst_id: str) -> list[list]:
         """向更早翻页，直到没有更多数据。
 

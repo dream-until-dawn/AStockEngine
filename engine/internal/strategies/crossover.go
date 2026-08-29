@@ -219,6 +219,11 @@ func init() {
 	eng.RegisterStrategy("ma_cross", func() eng.Strategy { return NewMACross() })
 	eng.RegisterStrategy("macd_cross", func() eng.Strategy { return NewMACDCross() })
 	eng.RegisterStrategy("grid", func() eng.Strategy { return NewGrid() })
+	// 下面两个不是「再多两个策略」，是给海选补维度：
+	// ma_cross 与 macd_cross 都在赌趋势延续，只扫这两个得不出
+	// 关于「技术分析」的结论，只能得出关于「均线」的结论
+	eng.RegisterStrategy("rsi_reversion", func() eng.Strategy { return NewRSIReversion() })
+	eng.RegisterStrategy("donchian_breakout", func() eng.Strategy { return NewDonchianBreakout() })
 }
 
 // Names 返回全部可用策略名，供 CLI 提示。

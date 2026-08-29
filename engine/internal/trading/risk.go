@@ -297,6 +297,68 @@ func (r *CashReserve) Check(o Order, ctx RiskContext) (Order, Rejection, bool) {
 	return o, Rejection{}, true
 }
 
+// ---- 流动性 ----
+
+var minTurnoverSpecs = []spec.ParamSpec{
+	{Name: "amount_wan", Kind: spec.ParamFloat, Default: 500, Min: 0, Max: 1e7, Step: 10,
+		Desc: "当日成交额低于此值（万元）不开新仓；0 表示不限"},
+	{Name: "max_share_ppm", Kind: spec.ParamInt, Default: 0, Min: 0, Max: 1_000_000, Step: 1000,
+		Desc: "单笔金额占当日成交额的上限（百万分之一）；0 表示不限。超限时缩量"},
+}
+
+// MinTurnover 流动性门槛：成交太清淡的标的不开新仓。
+//
+// **为什么这条必须是风控而不是标的池过滤。**
+// 「这只标的流动性够不够」是**逐日**的事实：一只 2015 年活跃、2018 年
+// 濒临退市的股票，在两段里的答案不同。写进 universe 就成了「用今天的
+// 流动性去决定 2015 年买不买」—— 那是未来函数，与 `is_st` 同理（C1）。
+//
+// 有了它，标的池才敢按 C3 的要求含退市股：退市前的缩量期会被这条
+// 自动挡掉，而不必靠 `status: listed` 把整只标的从历史里抹掉
+// （那会系统性高估收益 —— 退市的往往先大跌再退）。
+//
+// **只拦买入。** 卖出永远放行：手里已经有的东西，流动性差不是不卖的理由，
+// 恰恰是要卖的理由。真正的成交限制由 Broker 的成交量上限负责。
+type MinTurnover struct {
+	minAmountCents int64 // 当日成交额下限（分）
+	maxSharePPM    int64 // 单笔占当日成交额的上限
+}
+
+func (r *MinTurnover) Name() string { return "min_turnover" }
+
+func (r *MinTurnover) Check(o Order, ctx RiskContext) (Order, Rejection, bool) {
+	if o.Side != SideBuy {
+		return o, Rejection{}, true
+	}
+	bar, ok := ctx.Bar(o.Instrument)
+	if !ok {
+		return o, Rejection{}, true // 没有 bar 的情形由 Broker 处理
+	}
+	if r.minAmountCents > 0 && bar.Amount < r.minAmountCents {
+		return o, Rejection{
+			Order: o, At: ctx.Time(), Reason: RejectRisk, Rule: r.Name(),
+			Detail: fmt.Sprintf("当日成交额 %.0f 万元，低于门槛 %.0f 万元",
+				cents(bar.Amount)/10_000, cents(r.minAmountCents)/10_000),
+		}, false
+	}
+	if r.maxSharePPM > 0 && bar.Amount > 0 {
+		// 单笔金额上限 = 当日成交额 × ppm / 1e6。
+		// 先除后乘避免 amount × ppm 溢出 —— amount 上限约 1e13 分，
+		// × 1e6 就是 1e19，超过 int64
+		capCents := bar.Amount / 1_000_000 * r.maxSharePPM
+		q := shrinkToBudget(ctx, o, capCents)
+		if q <= 0 {
+			return o, Rejection{
+				Order: o, At: ctx.Time(), Reason: RejectRisk, Rule: r.Name(),
+				Detail: fmt.Sprintf("单笔上限 %.2f 元（当日成交额的 %.2f%%）一手都不够",
+					cents(capCents), float64(r.maxSharePPM)/10_000),
+			}, false
+		}
+		o.Qty = q
+	}
+	return o, Rejection{}, true
+}
+
 func cents(v int64) float64 { return float64(v) / 100 }
 
 // ---- 注册 ----
@@ -332,6 +394,19 @@ func init() {
 			return &DrawdownHalt{ppm: int64(p.Float("pct", 30) * 10_000)}, nil
 		})
 
+	Risks.Register("min_turnover", minTurnoverSpecs,
+		func(raw json.RawMessage) (Risk, error) {
+			p, err := registry.DecodeParams(minTurnoverSpecs, raw)
+			if err != nil {
+				return nil, err
+			}
+			// 万元 → 分：×1e4 元 ×100 分
+			return &MinTurnover{
+				minAmountCents: int64(p.Float("amount_wan", 500) * 1_000_000),
+				maxSharePPM:    int64(p.Int("max_share_ppm", 0)),
+			}, nil
+		})
+
 	Risks.Register("cash_reserve", cashReserveSpecs,
 		func(raw json.RawMessage) (Risk, error) {
 			p, err := registry.DecodeParams(cashReserveSpecs, raw)
@@ -344,3 +419,7 @@ func init() {
 			}, nil
 		})
 }
+
+var (
+	_ Risk = (*MinTurnover)(nil)
+)
