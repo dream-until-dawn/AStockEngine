@@ -1,203 +1,91 @@
-// Command backtest 跑一次完整回测：信号 → 订单 → 成交 → 记账 → 权益曲线。
+// Command backtest 跑一次完整回测：信号 → 订单 → 成交 → 记账 → 净值序列。
 //
-// 这是 v0.2 第二刀的端到端验证。示例策略用 MACD 金叉买入、死叉卖出，
-// 等权分配到有限只标的上 —— 策略本身不是重点，重点是链路跑通且账目自洽。
+// 这是 v0.2 的端到端入口。**它只输出原始净值序列，不算绩效指标** ——
+// 夏普、最大回撤、胜率属 v0.3 的 Metrics 模块。
 package main
 
 import (
-	"encoding/json"
+	"bufio"
+	"encoding/csv"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	eng "github.com/dream-until-dawn/AStockEngine/engine/internal/engine"
-	"github.com/dream-until-dawn/AStockEngine/engine/internal/indicator"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/strategies"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 )
 
-// macdStrategy 是最简策略：MACD 金叉买入、死叉清仓，仓位等权。
-//
-// **它刻意只保留一项自有状态**（prevAbove）。「持有哪些标的」与
-// 「哪些单在途」都从 StepContext 导出 —— 那些状态本就归引擎管，
-// 策略自己再存一份，快照恢复时就会两边不一致。
-// 首版正是这么写的，端到端回测立刻暴露：恢复后的策略不知道自己持有什么，
-// 于是重复下单，账本偏离全程结果。
-type macdStrategy struct {
-	maxHold   int
-	slotCents int64
-
-	// prevAbove 是**真正的**跨步记忆：上一步 DIF 是否在 DEA 之上。
-	// 无法从 ctx 导出，故必须实现 StatefulStrategy。
-	prevAbove map[mktdata.InstrumentID]bool
-
-	signals, buys, sells int
-}
-
-func (s *macdStrategy) Name() string { return "macd_cross" }
-
-func (s *macdStrategy) Specs() []eng.ParamSpec {
-	return []eng.ParamSpec{
-		{Name: "short", Kind: eng.ParamInt, Default: 12, Min: 2, Max: 60, Step: 1, Desc: "快线周期"},
-		{Name: "long", Kind: eng.ParamInt, Default: 26, Min: 5, Max: 200, Step: 1, Desc: "慢线周期"},
-		{Name: "signal", Kind: eng.ParamInt, Default: 9, Min: 2, Max: 60, Step: 1, Desc: "信号周期"},
-		{Name: "max_hold", Kind: eng.ParamInt, Default: 10, Min: 1, Max: 100, Step: 1, Desc: "最多同时持有"},
-	}
-}
-
-func (s *macdStrategy) Init(ic eng.InitContext) error {
-	p := ic.Params()
-	short, long, sig := p.Int("short", 12), p.Int("long", 26), p.Int("signal", 9)
-	s.maxHold = p.Int("max_hold", 10)
-	ic.Use("macd", func() indicator.Indicator {
-		return indicator.NewMACD(short, long, sig, indicator.DefaultPriceScale)
-	})
-	s.prevAbove = make(map[mktdata.InstrumentID]bool, 8192)
-	return nil
-}
-
-// SnapshotState / RestoreState 只需处理 prevAbove ——
-// 其余状态由引擎的账本与待撮合队列承载。
-func (s *macdStrategy) SnapshotState() ([]byte, error) {
-	m := make(map[string]bool, len(s.prevAbove))
-	for id, v := range s.prevAbove {
-		if v { // 只存 true，false 是默认值，可省一半体积
-			m[fmt.Sprint(int32(id))] = true
-		}
-	}
-	return json.Marshal(m)
-}
-
-func (s *macdStrategy) RestoreState(b []byte) error {
-	var m map[string]bool
-	if err := json.Unmarshal(b, &m); err != nil {
-		return err
-	}
-	s.prevAbove = make(map[mktdata.InstrumentID]bool, len(m))
-	for k, v := range m {
-		var id int32
-		if _, err := fmt.Sscan(k, &id); err != nil {
-			return err
-		}
-		s.prevAbove[mktdata.InstrumentID(id)] = v
-	}
-	return nil
-}
-
-func (s *macdStrategy) OnBar(ctx eng.StepContext) ([]trading.Order, error) {
-	for _, f := range ctx.Fills() {
-		if f.Side == trading.SideBuy {
-			s.buys++
-		} else {
-			s.sells++
-		}
-	}
-
-	// 「哪些单在途」从引擎的待撮合队列导出，不自己维护
-	inFlight := make(map[mktdata.InstrumentID]bool, len(ctx.Pending()))
-	for _, po := range ctx.Pending() {
-		inFlight[po.Instrument] = true
-	}
-	// 「持有哪些标的」从账本导出
-	pf := ctx.Portfolio()
-	holdCount := 0
-	for _, p := range pf.Positions {
-		if p.Total > 0 {
-			holdCount++
-		}
-	}
-
-	var orders []trading.Order
-	for _, id := range ctx.Universe() {
-		if inFlight[id] {
-			continue
-		}
-		ind, ok := ctx.Indicator(id, "macd")
-		if !ok || !ind.Ready() {
-			continue
-		}
-		m := ind.(*indicator.MACD)
-		above := m.DIF() > m.DEA()
-		cross := above && !s.prevAbove[id]
-		death := !above && s.prevAbove[id]
-		s.prevAbove[id] = above
-
-		bar, ok := ctx.Bar(id)
-		if !ok || bar.Suspended() || bar.Close <= 0 {
-			continue
-		}
-		pos := pf.Position(id)
-		holding := pos != nil && pos.Total > 0
-
-		if death && holding {
-			if avail := ctx.Available(id); avail > 0 {
-				orders = append(orders, trading.Order{
-					Instrument: id, Side: trading.SideSell,
-					Qty: avail, Tag: "macd_death",
-				})
-				inFlight[id] = true
-				s.signals++
-			}
-			continue
-		}
-		if cross && !holding && holdCount+len(inFlight) < s.maxHold {
-			qty := s.slotCents * 10 / bar.Close
-			if qty < 100 {
-				continue
-			}
-			orders = append(orders, trading.Order{
-				Instrument: id, Side: trading.SideBuy, Qty: qty, Tag: "macd_cross",
-			})
-			inFlight[id] = true
-			s.signals++
-		}
-	}
-	return orders, nil
+// equityPoint 是净值曲线上的一个点。全部为整数（分），
+// 保留原始精度供下游自行换算，避免在这里就损失信息。
+type equityPoint struct {
+	TradingDay   int32
+	EquityCents  int64
+	CashCents    int64
+	Positions    int
+	FillsToday   int
+	RejectsToday int
 }
 
 func main() {
 	dataRoot := flag.String("data", "../data", "数据根目录")
-	nInst := flag.Int("instruments", 400, "抽样标的数，0 表示全部")
-	from := flag.Int("from", 20180101, "起始交易日")
+	feePath := flag.String("fee", "../configs/fee/ashare_default.json", "费率配置")
+	stratName := flag.String("strategy", "macd_cross",
+		"策略："+strings.Join(strategies.Names(), " / "))
+	nInst := flag.Int("instruments", 300, "抽样标的数，0 表示全部")
+	from := flag.Int("from", 20200101, "起始交易日")
+	to := flag.Int("to", 0, "结束交易日，0 表示不限")
 	cashYuan := flag.Int64("cash", 1_000_000, "初始资金（元）")
 	maxHold := flag.Int("max-hold", 10, "最多同时持有")
 	volCapPct := flag.Float64("volume-cap", 10, "单笔成交占当日成交量上限（%）")
 	slipBps := flag.Int64("slippage-bps", 5, "滑点（基点）")
+	taxPct := flag.Float64("dividend-tax", 0, "红利税率（%）")
+	equityOut := flag.String("equity-out", "", "净值序列输出 CSV 路径")
 	snapAt := flag.Int("snapshot-at", 0, "在第 N 步做快照并验证往返")
 	flag.Parse()
 
-	barRoot := filepath.Join(*dataRoot, "bar", "market=ashare", "freq=1d")
-	uni, err := mktdata.LoadUniverse(filepath.Join(*dataRoot, "meta", "instruments.parquet"))
+	mk, ok := strategies.Registry[*stratName]
+	if !ok {
+		fatal(fmt.Errorf("未知策略 %q，可选：%s", *stratName,
+			strings.Join(strategies.Names(), " / ")))
+	}
+
+	// ---- 加载数据与配置 ----
+	metaDir := filepath.Join(*dataRoot, "meta")
+	uni, err := mktdata.LoadUniverse(filepath.Join(metaDir, "instruments.parquet"))
 	if err != nil {
 		fatal(err)
 	}
-	adj, err := mktdata.LoadAdjuster(filepath.Join(*dataRoot, "meta", "adj_factor.parquet"))
+	adj, err := mktdata.LoadAdjuster(filepath.Join(metaDir, "adj_factor.parquet"))
 	if err != nil {
 		fatal(err)
 	}
-	corp, err := mktdata.LoadCorpActions(filepath.Join(*dataRoot, "meta", "corporate_action.parquet"))
+	corp, err := mktdata.LoadCorpActions(filepath.Join(metaDir, "corporate_action.parquet"))
 	if err != nil {
 		fatal(err)
 	}
-	fee, err := trading.LoadFee(filepath.Join("..", "configs", "fee", "ashare_default.json"))
+	fee, err := trading.LoadFee(*feePath)
 	if err != nil {
 		fatal(err)
 	}
 	fmt.Printf("标的 %d 只 | 复权因子 %d 只 | 公司行动 %d 条 | 费率 %q\n",
 		uni.Len(), adj.NumInstruments(), corp.Total(), fee.Name())
 
-	opt := mktdata.LoadOptions{Root: barRoot, FromDay: int32(*from)}
+	opt := mktdata.LoadOptions{
+		Root:    filepath.Join(*dataRoot, "bar", "market=ashare", "freq=1d"),
+		FromDay: int32(*from), ToDay: int32(*to),
+	}
 	if *nInst > 0 {
-		// 只取个股，且优先有复权事件的 —— 这样公司行动分支才会被真正走到
 		var ids []mktdata.InstrumentID
 		for _, in := range uni.All() {
-			if in.Type != mktdata.TypeStock {
-				continue
-			}
-			if len(adj.ExDates(in.ID)) == 0 {
+			// 只取个股且有复权事件 —— 这样公司行动分支才会被真正走到
+			if in.Type != mktdata.TypeStock || len(adj.ExDates(in.ID)) == 0 {
 				continue
 			}
 			ids = append(ids, in.ID)
@@ -215,9 +103,13 @@ func main() {
 	fmt.Printf("加载 %d 行 / %d 只 / %d 个时点 / %v\n\n",
 		st.Rows, st.Instruments, st.Steps, st.Total.Round(time.Millisecond))
 
-	initial := *cashYuan * 100 // 元 → 分
-	run := func(label string, snapshotStep int) (*macdStrategy, *eng.Engine, []byte) {
-		strat := &macdStrategy{slotCents: initial / int64(*maxHold)}
+	initial := *cashYuan * 100
+	params := eng.Params{
+		"max_hold":   float64(*maxHold),
+		"cash_cents": float64(initial),
+	}
+
+	build := func() *eng.Engine {
 		br := trading.NewBroker(trading.NewAShareMarket(), fee,
 			trading.BpsSlippage{Bps: *slipBps},
 			trading.BrokerConfig{
@@ -228,90 +120,164 @@ func main() {
 			Columns: col, Universe: uni, Adjuster: adj, CorpAct: corp,
 			Market: trading.NewAShareMarket(), Broker: br,
 			Portfolio: trading.NewPortfolio(initial),
-		}, strat, eng.Config{
-			Params:               eng.Params{"max_hold": float64(*maxHold)},
+		}, mk(), eng.Config{
+			Params:               params,
 			IndicatorAdjMode:     mktdata.AdjHFQ,
 			InitialCashCents:     initial,
-			DividendTaxPPM:       0,
+			DividendTaxPPM:       int64(*taxPct * 10_000),
 			ImplySplitFromFactor: true,
 		})
 		if err != nil {
 			fatal(err)
 		}
-		var snap []byte
-		t0 := time.Now()
-		for !e.Done() {
-			if _, err := e.Step(); err != nil {
+		return e
+	}
+
+	// ---- 主回测 ----
+	e := build()
+	curve := make([]equityPoint, 0, col.NumSteps())
+	var snap []byte
+	var fills, rejects int
+	rejectBy := map[string]int{}
+
+	t0 := time.Now()
+	for !e.Done() {
+		tp, err := e.Step()
+		if err != nil {
+			fatal(err)
+		}
+		nf, nr := e.LastCounts()
+		fills += nf
+		rejects += nr
+		for _, r := range e.Rejections() {
+			rejectBy[r.Reason.String()]++
+		}
+		pf := e.Portfolio()
+		curve = append(curve, equityPoint{
+			TradingDay: tp.TradingDay, EquityCents: e.EquityCents(),
+			CashCents: pf.Cash, Positions: countPositions(pf),
+			FillsToday: nf, RejectsToday: nr,
+		})
+		if *snapAt > 0 && e.Steps() == *snapAt {
+			if snap, err = e.Snapshot(); err != nil {
 				fatal(err)
 			}
-			if snapshotStep > 0 && e.Steps() == snapshotStep {
-				if snap, err = e.Snapshot(); err != nil {
-					fatal(err)
+		}
+	}
+	dur := time.Since(t0)
+
+	pf := e.Portfolio()
+	final := e.EquityCents()
+	fmt.Printf("=== %s ===\n", *stratName)
+	fmt.Printf("  步数 %d  耗时 %v\n", e.Steps(), dur.Round(time.Millisecond))
+	fmt.Printf("  成交 %d 笔  拒单 %d 笔\n", fills, rejects)
+	fmt.Printf("  初始 %.2f 元 → 权益 %.2f 元（%+.2f%%）\n",
+		cents(initial), cents(final), float64(final-initial)/float64(initial)*100)
+	fmt.Printf("  现金 %.2f 元  持仓 %d 只  已实现 %.2f 元\n",
+		cents(pf.Cash), countPositions(pf), cents(pf.RealizedCents))
+	fmt.Printf("  费用合计 %.2f 元（占初始 %.2f%%）",
+		cents(pf.TotalFeeCents()), float64(pf.TotalFeeCents())/float64(initial)*100)
+	for _, k := range sortedKeys(pf.FeeCents) {
+		fmt.Printf("  %s %.2f", k, cents(pf.FeeCents[k]))
+	}
+	fmt.Println()
+
+	if len(rejectBy) > 0 {
+		fmt.Println("  拒单原因分布：")
+		for _, k := range sortedStrKeys(rejectBy) {
+			fmt.Printf("    %-16s %d\n", k, rejectBy[k])
+		}
+	}
+	if n := len(pf.Warnings); n > 0 {
+		fmt.Printf("  账本告警 %d 条，首条：%s\n", n, pf.Warnings[0])
+	}
+
+	// 净值序列的简单描述性统计。**不是绩效指标** —— 那是 v0.3 的事，
+	// 这里只报告序列本身的形态，便于确认曲线是否合理。
+	if len(curve) > 0 {
+		peak, maxDD := curve[0].EquityCents, 0.0
+		for _, p := range curve {
+			if p.EquityCents > peak {
+				peak = p.EquityCents
+			}
+			if peak > 0 {
+				dd := float64(peak-p.EquityCents) / float64(peak)
+				if dd > maxDD {
+					maxDD = dd
 				}
 			}
 		}
-		d := time.Since(t0)
-		pf := e.Portfolio()
-		equity := e.EquityCents()
-		fmt.Printf("=== %s ===\n", label)
-		fmt.Printf("  步数 %d  耗时 %v\n", e.Steps(), d.Round(time.Millisecond))
-		fmt.Printf("  信号 %d  买入成交 %d  卖出成交 %d\n", strat.signals, strat.buys, strat.sells)
-		fmt.Printf("  初始 %.2f 元 → 权益 %.2f 元（%.2f%%）\n",
-			float64(initial)/100, float64(equity)/100,
-			float64(equity-initial)/float64(initial)*100)
-		fmt.Printf("  现金 %.2f 元  持仓 %d 只  已实现 %.2f 元\n",
-			float64(pf.Cash)/100, countPositions(pf), float64(pf.RealizedCents)/100)
-		fmt.Printf("  费用合计 %.2f 元", float64(pf.TotalFeeCents())/100)
-		for _, k := range sortedKeys(pf.FeeCents) {
-			fmt.Printf("  %s %.2f", k, float64(pf.FeeCents[k])/100)
-		}
-		fmt.Println()
-		if n := len(pf.Warnings); n > 0 {
-			fmt.Printf("  账本告警 %d 条，首条：%s\n", n, pf.Warnings[0])
-		}
-		fmt.Println()
-		return strat, e, snap
+		fmt.Printf("  净值序列 %d 点，区间 %d ~ %d，峰值回撤 %.2f%%\n",
+			len(curve), curve[0].TradingDay, curve[len(curve)-1].TradingDay, maxDD*100)
 	}
+	fmt.Println()
 
-	_, base, snap := run("完整回测", *snapAt)
-
-	if *snapAt > 0 && snap != nil {
-		fmt.Printf("=== 快照往返（第 %d 步，%.2f MB）===\n",
-			*snapAt, float64(len(snap))/1024/1024)
-		strat2 := &macdStrategy{slotCents: initial / int64(*maxHold)}
-		br := trading.NewBroker(trading.NewAShareMarket(), fee,
-			trading.BpsSlippage{Bps: *slipBps},
-			trading.BrokerConfig{VolumeCapPPM: int64(*volCapPct * 10_000), AllowPartialFill: true})
-		e2, err := eng.New(eng.Deps{
-			Columns: col, Universe: uni, Adjuster: adj, CorpAct: corp,
-			Market: trading.NewAShareMarket(), Broker: br,
-			Portfolio: trading.NewPortfolio(initial),
-		}, strat2, eng.Config{
-			Params: eng.Params{"max_hold": float64(*maxHold)},
-			IndicatorAdjMode: mktdata.AdjHFQ, InitialCashCents: initial,
-			ImplySplitFromFactor: true,
-		})
-		if err != nil {
+	if *equityOut != "" {
+		if err := writeCurve(*equityOut, curve); err != nil {
 			fatal(err)
 		}
+		fmt.Printf("净值序列已写出 -> %s\n\n", *equityOut)
+	}
+
+	// ---- 快照往返 ----
+	if snap != nil {
+		fmt.Printf("=== 快照往返（第 %d 步，%.2f MB）===\n", *snapAt, float64(len(snap))/1024/1024)
+		e2 := build()
 		if err := e2.Restore(snap); err != nil {
 			fatal(err)
 		}
 		if err := e2.RunAll(); err != nil {
 			fatal(err)
 		}
-		a, b := base.Portfolio(), e2.Portfolio()
-		fmt.Printf("  全程现金 %.2f 元 vs 恢复后 %.2f 元\n",
-			float64(a.Cash)/100, float64(b.Cash)/100)
-		if a.Cash == b.Cash && a.RealizedCents == b.RealizedCents {
+		b := e2.Portfolio()
+		fmt.Printf("  全程 现金 %.2f / 已实现 %.2f\n", cents(pf.Cash), cents(pf.RealizedCents))
+		fmt.Printf("  恢复 现金 %.2f / 已实现 %.2f\n", cents(b.Cash), cents(b.RealizedCents))
+		if pf.Cash == b.Cash && pf.RealizedCents == b.RealizedCents {
 			fmt.Println("  ✅ 快照恢复后继续步进，账本与全程完全一致")
 		} else {
-			fmt.Printf("  ❌ 不一致：已实现 %.2f vs %.2f\n",
-				float64(a.RealizedCents)/100, float64(b.RealizedCents)/100)
+			fmt.Println("  ❌ 不一致")
 			os.Exit(1)
 		}
 	}
 }
+
+func writeCurve(path string, curve []equityPoint) error {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return err
+		}
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	bw := bufio.NewWriter(f)
+	defer bw.Flush()
+	w := csv.NewWriter(bw)
+	defer w.Flush()
+
+	// 输出整数分，不做单位换算 —— 下游要什么精度自己定
+	if err := w.Write([]string{"trading_day", "equity_cents", "cash_cents",
+		"positions", "fills", "rejects"}); err != nil {
+		return err
+	}
+	for _, p := range curve {
+		if err := w.Write([]string{
+			strconv.FormatInt(int64(p.TradingDay), 10),
+			strconv.FormatInt(p.EquityCents, 10),
+			strconv.FormatInt(p.CashCents, 10),
+			strconv.Itoa(p.Positions),
+			strconv.Itoa(p.FillsToday),
+			strconv.Itoa(p.RejectsToday),
+		}); err != nil {
+			return err
+		}
+	}
+	return w.Error()
+}
+
+func cents(v int64) float64 { return float64(v) / 100 }
 
 func countPositions(pf *trading.Portfolio) int {
 	n := 0
@@ -324,6 +290,15 @@ func countPositions(pf *trading.Portfolio) int {
 }
 
 func sortedKeys(m map[string]int64) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sortedStrKeys(m map[string]int) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)

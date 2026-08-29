@@ -489,3 +489,20 @@ func (c *stepCtx) AdjClose(id mktdata.InstrumentID, back int, mode mktdata.AdjMo
 	day, _ := h.TradingDay(back)
 	return c.e.adj.Adjust(id, day, raw, mode), true
 }
+
+// ---- 本步明细 ----
+//
+// 单步运行要「详细记录」（ROADMAP 需求 3），而记录的消费者是引擎外部：
+// CLI、Web、海选汇总。故成交与拒单必须在 Engine 上可读，
+// 不能只经 StepContext 暴露给策略 —— 策略之外没人能拿到。
+//
+// 返回的切片在下一次 Step() 时被复用，调用方要留存须自行拷贝。
+
+// Fills 返回最近一步的成交。
+func (e *Engine) Fills() []trading.Fill { return e.fills }
+
+// Rejections 返回最近一步的拒单，每条带结构化原因与数值 detail。
+func (e *Engine) Rejections() []trading.Rejection { return e.rejects }
+
+// LastCounts 最近一步的成交数与拒单数。
+func (e *Engine) LastCounts() (fills, rejects int) { return len(e.fills), len(e.rejects) }
