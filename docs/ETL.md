@@ -63,10 +63,10 @@ C1（未来函数防护）与 C5（可复现性）。
 .\.venv\Scripts\python.exe etl\layout.py
 
 # 标的清单与交易日历（全量，约 2 分钟）
-.\.venv\Scripts\python.exe etluild_instruments.py
+.\.venv\Scripts\python.exe etl\build_instruments.py
 
 # 行情抽试：40 只个股（含 10 只已退市）+ 20 只 ETF
-.\.venv\Scripts\python.exe etluild_bars.py --stocks 40 --etfs 20 --start 2018-01-01
+.\.venv\Scripts\python.exe etl\build_bars.py --stocks 40 --etfs 20 --start 2018-01-01
 
 # --- 行情同步（全量 / 每日增量，同一个入口） ---
 .\.venv\Scripts\python.exe etl\sync_bars.py --limit 8       # 试跑 8 只
