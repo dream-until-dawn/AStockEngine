@@ -214,6 +214,10 @@ INSTRUMENTS_SCHEMA = pa.schema([
     pa.field("name", pa.string(), nullable=False),
     pa.field("type", pa.int8(), nullable=False),
     pa.field("board", pa.int8(), nullable=False),
+    # ETF 的涨跌停由其**跟踪的指数**决定（跟踪创业板/科创板者为 20%），
+    # 而 board 对 ETF 统一记为主板 —— 代码段无法可靠区分。
+    # 个股的 tracked_board 等于 board 本身。见 etl/infer_etf_board.py。
+    pa.field("tracked_board", pa.int8(), nullable=False),
     pa.field("price_scale", pa.int32(), nullable=False),
     pa.field("qty_scale", pa.int32(), nullable=False),
     pa.field("quote_ccy", pa.int8(), nullable=False),

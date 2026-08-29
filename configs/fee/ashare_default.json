@@ -1,0 +1,75 @@
+{
+  "name": "ashare_default",
+  "description": "A 股默认费率。佣金因券商而异，请复制本文件后按自己的实际费率修改，不要直接改动本文件。印花税与过户费为监管费率，按生效日期分段，改动前请核实来源。",
+
+  "rules": [
+    {
+      "kind": "commission",
+      "side": "both",
+      "rate_ppm": 250,
+      "min_cents": 500,
+      "note": "万 2.5，最低 5 元。这是常见值而非法定值 —— 各家券商从万 0.85 到万 3 都有，务必改成自己的实际费率。部分券商已取消最低 5 元，此时把 min_cents 置 0。"
+    },
+
+    {
+      "kind": "stamp_duty",
+      "instrument_types": ["stock"],
+      "side": "both",
+      "to": 20050122,
+      "rate_ppm": 2000,
+      "note": "2‰ 双边。数据起点 2005-01-04 至 2005-01-22。"
+    },
+    {
+      "kind": "stamp_duty",
+      "instrument_types": ["stock"],
+      "side": "both",
+      "from": 20050123,
+      "to": 20070529,
+      "rate_ppm": 1000,
+      "note": "2005-01-23 起由 2‰ 下调至 1‰，双边征收。"
+    },
+    {
+      "kind": "stamp_duty",
+      "instrument_types": ["stock"],
+      "side": "both",
+      "from": 20070530,
+      "to": 20080423,
+      "rate_ppm": 3000,
+      "note": "2007-05-30 起上调至 3‰，双边征收。"
+    },
+    {
+      "kind": "stamp_duty",
+      "instrument_types": ["stock"],
+      "side": "both",
+      "from": 20080424,
+      "to": 20080918,
+      "rate_ppm": 1000,
+      "note": "2008-04-24 起由 3‰ 下调至 1‰，仍为双边征收。"
+    },
+    {
+      "kind": "stamp_duty",
+      "instrument_types": ["stock"],
+      "side": "sell",
+      "from": 20080919,
+      "to": 20230827,
+      "rate_ppm": 1000,
+      "note": "2008-09-19 起改为单边征收（仅卖出），税率维持 1‰。"
+    },
+    {
+      "kind": "stamp_duty",
+      "instrument_types": ["stock"],
+      "side": "sell",
+      "from": 20230828,
+      "rate_ppm": 500,
+      "note": "2023-08-28 起减半征收，0.5‰，仅卖出。"
+    },
+
+    {
+      "kind": "transfer_fee",
+      "instrument_types": ["stock"],
+      "side": "both",
+      "rate_ppm": 10,
+      "note": "过户费 0.001%，沪深双向。ETF 免征，故此规则限定 instrument_types 为 stock。早年沪市按每千股定额收取，如需回测 2015 年之前的精确成本，应另加一条 per_share_cents 规则并核实当时标准。"
+    }
+  ]
+}
