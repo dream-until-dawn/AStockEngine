@@ -45,7 +45,11 @@ func TestRejectReasonsAreSpecific(t *testing.T) {
 	}{
 		{
 			name: "停牌", side: SideBuy, qty: 1000, cash: oneMillionYuan,
-			bar:  func() mktdata.Bar { b := mkBar(day2024, 10000, 10000, 10000, 10000, 10000, 0); b.TradeStatus = 0; return b }(),
+			bar: func() mktdata.Bar {
+				b := mkBar(day2024, 10000, 10000, 10000, 10000, 10000, 0)
+				b.TradeStatus = 0
+				return b
+			}(),
 			want: RejectSuspended,
 		},
 		{

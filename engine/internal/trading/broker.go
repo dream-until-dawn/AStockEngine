@@ -45,19 +45,19 @@ type PendingOrder struct {
 type RejectReason int8
 
 const (
-	RejectNone RejectReason = iota
-	RejectSuspended            // 停牌
-	RejectNotListed            // 未上市 / 已退市
-	RejectOneWordBoard         // 一字板：全天一个价，无法成交
-	RejectLimitUpNoBuy         // 涨停买不进
-	RejectLimitDownNoSell      // 跌停卖不出
-	RejectLimitPriceNotReached // 限价单价格未触及
-	RejectInvalidQty           // 申报数量不合规
-	RejectInsufficientCash     // 现金不足
-	RejectInsufficientPosition // 可卖数量不足（T+1 未解冻）
-	RejectVolumeCap            // 超出当日成交量占比上限
-	RejectNoPrice              // 无有效参考价（如成交量为 0 导致 VWAP 无法计算）
-	RejectExpired              // 超过有效期未成交
+	RejectNone                 RejectReason = iota
+	RejectSuspended                         // 停牌
+	RejectNotListed                         // 未上市 / 已退市
+	RejectOneWordBoard                      // 一字板：全天一个价，无法成交
+	RejectLimitUpNoBuy                      // 涨停买不进
+	RejectLimitDownNoSell                   // 跌停卖不出
+	RejectLimitPriceNotReached              // 限价单价格未触及
+	RejectInvalidQty                        // 申报数量不合规
+	RejectInsufficientCash                  // 现金不足
+	RejectInsufficientPosition              // 可卖数量不足（T+1 未解冻）
+	RejectVolumeCap                         // 超出当日成交量占比上限
+	RejectNoPrice                           // 无有效参考价（如成交量为 0 导致 VWAP 无法计算）
+	RejectExpired                           // 超过有效期未成交
 	// RejectRisk 风控拦截。**具体是哪条规则看 Rejection.Rule** ——
 	// 每加一条风控就加一个枚举值，枚举会退化成规则清单的镜像。
 	RejectRisk
