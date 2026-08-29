@@ -19,6 +19,7 @@ import (
 
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/config"
 	eng "github.com/dream-until-dawn/AStockEngine/engine/internal/engine"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/fingerprint"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/metrics"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/record"
@@ -29,7 +30,16 @@ import (
 	_ "github.com/dream-until-dawn/AStockEngine/engine/internal/strategies"
 )
 
+// gitCommit 由构建时注入：
+//
+//	go build -ldflags "-X main.gitCommit=$(git rev-parse HEAD)" ./cmd/backtest
+//
+// `go run` 拿不到它，指纹会退化为 dev 并在报告里标明不可复现。
+var gitCommit string
+
 func main() {
+	fingerprint.SetEngineVersion(gitCommit)
+
 	cfgPath := flag.String("config", "", "配置文件路径（必填）")
 	equityOut := flag.String("equity-out", "", "净值序列输出 CSV 路径")
 	snapAt := flag.Int("snapshot-at", 0, "在第 N 步做快照并验证往返")
@@ -64,6 +74,26 @@ func main() {
 	}
 	for _, line := range cfg.Describe(e, ds, loadDur) {
 		fmt.Println(line)
+	}
+
+	// 输入指纹在**跑之前**就能算出来 —— 它只依赖配置、数据与引擎版本。
+	// 先印出来，跑完再印输出指纹，两者配成一条可验证的记录。
+	dataFP, nFiles, err := fingerprint.Data(cfg.DataRoot())
+	if err != nil {
+		fatal(err)
+	}
+	inputFP, err := cfg.InputFingerprint(dataFP)
+	if err != nil {
+		fatal(err)
+	}
+	fmt.Printf("指纹    输入 %s   数据 %s（%d 个 parquet）  引擎 %s\n",
+		fingerprint.Short(inputFP), fingerprint.Short(dataFP), nFiles,
+		fingerprint.EngineVersion())
+	if !fingerprint.Reproducible() {
+		// 必须说出来：两次 dev 构建之间源码可能已经变了，
+		// 指纹相同并不代表结果可复现
+		fmt.Println("        [!] dev 构建，指纹不保证跨构建可复现" +
+			"（用 -ldflags 注入 git commit 可解）")
 	}
 	fmt.Println()
 
@@ -148,6 +178,12 @@ func main() {
 		printReport(computeMetrics(cfg, ds, rec))
 	}
 
+	fmt.Println("=== 指纹（C5）===")
+	fmt.Printf("  输入 %s\n", inputFP)
+	fmt.Printf("  输出 %s\n", e.ResultFingerprint())
+	fmt.Println("  同输入指纹必须给出同输出指纹。对不上就是可复现性出了问题。")
+	fmt.Println()
+
 	if *equityOut != "" {
 		if err := writeCurve(*equityOut, rec.Steps()); err != nil {
 			fatal(err)
@@ -173,11 +209,20 @@ func main() {
 			cents(pf.Cash), cents(pf.RealizedCents), cents(e.PeakEquityCents()))
 		fmt.Printf("  恢复 现金 %.2f / 已实现 %.2f / 峰值 %.2f\n",
 			cents(b.Cash), cents(b.RealizedCents), cents(e2.PeakEquityCents()))
-		if pf.Cash == b.Cash && pf.RealizedCents == b.RealizedCents &&
-			e.PeakEquityCents() == e2.PeakEquityCents() {
-			fmt.Println("  ✅ 快照恢复后继续步进，账本与全程完全一致")
+		fpFull, fpRestored := e.ResultFingerprint(), e2.ResultFingerprint()
+		fmt.Printf("  全程 指纹 %s\n", fpFull)
+		fmt.Printf("  恢复 指纹 %s\n", fpRestored)
+		ok := pf.Cash == b.Cash && pf.RealizedCents == b.RealizedCents &&
+			e.PeakEquityCents() == e2.PeakEquityCents()
+		if ok && fpFull == fpRestored {
+			// 指纹相同才是真的一致：账本三个数相同只说明结果相同，
+			// 指纹相同才说明**逐笔成交**都相同（C5 + C6 合起来的要求）
+			fmt.Println("  [OK] 快照恢复后继续步进，账本与逐笔成交均与全程一致")
+		} else if ok {
+			fmt.Println("  [!!] 账本一致但指纹不同 —— 中间某笔成交不同，只是恰好抵消了")
+			os.Exit(1)
 		} else {
-			fmt.Println("  ❌ 不一致")
+			fmt.Println("  [XX] 不一致")
 			os.Exit(1)
 		}
 	}

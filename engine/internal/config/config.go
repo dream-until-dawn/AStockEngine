@@ -336,6 +336,9 @@ func (c *Config) resolvePath(p string) string {
 	return filepath.Join(c.dir, p)
 }
 
+// readFile 单独抽出来只为让 fingerprint.go 不必再 import os。
+func readFile(path string) ([]byte, error) { return os.ReadFile(path) }
+
 // sortedIDs 返回排序后的 ID 切片。装配路径上凡是从 map 出来的集合都要过它。
 func sortedIDs(m map[mktdata.InstrumentID]bool) []mktdata.InstrumentID {
 	out := make([]mktdata.InstrumentID, 0, len(m))

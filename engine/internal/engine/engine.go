@@ -1,8 +1,11 @@
 package engine
 
 import (
+	"crypto/sha256"
+	"encoding"
 	"encoding/json"
 	"fmt"
+	"hash"
 
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/indicator"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
@@ -73,6 +76,11 @@ type Engine struct {
 	signals []trading.Signal
 	// sized 本步 Sizer 折算出的订单（风控之前）
 	sized []trading.Order
+
+	// resultHash 逐笔成交的滚动哈希（C5）。在引擎内算，
+	// 这样它不受 recorder.level 影响 —— 记录多少是给人看的事，
+	// 不该改变「这次运行算出了什么」
+	resultHash hash.Hash
 }
 
 // Deps 是引擎依赖的数据与模块。
@@ -128,6 +136,7 @@ func New(d Deps, s Strategy, cfg Config) (*Engine, error) {
 		factories:  make(map[string]IndicatorFactory),
 		indicators: make(map[string]map[mktdata.InstrumentID]indicator.Indicator),
 		prices:     make(map[mktdata.InstrumentID]int64, 1024),
+		resultHash: sha256.New(),
 	}
 	if e.cfg.Params == nil {
 		e.cfg.Params = Params{}
@@ -355,6 +364,7 @@ func (e *Engine) tryMatch(po *trading.PendingOrder, tp mktdata.TimePoint) bool {
 		return false
 	}
 	e.fills = append(e.fills, fill)
+	fillDigest(e.resultHash, fill)
 	return true
 }
 
@@ -450,11 +460,22 @@ type snapshot struct {
 	Pending []trading.PendingOrder `json:"pending"`
 	// Strategy 策略自身的跨步状态。实现 StatefulStrategy 的策略才有。
 	Strategy []byte `json:"strategy,omitempty"`
+	// ResultHash 输出指纹的滚动哈希状态。
+	//
+	// 不存的话，从快照恢复后继续跑出来的指纹会缺掉快照之前的全部成交 ——
+	// 而 C6 的实盘模式**每天都从快照恢复**，那样指纹就永远对不上全程运行，
+	// 「同配置同结果」这条也就无从验证。
+	ResultHash []byte `json:"result_hash,omitempty"`
 }
 
 func (e *Engine) Snapshot() ([]byte, error) {
+	rh, err := e.resultHash.(encoding.BinaryMarshaler).MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("序列化输出指纹状态失败: %w", err)
+	}
 	s := snapshot{
-		Steps: e.steps, PeakEquity: e.peakEquity, Cursor: e.cur.Snapshot(),
+		Steps: e.steps, PeakEquity: e.peakEquity, ResultHash: rh,
+		Cursor:     e.cur.Snapshot(),
 		Indicators: make(map[string]map[string]indicator.State, len(e.keys)),
 		Portfolio:  e.pf.Snapshot(),
 		Pending:    append([]trading.PendingOrder(nil), e.pending...),
@@ -507,6 +528,11 @@ func (e *Engine) Restore(data []byte) error {
 	e.pending = append([]trading.PendingOrder(nil), s.Pending...)
 	e.steps = s.Steps
 	e.peakEquity = s.PeakEquity
+	if len(s.ResultHash) > 0 {
+		if err := e.resultHash.(encoding.BinaryUnmarshaler).UnmarshalBinary(s.ResultHash); err != nil {
+			return fmt.Errorf("恢复输出指纹状态失败: %w", err)
+		}
+	}
 	if ss, ok := e.strategy.(StatefulStrategy); ok {
 		if len(s.Strategy) == 0 {
 			return fmt.Errorf("策略 %s 声明了跨步状态，但快照中没有 —— "+

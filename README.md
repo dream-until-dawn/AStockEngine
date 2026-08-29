@@ -80,21 +80,33 @@ K 线页上的 MACD / KDJ / 均线**由后端引擎算出**，走的是与回测
 
 ### 4. 跑回测
 
+**一次运行由一份 JSON 描述**，换 sizer、加风控、改费率都不需要重新编译：
+
 ```bash
-cd engine && go run ./cmd/backtest -strategy macd_cross -equity-out ../data/results/macd.csv
+cd engine && go run ./cmd/backtest -config ../configs/backtest/macd_cross.json
 ```
 
-常用参数：
+看有哪些模块可选、各自收什么参数：
 
-| 参数 | 说明 |
-|---|---|
-| `-strategy` | `buy_and_hold` / `ma_cross` / `macd_cross` |
-| `-instruments` | 抽样标的数，`0` 为全部 |
-| `-from` / `-to` | 起止交易日（`20200101` 形式） |
-| `-cash` | 初始资金（元） |
-| `-fee` | 费率配置路径 |
-| `-equity-out` | 净值序列 CSV 输出路径 |
-| `-snapshot-at` | 在第 N 步快照并验证往返一致 |
+```bash
+cd engine && go run ./cmd/backtest -modules
+```
+
+命令行只剩三个开关：`-config`（配置在哪）、`-equity-out`（净值序列写哪）、
+`-snapshot-at`（在第 N 步快照并验证往返）。配置示例见 `configs/backtest/`：
+
+```json
+{
+  "data":     { "root": "../../data", "from": 20200101,
+                "universe": { "type": "stock", "require_factor": true, "limit": 300 } },
+  "fee":      { "impl": "config", "params": { "path": "../fee/ashare_default.json" } },
+  "slippage": { "impl": "fixed_bps", "params": { "bps": 5 } },
+  "sizer":    { "impl": "equal_weight", "params": { "slots": 10, "base": "initial" } },
+  "risk":     [ { "impl": "max_position_pct", "params": { "pct": 15 } } ],
+  "strategy": { "impl": "macd_cross", "params": { "short": 12, "long": 26, "signal": 9 } },
+  "metrics":  { "benchmark": "510300" }
+}
+```
 
 **费率是用户配置项，不是常量** —— 不同券商佣金不同，远期加密货币的费率结构
 （提现费、maker/taker）也与 A 股完全不同。见 `configs/fee/ashare_default.json`，
@@ -114,6 +126,12 @@ engine/        Go 回测引擎
   internal/trading/     Fee / Market / Portfolio / Broker
   internal/engine/      Step() 状态机与策略接口
   internal/strategies/  样例策略
+  internal/spec/        参数自描述（喂 Web 表单 / 海选网格 / 配置校验）
+  internal/registry/    泛型容器：按名字取实现
+  internal/config/      一份 JSON 描述一次运行
+  internal/record/      三档记录（none / summary / full）
+  internal/metrics/     绩效指标
+  internal/fingerprint/ 结果指纹（C5）
   cmd/backtest          回测命令行
   cmd/server            数据核对服务（HTTP API）
 web/           数据核对台前端（React + Vite）
@@ -132,6 +150,7 @@ docs/          设计文档
 | [SCHEMA.md](docs/SCHEMA.md) | 表结构契约，Python 与 Go 都以此为准 |
 | [ETL.md](docs/ETL.md) | 数据管道说明；**第 6 节「踩过的坑」是全项目信息密度最高的一节** |
 | [WEB.md](docs/WEB.md) | 数据核对台：接口、五个视图、七条设计决策 |
+| [DESIGN-v0.3-assembly.md](docs/DESIGN-v0.3-assembly.md) | 模块化装配：registry、Sizer/Risk、Metrics 的三个坑、结果指纹 |
 | [DESIGN-v0.2-dataflow.md](docs/DESIGN-v0.2-dataflow.md) | 行情数据流设计评审 |
 | [DESIGN-v0.2-trading.md](docs/DESIGN-v0.2-trading.md) | 交易语义设计评审 |
 | [probe/REPORT-v0.0.md](docs/probe/REPORT-v0.0.md) | 技术选型的实测依据 |
@@ -146,7 +165,10 @@ docs/          设计文档
   它锚定末日，本身即未来函数，且不可复现
 - **C4 状态机** —— 核心是 `Step()`，**不能是内部 for 循环**。
   单步调试、批量海选、实盘增量三种模式共用同一核心
-- **C5 可复现** —— 全链路定点整数，同配置两次运行逐笔一致
+- **C5 可复现** —— 全链路定点整数，同配置两次运行逐笔一致。
+  由**输入/输出指纹**机器可验，不靠肉眼比对几个汇总数。想跨构建复现，
+  用 `-ldflags "-X main.gitCommit=$(git rev-parse HEAD)"` 构建 ——
+  `go run` 拿不到 commit，报告会标注「dev 构建，指纹不保证跨构建可复现」
 - **C8.1 涨跌停基准是 `preclose`** —— 不是前一日收盘价。用 `close.shift(1)`
   会在每个大比例送转的除权日误判
 
