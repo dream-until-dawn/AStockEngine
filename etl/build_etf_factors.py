@@ -47,9 +47,14 @@ import schema as sc  # noqa: E402
 _EXCHANGE_PREFIX = {int(sc.Exchange.SSE): "sh", int(sc.Exchange.SZSE): "sz"}
 
 # 份额折算的常见比例。价格推出的比值落在容差内即取整到这些值。
-_CLEAN_RATIOS = (1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 8.0, 10.0, 20.0, 100.0)
+_CLEAN_RATIOS = (1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0,
+                 15.0, 20.0, 25.0, 50.0, 100.0)
 _SNAP_TOLERANCE = 0.06   # 6%：实测 159527 的价格估计偏离真实比例 3.1%
 _MIN_EVENT_RATIO = 1.001  # 低于此视为无实质调整，跳过
+
+# 比值达到该量级才可能是份额折算；以下一律按「金额未知的分红」处理。
+# 折算是成倍数的，不存在 1.1 倍的折算。
+_SPLIT_THRESHOLD = 1.5
 
 
 def snap_ratio(raw: float) -> tuple[float, bool]:
@@ -124,22 +129,34 @@ def build_factors(bars: pd.DataFrame, events: pd.DataFrame, iid: int) -> tuple[l
 
         cash = float(e.cash)
         if cash > 0:
-            # 现金分红：金额权威，比例可精确计算
+            # 现金分红且金额已知：比例可精确计算
             if cash >= prev_close:
                 warns.append(f"{d} 分红 {cash} 不小于前收 {prev_close}，跳过")
                 continue
             ratio = Decimal(str(prev_close)) / Decimal(str(prev_close - cash))
             kind = "dividend"
         else:
-            # 份额折算：价格比值只是近似，取整到干净比例
+            # 「累计分红 = 0」意味着**金额未知**，不是「没有分红」——
+            # 159919 的事件表里 2019-01-14 累计分红为 0，而 2020-09-14 才 0.1520，
+            # 若 2019 年真有 0.335 的分红，后续累计值不可能更小。数据源早期缺金额。
+            #
+            # 因此只能由价格推比值，再按量级区分两类：
+            #   >= 1.5  份额折算（成倍数），取整到常见比例
+            #   <  1.5  金额未知的分红，直接用价格比值 —— 其中混入了当日开盘的
+            #           市场波动，误差约在开盘跳空的量级（通常 <1%），
+            #           但远小于放着 -9.8% 的断点不管
             raw = prev_close / today_open
             if raw < _MIN_EVENT_RATIO:
                 continue
-            snapped, ok = snap_ratio(raw)
-            if not ok:
-                warns.append(f"{d} 折算比例 {raw:.4f} 无法取整到常见比例，按原值使用")
-            ratio = Decimal(str(snapped))
-            kind = "split"
+            if raw >= _SPLIT_THRESHOLD:
+                snapped, ok = snap_ratio(raw)
+                if not ok:
+                    warns.append(f"{d} 折算比值 {raw:.4f} 未落在常见比例上，按原值使用")
+                ratio = Decimal(str(snapped))
+                kind = "split"
+            else:
+                ratio = Decimal(str(raw))
+                kind = "estimated"
 
         factor = factor * ratio
         rows.append({
@@ -174,7 +191,8 @@ def main() -> int:
     bars = load_etf_bars(inst)
     print(f"  ETF bar {len(bars)} 行 / {bars['instrument_id'].nunique()} 只", flush=True)
 
-    all_rows, all_warns, stats = [], [], {"dividend": 0, "split": 0, "no_event": 0, "failed": 0}
+    all_rows, all_warns, stats = [], [], {"dividend": 0, "split": 0, "estimated": 0,
+                                          "no_event": 0, "failed": 0}
     started = time.perf_counter()
     for i, r in enumerate(etfs.itertuples(index=False), 1):
         try:
@@ -220,7 +238,7 @@ def main() -> int:
           f"-> {p.name} (+{c.name})")
 
     if not args.no_fix_preclose:
-        n = fix_event_preclose(inst, pd.DataFrame(all_rows))
+        n = fix_event_preclose(bars, pd.DataFrame(all_rows))
         print(f"已修正 ETF 事件日 preclose {n} 行")
 
     if all_warns:
@@ -230,41 +248,55 @@ def main() -> int:
     return 0
 
 
-def fix_event_preclose(inst: pd.DataFrame, rows: pd.DataFrame) -> int:
+def fix_event_preclose(bars: pd.DataFrame, rows: pd.DataFrame) -> int:
     """把 ETF 事件日的 preclose 由「前一日收盘」改为「除权调整后的前收」。
 
     ETF 的 preclose 原本是用前一日 close 直接补齐的（新浪不提供该字段），
     在除权/折算日必然偏高，导致当日涨跌停判定失真（SCHEMA.md 1.4 已知降级 #2）。
-    有了因子即可还原：调整后前收 = 前一日收盘 × factor(前) / factor(当日)。
+
+    **必须幂等**：由「前一交易日收盘 / 本次比例」重新计算，而不是在现有
+    preclose 上再除一次。后者重复运行会二次缩小，且无法修复此前用错误比例
+    改坏的值 —— 本函数按前者实现，重跑即自动纠正。
     """
     if rows.empty:
         return 0
-    keys = {(int(r.instrument_id), int(r.ex_date)) for r in rows.itertuples(index=False)}
-    ratio_map = {}
+
+    # (iid, ex_date) -> 该事件的比例
+    ratio_map: dict[tuple[int, int], float] = {}
     for iid, g in rows.groupby("instrument_id"):
         g = g.sort_values("ex_date")
-        prev = sc.FACTOR_SCALE
+        prev = float(sc.FACTOR_SCALE)
         for r in g.itertuples(index=False):
             ratio_map[(int(iid), int(r.ex_date))] = int(r.hfq_factor) / prev
-            prev = int(r.hfq_factor)
+            prev = float(int(r.hfq_factor))
+
+    # (iid, ex_date) -> 前一交易日收盘（定点）
+    prev_close: dict[tuple[int, int], int] = {}
+    for iid, g in bars.groupby("instrument_id"):
+        g = g.sort_values("trading_day")
+        days = list(g["trading_day"])
+        closes = list(g["close"])
+        for k in range(1, len(days)):
+            key = (int(iid), int(days[k]))
+            if key in ratio_map:
+                prev_close[key] = int(closes[k - 1])
 
     root = layout.bar_dir("ashare", "1d")
     fixed = 0
     for f in sorted(root.rglob("*.parquet")):
         df = pd.read_parquet(f)
-        mask = pd.Series(
-            [(int(a), int(b)) in keys for a, b in zip(df["instrument_id"], df["trading_day"])],
-            index=df.index)
-        if not mask.any():
+        keys = list(zip(df["instrument_id"].astype(int), df["trading_day"].astype(int)))
+        hits = [i for i, k in enumerate(keys) if k in ratio_map and k in prev_close]
+        if not hits:
             continue
-        idx = df.index[mask]
-        for i in idx:
-            iid, day = int(df.at[i, "instrument_id"]), int(df.at[i, "trading_day"])
-            ratio = ratio_map.get((iid, day))
-            if not ratio or ratio <= 0:
-                continue
-            df.at[i, "preclose"] = int(round(df.at[i, "preclose"] / ratio))
-            fixed += 1
+        col = df["preclose"].to_numpy().copy()
+        for i in hits:
+            k = keys[i]
+            ratio = ratio_map[k]
+            if ratio > 0:
+                col[i] = int(round(prev_close[k] / ratio))
+                fixed += 1
+        df["preclose"] = col
         df = df.sort_values(["instrument_id", "ts_close"]).reset_index(drop=True)
         sc.validate_columns(df, "bar")
         pq.write_table(pa.Table.from_pandas(df, schema=sc.BAR_SCHEMA, preserve_index=False),
