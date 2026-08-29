@@ -242,7 +242,7 @@ def main() -> int:
 
     has_cash = int((df["cash_before_tax"] > 0).sum())
     has_stock = int(((df["stock_dividend"] + df["stock_transfer"]) > 0).sum())
-    print(f"\ncorporate_action  {before} -> 去重后 {len(df)} 行 / "
+    print(f"\ncorporate_action  {before} -> 合并后 {len(df)} 行 / "
           f"{df['instrument_id'].nunique()} 只标的 -> {p.name} (+{c.name})")
     has_rights = int((df["rights_ratio"] > 0).sum())
     print(f"  含现金分红 {has_cash} 行，含送转 {has_stock} 行，含配股 {has_rights} 行")
