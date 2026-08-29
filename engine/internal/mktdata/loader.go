@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/parquet-go/parquet-go"
@@ -63,6 +64,13 @@ func (s LoadStats) String() string {
 type LoadOptions struct {
 	// Root 是 bar 分区根目录，如 data/bar/market=ashare/freq=1d
 	Root string
+	// Roots 多个分区根目录，用于把不同市场载入同一份 Columns。
+	// 与 Root 同时给出时 Root 排在最前。
+	//
+	// 多市场共用一条时间轴是**刻意的**：A 股日线的 ts_close 是当日 07:00 UTC，
+	// 加密是次日 16:00 UTC，两者自然交错成不同的步 —— 引擎的游标无需分支，
+	// 这正是 C9 想要的形态。
+	Roots []string
 	// Instruments 为空表示全部；否则只加载指定标的
 	Instruments []InstrumentID
 	// FromDay / ToDay 为 0 表示不限，否则按 trading_day 过滤（YYYYMMDD）
@@ -82,15 +90,28 @@ func Load(opt LoadOptions) (*Columns, LoadStats, error) {
 	started := time.Now()
 	var st LoadStats
 
-	files, err := filepath.Glob(filepath.Join(opt.Root, "year=*", "*.parquet"))
-	if err != nil {
-		return nil, st, fmt.Errorf("扫描分区失败: %w", err)
+	roots := opt.Roots
+	if opt.Root != "" {
+		roots = append([]string{opt.Root}, roots...)
+	}
+	if len(roots) == 0 {
+		return nil, st, fmt.Errorf("未指定分区根目录")
+	}
+	var files []string
+	for _, r := range roots {
+		fs, err := filepath.Glob(filepath.Join(r, "year=*", "*.parquet"))
+		if err != nil {
+			return nil, st, fmt.Errorf("扫描分区失败: %w", err)
+		}
+		// 按年份目录名排序 —— 保证同一标的的片段按时间顺序拼接。
+		// **逐根排序后拼接，而不是全局排序**：全局排序把根目录名也算进去，
+		// 结论碰巧一样（标的不跨市场），但那是巧合而非保证
+		sort.Strings(fs)
+		files = append(files, fs...)
 	}
 	if len(files) == 0 {
-		return nil, st, fmt.Errorf("在 %s 下未找到分区文件", opt.Root)
+		return nil, st, fmt.Errorf("在 %s 下未找到分区文件", strings.Join(roots, "、"))
 	}
-	// 按年份目录名排序 —— 保证同一标的的片段按时间顺序拼接
-	sort.Strings(files)
 	st.Files = len(files)
 
 	var want map[InstrumentID]bool
@@ -300,18 +321,20 @@ func ReadInstrumentIDs(root string) ([]InstrumentID, error) {
 }
 
 // FileSizeBytes 汇总分区文件的磁盘占用，便于与内存占用对比。
-func FileSizeBytes(root string) (int64, error) {
-	files, err := filepath.Glob(filepath.Join(root, "year=*", "*.parquet"))
-	if err != nil {
-		return 0, err
-	}
+func FileSizeBytes(roots ...string) (int64, error) {
 	var sum int64
-	for _, f := range files {
-		fi, err := os.Stat(f)
+	for _, root := range roots {
+		files, err := filepath.Glob(filepath.Join(root, "year=*", "*.parquet"))
 		if err != nil {
 			return 0, err
 		}
-		sum += fi.Size()
+		for _, f := range files {
+			fi, err := os.Stat(f)
+			if err != nil {
+				return 0, err
+			}
+			sum += fi.Size()
+		}
 	}
 	return sum, nil
 }

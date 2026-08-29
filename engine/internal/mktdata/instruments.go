@@ -20,6 +20,8 @@ type (
 const (
 	MarketUnknown Market = 0
 	MarketAShare  Market = 1
+	// MarketCrypto 加密货币。5 起留给非股票市场，中间空出来给港股/美股
+	MarketCrypto Market = 5
 )
 
 const (
@@ -27,12 +29,16 @@ const (
 	ExchangeSSE     Exchange = 1
 	ExchangeSZSE    Exchange = 2
 	ExchangeBSE     Exchange = 3
+	// ExchangeOKX 10 起留给非 A 股交易所
+	ExchangeOKX Exchange = 10
 )
 
 const (
 	TypeUnknown InstrumentType = 0
 	TypeStock   InstrumentType = 1
 	TypeETF     InstrumentType = 2
+	// TypeSwap 永续合约。10 起留给衍生品，免得与现货类型挤在一起
+	TypeSwap InstrumentType = 10
 )
 
 const (
@@ -46,6 +52,8 @@ const (
 const (
 	CurrencyUnknown Currency = 0
 	CurrencyCNY     Currency = 1
+	// CurrencyUSDT 稳定币计价。10 起留给非法币
+	CurrencyUSDT Currency = 10
 )
 
 const (
@@ -54,12 +62,24 @@ const (
 	StatusDelisted Status = 2
 )
 
+func (m Market) String() string {
+	switch m {
+	case MarketAShare:
+		return "ashare"
+	case MarketCrypto:
+		return "crypto"
+	}
+	return "unknown"
+}
+
 func (t InstrumentType) String() string {
 	switch t {
 	case TypeStock:
 		return "stock"
 	case TypeETF:
 		return "etf"
+	case TypeSwap:
+		return "swap"
 	}
 	return "unknown"
 }

@@ -37,7 +37,7 @@ META_TABLES = (
     "corporate_action",  # 分红送配
 )
 
-MARKETS = ("ashare",)    # 远期扩展：us / hk / futures / crypto
+MARKETS = ("ashare", "crypto")    # 远期扩展：us / hk / futures
 FREQS = ("1d",)          # 远期扩展：1m / 5m / 1h
 
 

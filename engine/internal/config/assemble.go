@@ -235,6 +235,9 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 		return nil, err
 	}
 
+	if err := checkMarketRules(ds.Universe, ids, c.Market.Impl); err != nil {
+		return nil, err
+	}
 	market, err := trading.Markets.Build(c.Market.Impl, c.Market.Params)
 	if err != nil {
 		return nil, err
@@ -387,6 +390,44 @@ func parseStatus(s string) (int, error) {
 	return 0, fmt.Errorf("未知的 universe.status %q，可选：all / listed / delisted", s)
 }
 
+// checkMarketRules 拦下「用 A 股规则跑非 A 股标的」。
+//
+// 数据层是市场无关的（C9），交易规则层不是。A 股规则带着 T+1、涨跌停、
+// 印花税、252 日年化；把它套到加密货币上**不会报任何错**，只会静默给出
+// 一份看着很正常的假结果 —— 这比崩溃危险得多。
+//
+// 加密的规则实现（T+0、无涨跌停、365 日年化、资金费率）还没写，
+// 所以这里宁可拒绝。等 CryptoMarket 落地后，这个函数改成查表即可。
+func checkMarketRules(uni *mktdata.Universe, ids []mktdata.InstrumentID, impl string) error {
+	if strings.ToLower(strings.TrimSpace(impl)) != "ashare" {
+		return nil
+	}
+	counts := make(map[mktdata.Market]int, 2)
+	var sample string
+	for _, id := range ids {
+		in := uni.Get(id)
+		if in == nil || in.Market == mktdata.MarketAShare {
+			continue
+		}
+		if counts[in.Market] == 0 {
+			sample = in.Symbol
+		}
+		counts[in.Market]++
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(counts))
+	for m, n := range counts {
+		parts = append(parts, fmt.Sprintf("%s %d 个", m, n))
+	}
+	sort.Strings(parts)
+	return fmt.Errorf("market.impl=\"ashare\" 但标的池里有非 A 股标的（%s，如 %s）—— "+
+		"A 股规则含 T+1、涨跌停、印花税，套到其他市场会静默给出错误结果。"+
+		"请用 universe.market 限定市场；对应市场的规则实现尚未提供",
+		strings.Join(parts, "、"), sample)
+}
+
 func parseMarkets(ss []string) (map[mktdata.Market]bool, error) {
 	if len(ss) == 0 {
 		return nil, nil
@@ -396,8 +437,10 @@ func parseMarkets(ss []string) (map[mktdata.Market]bool, error) {
 		switch strings.ToLower(s) {
 		case "ashare", "a", "cn":
 			m[mktdata.MarketAShare] = true
+		case "crypto", "okx":
+			m[mktdata.MarketCrypto] = true
 		default:
-			return nil, fmt.Errorf("未知的 universe.market %q，当前只支持 ashare", s)
+			return nil, fmt.Errorf("未知的 universe.market %q，可选：ashare / crypto", s)
 		}
 	}
 	return m, nil

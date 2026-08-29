@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -106,11 +107,13 @@ func LoadStore(dataRoot, feePath string, progress func(string, ...any)) (*Store,
 		return nil, err
 	}
 
-	progress("  载入 %-18s ", "bar（全量）")
+	roots, err := barRoots(dataRoot)
+	if err != nil {
+		return nil, err
+	}
+	progress("  载入 %-18s ", fmt.Sprintf("bar（%d 个市场）", len(roots)))
 	t0 := time.Now()
-	col, st, err := mktdata.Load(mktdata.LoadOptions{
-		Root: filepath.Join(dataRoot, "bar", "market=ashare", "freq=1d"),
-	})
+	col, st, err := mktdata.Load(mktdata.LoadOptions{Roots: roots})
 	if err != nil {
 		progress("失败\n")
 		return nil, err
@@ -138,6 +141,33 @@ func LoadStore(dataRoot, feePath string, progress func(string, ...any)) (*Store,
 	return s, nil
 }
 
+// MarketScope 描述当前载入了哪些市场，用于在页面上明示范围。
+//
+// 由**实际载入的标的**统计而来，而不是写死一句话 ——
+// 写死的范围说明会在数据变了之后继续骗人。
+func (s *Store) MarketScope() string {
+	n := make(map[mktdata.Market]int, 4)
+	for _, in := range s.Uni.All() {
+		if st, ok := s.InstStats[in.ID]; ok && st.Bars > 0 {
+			n[in.Market]++
+		}
+	}
+	names := map[mktdata.Market]string{
+		mktdata.MarketAShare: "A 股", mktdata.MarketCrypto: "加密货币",
+	}
+	order := []mktdata.Market{mktdata.MarketAShare, mktdata.MarketCrypto}
+	parts := make([]string, 0, len(order))
+	for _, m := range order {
+		if n[m] > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d 只", names[m], n[m]))
+		}
+	}
+	if len(parts) == 0 {
+		return "无"
+	}
+	return strings.Join(parts, " + ")
+}
+
 // Stat 取标的统计，不存在时返回零值。
 func (s *Store) Stat(id mktdata.InstrumentID) InstStat { return s.InstStats[id] }
 
@@ -151,12 +181,42 @@ func (s *Store) DataDays() (first, last int32) {
 
 // FileSizeMB 返回 bar 分区的磁盘占用，用于与内存占用对照。
 func (s *Store) FileSizeMB() float64 {
-	n, err := mktdata.FileSizeBytes(
-		filepath.Join(s.DataRoot, "bar", "market=ashare", "freq=1d"))
+	roots, err := barRoots(s.DataRoot)
+	if err != nil {
+		return 0
+	}
+	n, err := mktdata.FileSizeBytes(roots...)
 	if err != nil {
 		return 0
 	}
 	return float64(n) / 1024 / 1024
+}
+
+// barRoots 列出 data/bar 下**全部**市场的日线分区目录。
+//
+// 不写死 market=ashare：核对台的用处就是把数据摆出来看，
+// 而「新拉的一批数据在页面上看不到」是最不该出现的失败形态 ——
+// 它不报错，只是安静地少了东西。加了市场就自动出现。
+//
+// 结果按路径排序，保证同一份数据每次启动的加载顺序一致。
+func barRoots(dataRoot string) ([]string, error) {
+	dirs, err := filepath.Glob(filepath.Join(dataRoot, "bar", "market=*", "freq=1d"))
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		years, _ := filepath.Glob(filepath.Join(d, "year=*", "*.parquet"))
+		if len(years) > 0 {
+			out = append(out, d)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("在 %s 下没有任何市场的日线分区",
+			filepath.Join(dataRoot, "bar"))
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
 // checkDataRoot 在启动前确认数据目录存在，给出比 parquet 报错更可读的提示。
@@ -173,10 +233,8 @@ func checkDataRoot(dataRoot string) error {
 			missing = append(missing, p)
 		}
 	}
-	bars, _ := filepath.Glob(
-		filepath.Join(dataRoot, "bar", "market=ashare", "freq=1d", "year=*", "*.parquet"))
-	if len(bars) == 0 {
-		missing = append(missing, filepath.Join(dataRoot, "bar/market=ashare/freq=1d/year=*"))
+	if _, err := barRoots(dataRoot); err != nil {
+		missing = append(missing, filepath.Join(dataRoot, "bar/market=*/freq=1d/year=*"))
 	}
 	if len(missing) > 0 {
 		sort.Strings(missing)

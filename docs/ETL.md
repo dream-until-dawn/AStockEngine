@@ -12,7 +12,8 @@
 
 ```
        BaoStock ──┐
-       新浪 ──────┤→ sources/ 适配器 ──→ 归一化形态 ──┐
+       新浪 ──────┤
+       OKX ───────┤→ sources/ 适配器 ──→ 归一化形态 ──┐
    ingest/(其他语言) ┘   (Capability 声明能力)          │
                                                       ▼
                                           定点转换 + ts 计算 + 排序
@@ -40,11 +41,13 @@ C1（未来函数防护）与 C5（可复现性）。
 | `etl/sources/base.py` | 适配器接口 + `Capability` 能力位 |
 | `etl/sources/baostock_src.py` | 个股日线 / 标的清单 / 交易日历 / 分红送配 |
 | `etl/sources/sina_src.py` | ETF 日线 / 复权因子 |
+| `etl/sources/okx_src.py` | 加密永续合约日线 / 合约规格。**不需要 API key** |
 | `etl/sources/external.py` | 非 Python 数据源的接入（见 [ingest/README.md](../ingest/README.md)） |
 | `etl/build_instruments.py` | 构建 instruments + calendar（全量） |
 | `etl/build_bars.py` | 构建 bar + adj_factor（抽试 / 全量），含质检 |
 | `etl/sync_bars.py` | **bar 全量拉取与每日增量**，断点续跑、并发、自愈、逐年质检；含个股复权因子同步 |
 | `etl/build_etf_factors.py` | **ETF 复权因子**重建 + 修正事件日 preclose |
+| `etl/build_crypto.py` | 加密永续合约：合并 instruments + 全量 bar（全量重拉，非增量） |
 | `etl/dump.py` | 查看 Parquet 内容，还原定点与枚举 |
 
 ---
@@ -80,6 +83,10 @@ C1（未来函数防护）与 C5（可复现性）。
 # ETF 复权因子（个股走 sync_bars，ETF 无对应接口需重建）
 .\.venv\Scripts\python.exe etl\build_etf_factors.py
 
+# 加密永续合约日线（全量重拉，约 2 分钟；不需要 API key）
+.\.venv\Scripts\python.exe etl\build_crypto.py
+.\.venv\Scripts\python.exe etl\build_crypto.py --instruments BTC-USDT-SWAP
+
 # 查看数据
 .\.venv\Scripts\python.exe etl\dump.py instruments --where "board==3" --limit 10
 .\.venv\Scripts\python.exe etl\dump.py bar --symbol 600519 --limit 15
@@ -97,6 +104,12 @@ C1（未来函数防护）与 C5（可复现性）。
 | ETF 日线 | 新浪 | BaoStock 对 ETF 代码返回 0 行；新浪覆盖全历史 |
 | 个股复权因子 | 新浪 | 事件式、16 位精度；实测还原后复权价误差 < 1e-6 |
 | ETF 复权 | **暂无** | 🟡 未解决，见第 7 节 |
+| 加密永续日线 | OKX | `bar=1D` 原生就是 UTC+8 口径；`history-candles` 给全历史；公开端点无需鉴权 |
+| 资金费率 | **暂无** | 🔴 未采集，见 SCHEMA.md 1.5 —— 缺它则加密回测系统性偏乐观 |
+
+> **OKX 接入不碰 API key。** 行情端点（`/api/v5/market/*`、`/api/v5/public/*`）
+> 是公开的，只有下单与查账户才要鉴权。`okx_src.py` 因此完全不读凭证 ——
+> 少一个能泄漏的东西，也少一处「本地能跑、CI 上跑不了」的差异。
 
 **东财已弃用**：约 10 次请求即触发 IP + 端点级封禁，实测 ≥45 分钟未恢复。
 按此速率回补 1647 只 ETF 需 120 小时以上。
@@ -388,6 +401,26 @@ date        open   high   low   close  preclose  volume  amount  turn  tradestat
 
 ---
 
+### 6.12 OKX 的三个坑
+
+**① 未收盘的 bar 会照常返回。** `history-candles` 的第 9 个字段 `confirm`
+为 `"0"` 表示这根还没收盘。不过滤的话最后一根是半截的 ——
+后果不是「数据有点糙」，而是**「今天」的回测结果每小时都在变**，
+C5 直接失守，而且不会报任何错。
+
+**② 翻页游标必须用「这一页最旧的一根」，与是否 confirm 无关。**
+先按 `confirm` 过滤、再拿过滤后列表的最旧值做游标，
+遇到整页都未收盘时游标不动，循环卡死。
+
+**③ 业务错误走 HTTP 200 + `code` 字段。** OKX 不用 HTTP 状态码报业务错误。
+只看状态码的话，一个 `code=51001`（合约不存在）会被当成空结果，
+然后**静默写出一张空表**。`_get()` 因此显式校验 `code == "0"`。
+
+> 前两条与 6.1 / 6.4 是同一类：**错误不表现为异常，而表现为一个看起来正常的数**。
+> 这类问题只能靠「知道它存在」来防，测不出来。
+
+---
+
 ## 7. 已知的数据质量降级
 
 | # | 项 | 影响 | 状态 |
@@ -401,7 +434,23 @@ date        open   high   low   close  preclose  volume  amount  turn  tradestat
 | 7 | `510100` 于 2023-02-13 的折算未修正 | 该日后复权序列有 +19.4% 跳变 | 比值 0.838 落在合并阈值之外；由 tracked_board 推断顺带检出 |
 | 8 | 约 6770 个因子事件无分红送配记录 | 其中 1270 个为 2005-2007 股改对价送股，Portfolio 在这些日期无法入账 | 厂商覆盖差异，见 6.11 |
 | 9 | `pay_date` 恒为 null | 派息到账日未知，Portfolio 只能按除权日入账 | 数据源不提供；BaoStock 有但需逐年查询，代价过高 |
+| 10 | **加密无资金费率** | 永续每 8h 结算一次，影响可能超过手续费；**回测系统性偏乐观** | 🔴 未采集，见 SCHEMA.md 1.5 |
+| 11 | 加密 `turn` 恒为 0 | 永续合约无流通股本，换手率无从谈起 | 概念不适用，非数据缺失 |
+| 12 | 加密无交易日历 | `TradingDaysPerYear` 回退兜底 252，而正确值是 365 | 年化路径待 CryptoMarket 处理，见 SCHEMA.md 3 |
+| 13 | OKX 2019-12-04~11 成交量离群 | BTC 这 8 天成交额中位 583 亿 USDT，而 2019-12-16~2020-06-30 的 198 天中位仅 3.2 亿 —— **183 倍** | 合约上线首月（2019-11-12）；vol 与 amount 内部自洽（隐含均价落在当日 [low, high]），故非单位错误。不修正、不剔除，见下方说明 |
+| 14 | 15 根零成交 bar（BTC 7 / ETH 8，全在 2019-12） | OHLC 多为上一根价格铺平；其中 2 根价格有变动却零成交 | 已按 SCHEMA.md 1.3 记 `tradestatus=0`，引擎视同停牌 |
 
+> **关于 13：为什么不剔除。** 那 8 天的 `vol` 与 `amount` 互相自洽
+> （用 `ct_val` 折出的隐含均价落在当日 `[low, high]` 内），
+> 所以不是单位错误 —— 要么是真实成交，要么是上线激励期的对敲，
+> 两者都是「OKX 报出来的成交量」这个事实的一部分。
+> 剔除它需要一条判定规则，而任何阈值规则都会在别处误伤。
+>
+> **它的实际影响是有限的**：成交量只用于 Broker 的 `volume_cap_ppm`
+> （限制单笔成交不超过当日成交量的某个比例）。成交量被高估
+> 意味着这 8 天的成交量约束**偏松**，而不是价格失真 ——
+> 价格序列本身没有异常。真要回避，用 `data.from` 跳过 2019 年即可。
+>
 > **已澄清**：早前把 `is_st` 列为「数据存疑」是**误判**。
 > 当时观察到 002214 大立科技在 2026-07-09/10 的涨跌幅超出 ST 的 5% 限制，
 > 疑为数据错误；扩大样本后发现越界全部集中在 2026-07-06 之后且涉及多只 ST 股，
@@ -425,6 +474,7 @@ date        open   high   low   close  preclose  volume  amount  turn  tradestat
 | `trading_day` 落在日历交易日内 | calendar 表 |
 | **板块 / ST 自洽校验** | 见 6.4 —— 用数据自己验数据，不引入新数据源 |
 | instruments ID 唯一、枚举完整、日期合理 | SCHEMA.md 2.4 |
+| **定点值离 int64 上限的余量**（`build_crypto.py: report_ranges`） | SCHEMA.md 0.6 —— 每次运行实测打印，不靠估算 |
 
 ---
 

@@ -15,7 +15,7 @@ from typing import Iterable
 
 import pyarrow as pa
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"  # 1.1.0：加入加密货币永续合约
 
 # --- 枚举（0 一律保留为未知/无效） ------------------------------------------
 
@@ -23,7 +23,9 @@ SCHEMA_VERSION = "1.0.0"
 class Market(IntEnum):
     UNKNOWN = 0
     ASHARE = 1
-    # 远期：US = 2, HK = 3, FUTURES = 4, CRYPTO = 5
+    CRYPTO = 5
+    # 远期：US = 2, HK = 3, FUTURES = 4
+    # 取值一经使用不得改动 —— 它已经写进了 parquet
 
 
 class Exchange(IntEnum):
@@ -31,12 +33,14 @@ class Exchange(IntEnum):
     SSE = 1   # 上交所
     SZSE = 2  # 深交所
     BSE = 3   # 北交所
+    OKX = 10  # OKX（加密货币）；10 起留给非 A 股交易所
 
 
 class InstrumentType(IntEnum):
     UNKNOWN = 0
     STOCK = 1
     ETF = 2
+    SWAP = 10  # 永续合约。10 起留给衍生品，免得与现货类型挤在一起
 
 
 class Board(IntEnum):
@@ -45,11 +49,14 @@ class Board(IntEnum):
     CHINEXT = 2   # 创业板
     STAR = 3      # 科创板
     BSE = 4       # 北交所
+    # 加密货币没有板块概念 —— 一律 UNKNOWN，而不是硬塞进 MAIN。
+    # board 在引擎里决定涨跌停幅度，给个假的板块会让它按 A 股规则算
 
 
 class Currency(IntEnum):
     UNKNOWN = 0
     CNY = 1
+    USDT = 10  # 稳定币计价。10 起留给非法币
 
 
 class Status(IntEnum):
@@ -62,6 +69,37 @@ class Status(IntEnum):
 
 PRICE_SCALE_ASHARE = 1000       # 价格最小单位 0.001 元
 QTY_SCALE_ASHARE = 1            # 数量最小单位 1 股/份
+
+# --- 加密货币的定点精度 -------------------------------------------------------
+#
+# **「18 位精度」在 int64 里放不下，这不是取舍问题而是算术事实。**
+#
+#   int64 上限 9,223,372,036,854,775,807，约 19 位十进制
+#   固定 18 位小数 → 可表示的最大数是 9.22，连 10 都放不下
+#
+# 真正需要的是「有效数字够 + 小数点位置随标的可变」，而 schema 里
+# price_scale / qty_scale 本来就是**逐标的**的，正是为此。
+#
+# 下面三行的前两行是**实测值**（build_crypto.py 每次运行会打印当轮实测）：
+#
+#   标的            历史最高价   scale   定点值      到 int64 上限的余量
+#   BTC-USDT-SWAP   124,956.5   1e8     1.25e13     73.8 万倍
+#   日成交量（张）    1.25e9      1e8     1.25e17     74 倍
+#   SHIB 类         ~1e-5      1e8     1e3         有效数字只剩 4 位 → 该给 1e12
+#
+# 选 1e8 的理由：它是加密圈的惯例精度（satoshi 级），比 OKX 的
+# tickSz（BTC 0.1、ETH 0.01）细 7~9 个数量级，且留足余量。
+# 极低价标的将来单独给更大的 scale —— 这正是逐标的 scale 的意义。
+#
+# ⚠ **乘积会溢出**：实测 price_fp × qty_fp 最大 1.25e13 × 1.25e17 = 1.56e30，
+# 远超 int64 的 9.22e18。引擎侧算名义额必须走 mulDiv 拆分
+# （参照 mktdata/adjust.go 的 mulDivFactor）。单个值本身都安全，
+# 溢出只发生在相乘时。
+#
+# 数量的余量只有 74 倍，是三者里最紧的一项 —— 若将来接成交量更大的
+# 小币种，先看 build_crypto.py 打印的实测余量，别照抄 1e8。
+PRICE_SCALE_CRYPTO = 100_000_000   # 1e8，8 位小数
+QTY_SCALE_CRYPTO = 100_000_000     # 1e8，张数也到 8 位小数（OKX lotSz 0.01 张）
 AMOUNT_SCALE = 100              # 金额以分为单位
 RATIO_SCALE = 1_000_000         # 比率（换手率等）固定 1e6
 FACTOR_SCALE = 1_000_000_000_000  # 复权因子 1e12
@@ -110,6 +148,21 @@ def ymd_to_int(value) -> int:
 
 def int_to_date(ymd: int) -> date:
     return date(ymd // 10000, ymd // 100 % 100, ymd % 100)
+
+
+def crypto_session_ts(ymd: int) -> tuple[int, int]:
+    """加密货币日线的 (ts_open, ts_close)，UTC 毫秒。
+
+    **按 UTC+8 切日**（OKX 的 bar=1D 就是这个口径，1Dutc 才是 UTC 0 点）。
+    24×7 连续交易，故 ts_close = 次日 00:00 —— 与次日 bar 的 ts_open 相同，
+    这是事实而非错误：一根 bar 结束的瞬间就是下一根开始的瞬间。
+
+    引擎的游标只用 ts_close（该 bar 信息可得的时刻），所以 A 股的
+    15:00 与加密的次日 00:00 能排在同一条时间轴上，无需分支（C9）。
+    """
+    d = int_to_date(ymd)
+    o = datetime(d.year, d.month, d.day, 0, 0, tzinfo=CST)
+    return int(o.timestamp() * 1000), int(o.timestamp() * 1000) + 86_400_000
 
 
 def session_ts(ymd: int) -> tuple[int, int]:

@@ -55,6 +55,17 @@ python -m venv .venv
 
 再次运行 `sync_bars.py` 即为增量更新，只补新交易日。
 
+加密货币（OKX 永续合约，可选，约 2 分钟）。**不需要 API key** ——
+行情端点是公开的：
+
+```bash
+.\.venv\Scripts\python.exe etl\build_crypto.py
+```
+
+> 加密数据目前**只到数据层**：可以在核对台里看 K 线与指标，
+> 但还跑不了回测 —— 交易规则（T+0、无涨跌停、365 日年化、资金费率）
+> 尚未实现，引擎会明确拒绝而不是套用 A 股规则给出假结果。
+
 ### 3. 打开数据核对台
 
 在改策略之前，先确认数据是对的。核对台把四张非行情表、日线行情
@@ -118,7 +129,7 @@ cd engine && go run ./cmd/backtest -modules
 etl/           Python 数据管道
   layout.py      所有路径的唯一定义处
   schema.py      表结构（与 Go 侧的唯一耦合点）
-  sources/       数据源适配器，每个源一个文件
+  sources/       数据源适配器，每个源一个文件（BaoStock / 新浪 / OKX）
   probe/         v0.0 技术验证探针
 engine/        Go 回测引擎
   internal/mktdata/     列式加载、时间游标、复权、公司行动

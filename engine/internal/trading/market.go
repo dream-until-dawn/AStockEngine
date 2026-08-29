@@ -2,6 +2,7 @@ package trading
 
 import (
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
+	"math"
 )
 
 // PriceRef 指定成交价的基准。
@@ -137,10 +138,39 @@ func (m *AShareMarket) LimitPrices(inst *mktdata.Instrument, b mktdata.Bar) (int
 	if b.PreClose <= 0 {
 		return 0, 0, false
 	}
+	// 别的市场没有涨跌停这回事，返回 false 而不是算一个数出来。
+	//
+	// 这不只是语义问题，也是溢出问题：roundToCent 里 preclose × 1.3e6
+	// 在 A 股的价格量级（≤3e6 厘）上安全，而加密的定点价可到 1.25e13
+	// （scale 1e8），乘完 1.6e19 **超过 int64**，会静默回绕成负数。
+	// 见 SCHEMA.md 0.6。
+	//
+	// **market 未知时按 A 股处理**（走下面的量级兜底），而不是当成别的市场 ——
+	// 未知市场若直接放行「无涨跌停」，等于在数据有问题时把风控关掉，
+	// 回测结果会偏乐观。宁可用更严的规则，也不要静默放宽。
+	if inst != nil && inst.Market != mktdata.MarketAShare &&
+		inst.Market != mktdata.MarketUnknown {
+		return 0, 0, false
+	}
+	// 量级兜底：market 填错时也不至于算出一个负的涨停价。
+	// 上界由 roundToCent 的最坏情形反推（北交所 30% → factorPPM = 1.3e6）。
+	if b.PreClose > maxPreCloseForLimit {
+		return 0, 0, false
+	}
 	ppm := m.limitPPM(inst, b)
 	return roundToCent(b.PreClose, 1_000_000+ppm),
 		roundToCent(b.PreClose, 1_000_000-ppm), true
 }
+
+// maxPreCloseForLimit 是 roundToCent 不溢出的 preclose 上界。
+//
+// 最坏情形 factorPPM = 1e6 + 3e5（北交所 30%），再加上四舍五入的 5e6：
+//
+//	preclose × 1.3e6 + 5e6 ≤ 9.22e18   →   preclose ≤ 7.09e12
+//
+// A 股的价格上限约 3e6 厘，离这条线还有 200 万倍；
+// 它拦的是「scale 不是 1000 的标的被当成了 A 股」这种情况。
+const maxPreCloseForLimit = (math.MaxInt64 - 5_000_000) / 1_300_000
 
 // roundToCent 计算 preclose × factorPPM / 1e6，并**四舍五入到分**。
 //
@@ -148,7 +178,8 @@ func (m *AShareMarket) LimitPrices(inst *mktdata.Instrument, b mktdata.Bar) (int
 // 全程整数：preclose 上限约 3e6 厘，× 1.3e6 = 3.9e12，远在 int64 范围内。
 //
 // 校验：4.35 元 ×1.10 = 4.785 → 4.79（而非银行家舍入的 4.78）
-//       5.35 元 ×1.10 = 5.885 → 5.89（而非 5.88）
+//
+//	5.35 元 ×1.10 = 5.885 → 5.89（而非 5.88）
 func roundToCent(preclose, factorPPM int64) int64 {
 	n := preclose * factorPPM // 厘 × 1e6
 	// 除以 1e7 得到「分」，四舍五入；再乘 10 回到「厘」
