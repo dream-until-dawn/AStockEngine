@@ -64,6 +64,7 @@ func main() {
 	mux.HandleFunc("GET /api/kline/{id}", store.handleKline)
 	mux.HandleFunc("GET /api/configs", store.handleConfigs)
 	mux.HandleFunc("POST /api/backtest", store.handleBacktest)
+	mux.HandleFunc("POST /api/universe", store.handleUniverse)
 
 	// 前端产物存在就一并伺服，这样 `go run` 一条命令即可用；
 	// 开发时走 Vite（它把 /api 代理到这里），不依赖本分支。
@@ -176,6 +177,7 @@ const apiIndex = `AStockEngine 数据核对服务
   GET /api/corp-actions            全市场分红送配 ?from=&to=&q=&hasEffect=
   GET /api/configs                 列出回测配置（含解析结果，供前端改参数）
   POST /api/backtest               跑一次回测，返回绩效 / 净值 / 成交 / 拒单 / 逐轮
+  POST /api/universe               预览标的池：命中多少只、都是些什么
   GET /api/kline/{id}              K 线 + 引擎算出的指标
       ?adj=none|qfq|hfq            复权模式，K 线与指标同基准（默认 none）
       &from=&to=&macd=12,26,9&kdj=9,3,3&ma=5,10,20,60

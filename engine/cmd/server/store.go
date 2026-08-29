@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
@@ -36,8 +37,14 @@ type Store struct {
 	// ConfigDir 回测配置所在目录。也是从浏览器传来的配置里相对路径的解析基准
 	ConfigDir string
 	LoadedAt  time.Time
-	LoadMS    int64
-	BarStats  mktdata.LoadStats
+
+	// 最近一次回测用的标的子集。调参时会反复跑同一个池子，
+	// 缓存一份省掉重复拷贝（大池子一次 550 MB）
+	uniMu    sync.Mutex
+	uniKey   string
+	uniCols  *mktdata.Columns
+	LoadMS   int64
+	BarStats mktdata.LoadStats
 }
 
 // InstStat 是单个标的的数据覆盖情况。

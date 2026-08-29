@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -30,10 +32,16 @@ import (
 
 // maxUniverseForWeb 服务端回测的标的数上限。
 //
-// Assemble 会把全量列式数据 Subset 成配置要求的子集，那是一次拷贝。
-// 285 只约 30 MB 无所谓，全市场 7,175 只就是又一个 1.25 GB ——
-// 浏览器点一下把服务端撑爆不是个好体验，宁可直说。
-const maxUniverseForWeb = 3000
+// Assemble 会把全量列式数据 Subset 成配置要求的子集，那是一次拷贝：
+// 285 只约 30 MB，3,194 只（在市主板）约 550 MB，全市场就是又一个 1.25 GB。
+//
+// 6000 这个数是按「A 股所有现实池子都能跑」定的：全部个股 5,549 只、
+// 全部标的 7,200 只。取 6000 是让前者能跑、后者被挡住 ——
+// 「所有个股加所有 ETF 一起回测」不是一个有意义的池子，
+// 拦下来比让服务端吃满内存好。
+//
+// 命令行没有这个限制：LoadDataSet 只载入所需标的，压根不用 Subset。
+const maxUniverseForWeb = 6000
 
 // maxListedRejections 返回给前端的拒单条数上限。
 // 超出部分只给计数 —— 8,720 条拒单全塞进 JSON 对看没有帮助。
@@ -198,9 +206,11 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ds := &config.DataSet{
-		Columns: s.Col, Universe: s.Uni, Adjuster: s.Adj, CorpAct: s.Corp,
+		Universe: s.Uni, Adjuster: s.Adj, CorpAct: s.Corp,
 		Calendar: s.Cal, Root: mustAbs(s.DataRoot),
 	}
+	// 基准要在**裁子集之前**从全量数据里取 —— 它不在标的池里，
+	// 裁完就没了。这一步顺序错了不会报错，只会让报告里的对标区块凭空消失
 	if cfg.Metrics.Benchmark != "" {
 		in := s.Uni.BySymbol(cfg.Metrics.Benchmark)
 		if in == nil {
@@ -208,8 +218,13 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 				"metrics.benchmark: 未找到标的 %q", cfg.Metrics.Benchmark)
 			return
 		}
-		ds.BenchmarkID, ds.HasBenchmark = in.ID, true
+		if !ds.SetBenchmark(s.Col, in.ID) {
+			writeErr(w, http.StatusBadRequest,
+				"metrics.benchmark: %q 没有行情数据", cfg.Metrics.Benchmark)
+			return
+		}
 	}
+	ds.Columns = s.narrowCached(cfg, ids)
 
 	e, err := cfg.Assemble(ds)
 	if err != nil {
@@ -323,6 +338,49 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, res)
+
+	// 大池子的子集是一大块临时内存（3,194 只约 550 MB）。
+	// Go 的 GC 不会主动还给操作系统，本地工具没必要攥着它不放。
+	if len(ids) > 1000 {
+		go func() {
+			runtime.GC()
+			debug.FreeOSMemory()
+		}()
+	}
+}
+
+// narrowCached 把全量列式数据裁成本次要用的子集，并缓存最近一次的结果。
+//
+// **缓存的意义在于工作流**：调策略参数时会反复跑同一个标的池 ——
+// slots 从 10 改到 5 再跑，标的池没变，没有理由再拷贝一次 550 MB。
+// 只缓存一份：换池子就换掉，不做 LRU（多份缓存等于多份内存，
+// 而同时用两个大池子来回切不是常见用法）。
+//
+// 返回的 Columns 交给 Assemble，那边的 narrow 会认出「集合与区间都吻合」
+// 从而原样透传，不会再拷一次。
+func (s *Store) narrowCached(cfg *config.Config, ids []mktdata.InstrumentID) *mktdata.Columns {
+	// 键要含区间：同一批标的、不同起止日，切出来的是不同的子集
+	parts := make([]byte, 0, len(ids)*4+16)
+	parts = append(parts, byte(cfg.Data.From), byte(cfg.Data.From>>8),
+		byte(cfg.Data.To), byte(cfg.Data.To>>8))
+	for _, id := range ids {
+		parts = append(parts, byte(id), byte(id>>8), byte(id>>16), byte(id>>24))
+	}
+	key := fingerprint.Hex(parts)
+
+	s.uniMu.Lock()
+	defer s.uniMu.Unlock()
+	if s.uniKey == key && s.uniCols != nil {
+		return s.uniCols
+	}
+	sub, err := s.Col.Subset(ids, cfg.Data.From, cfg.Data.To)
+	if err != nil {
+		// 裁不出来就把全量交回去，让 Assemble 自己报错 ——
+		// 在这里吞掉错误会让失败原因指向一个和它无关的地方
+		return s.Col
+	}
+	s.uniKey, s.uniCols = key, sub
+	return sub
 }
 
 // normalizeBench 把基准价格序列归一化到初始资金，并只保留策略也有的交易日。
@@ -414,4 +472,90 @@ func readAll(r *http.Request) ([]byte, error) {
 			return b, nil // io.EOF 之外的错误交给上层的 JSON 解析报
 		}
 	}
+}
+
+// handleUniverse 解析一份 universe 规格，返回命中的标的数与样例。
+//
+// 存在的理由：选池子时得先知道选中了多少、都是些什么，
+// 否则只能靠「跑一次看报错」——而超过上限的池子根本跑不起来。
+//
+// 请求体就是一段 universe JSON，与配置里 data.universe 的形状一致。
+func (s *Store) handleUniverse(w http.ResponseWriter, r *http.Request) {
+	body, err := readAll(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "读取请求体失败: %v", err)
+		return
+	}
+	// 套一层最小配置壳，复用同一套解析与校验 ——
+	// 预览和真跑必须走同一条路径，否则预览说 3193 只、真跑却是别的数
+	var u config.Universe
+	if err := json.Unmarshal(body, &u); err != nil {
+		writeErr(w, http.StatusBadRequest, "universe 不是合法 JSON: %v", err)
+		return
+	}
+	cfg := &config.Config{}
+	cfg.Data.Univers = u
+	ids, err := cfg.ResolveUniverse(s.Uni, s.Adj)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+
+	type row struct {
+		ID     int32  `json:"id"`
+		Symbol string `json:"symbol"`
+		Name   string `json:"name"`
+		Type   int8   `json:"type"`
+		Board  int8   `json:"board"`
+		Bars   int    `json:"bars"`
+		First  int32  `json:"firstDay"`
+		Last   int32  `json:"lastDay"`
+	}
+	// 只回样例：3000 只标的的完整列表对「选池子」没有帮助，
+	// 而两端各看几只就能判断选对没有
+	const sampleN = 12
+	sample := make([]row, 0, sampleN*2)
+	add := func(id mktdata.InstrumentID) {
+		in := s.Uni.Get(id)
+		if in == nil {
+			return
+		}
+		st := s.Stat(id)
+		sample = append(sample, row{
+			ID: int32(id), Symbol: in.Symbol, Name: in.Name,
+			Type: int8(in.Type), Board: int8(in.Board),
+			Bars: st.Bars, First: st.FirstDay, Last: st.LastDay,
+		})
+	}
+	head := ids
+	if len(head) > sampleN {
+		head = head[:sampleN]
+	}
+	for _, id := range head {
+		add(id)
+	}
+	truncated := 0
+	if len(ids) > sampleN*2 {
+		truncated = len(ids) - sampleN*2
+		for _, id := range ids[len(ids)-sampleN:] {
+			add(id)
+		}
+	} else if len(ids) > sampleN {
+		for _, id := range ids[sampleN:] {
+			add(id)
+		}
+	}
+
+	// 有多少只在所选区间内**真的有行情** —— 过滤命中数不等于能跑的数
+	withBars := 0
+	for _, id := range ids {
+		if s.Stat(id).Bars > 0 {
+			withBars++
+		}
+	}
+	writeJSON(w, map[string]any{
+		"count": len(ids), "withBars": withBars,
+		"limit": maxUniverseForWeb, "overLimit": len(ids) > maxUniverseForWeb,
+		"sample": sample, "truncated": truncated,
+	})
 }

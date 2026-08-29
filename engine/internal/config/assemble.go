@@ -28,9 +28,17 @@ type DataSet struct {
 	Stats    mktdata.LoadStats
 	Root     string
 
-	// BenchmarkID 基准标的。它在 Columns 里但**不在标的池里**
+	// BenchmarkID 基准标的。它**不在标的池里** —— 否则策略会把它当成
+	// 可交易标的，超额收益就成了自己跟自己比
 	BenchmarkID  mktdata.InstrumentID
 	HasBenchmark bool
+	// BenchDays / BenchEquity 基准的后复权净值序列，**在裁子集之前算好**。
+	//
+	// 不能等到用的时候再从 Columns 取：调用方可能已经把 Columns 裁成
+	// 不含基准的子集了（服务端为了复用就是这么做的），那时再取只会取到空 ——
+	// 而「基准区块整个消失」这种失败是静悄悄的，报告里只是少了一段。
+	BenchDays   []int32
+	BenchEquity []int64
 }
 
 // LoadDataSet 按配置载入数据。
@@ -96,33 +104,44 @@ func LoadDataSet(c *Config) (*DataSet, error) {
 		Columns: col, Universe: uni, Adjuster: adj, CorpAct: corp,
 		Calendar: cal, Stats: st, Root: root,
 	}
-	if hasBench {
-		ds.BenchmarkID, ds.HasBenchmark = benchID, true
+	if hasBench && !ds.SetBenchmark(col, benchID) {
+		return nil, fmt.Errorf("metrics.benchmark: %q 在该区间内没有行情",
+			c.Metrics.Benchmark)
 	}
 	return ds, nil
 }
 
-// BenchmarkCurve 抽出基准的净值序列，**用后复权收盘价**。
+// BenchmarkCurve 返回基准的净值序列。
+func (ds *DataSet) BenchmarkCurve() (days []int32, equity []int64, ok bool) {
+	if !ds.HasBenchmark || len(ds.BenchDays) == 0 {
+		return nil, nil, false
+	}
+	return ds.BenchDays, ds.BenchEquity, true
+}
+
+// SetBenchmark 记下基准标的并**立刻**算出它的后复权净值序列。
 //
 // 后复权而非原始价：基准的总回报要含分红再投，否则会系统性低估基准、
 // 让策略的超额收益虚高。
 //
+// 必须在把 Columns 裁成子集**之前**调用 —— 基准不在标的池里，
+// 裁完就取不到了。
+//
 // 覆盖不到的交易日直接缺席，由 metrics 按交集处理 ——
 // 数据里没有指数（C10 纯技术面，ETL 没拉指数行情），只能用 ETF 代理，
 // 而宽基 ETF 最早到 2012（510300 / 159919 都是 2012-05-28 起）。
-func (ds *DataSet) BenchmarkCurve() (days []int32, equity []int64, ok bool) {
-	if !ds.HasBenchmark {
-		return nil, nil, false
-	}
-	days, closes, ok := ds.Columns.Series(ds.BenchmarkID)
+func (ds *DataSet) SetBenchmark(col *mktdata.Columns, id mktdata.InstrumentID) bool {
+	days, closes, ok := col.Series(id)
 	if !ok {
-		return nil, nil, false
+		return false
 	}
-	equity = make([]int64, len(closes))
+	equity := make([]int64, len(closes))
 	for i, c := range closes {
-		equity[i] = ds.Adjuster.Adjust(ds.BenchmarkID, days[i], c, mktdata.AdjHFQ)
+		equity[i] = ds.Adjuster.Adjust(id, days[i], c, mktdata.AdjHFQ)
 	}
-	return days, equity, true
+	ds.BenchmarkID, ds.HasBenchmark = id, true
+	ds.BenchDays, ds.BenchEquity = days, equity
+	return true
 }
 
 // ResolveUniverse 把配置里的过滤条件解析成一组标的 ID。
@@ -163,9 +182,16 @@ func (c *Config) ResolveUniverse(
 	if err != nil {
 		return nil, err
 	}
+	wantMarket, err := parseMarkets(u.Market)
+	if err != nil {
+		return nil, err
+	}
 
 	picked := make([]mktdata.InstrumentID, 0, 1024)
 	for _, in := range uni.All() {
+		if wantMarket != nil && !wantMarket[in.Market] {
+			continue
+		}
 		if wantType >= 0 && in.Type != mktdata.InstrumentType(wantType) {
 			continue
 		}
@@ -363,6 +389,22 @@ func parseStatus(s string) (int, error) {
 		return int(mktdata.StatusDelisted), nil
 	}
 	return 0, fmt.Errorf("未知的 universe.status %q，可选：all / listed / delisted", s)
+}
+
+func parseMarkets(ss []string) (map[mktdata.Market]bool, error) {
+	if len(ss) == 0 {
+		return nil, nil
+	}
+	m := make(map[mktdata.Market]bool, len(ss))
+	for _, s := range ss {
+		switch strings.ToLower(s) {
+		case "ashare", "a", "cn":
+			m[mktdata.MarketAShare] = true
+		default:
+			return nil, fmt.Errorf("未知的 universe.market %q，当前只支持 ashare", s)
+		}
+	}
+	return m, nil
 }
 
 func parseBoards(ss []string) (map[mktdata.Board]bool, error) {

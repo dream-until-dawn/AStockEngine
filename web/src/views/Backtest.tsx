@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
 import { fmtCompact, fmtDay, fmtNum, runApi } from '../api'
 import EquityChart from '../components/EquityChart'
+import UniversePicker from '../components/UniversePicker'
 import { DataTable, ErrBox, Loading, downloadCSV, type Col } from '../components/ui'
 import { getRun, setRun } from '../runStore'
-import type { ConfigItem, Meta, RoundTrip, RunFill, RunReject, RunResult } from '../types'
+import type {
+  ConfigItem, Meta, RoundTrip, RunFill, RunReject, RunResult, UniverseSpec,
+} from '../types'
 
 // 回测结果视图。**只看跑完的结果，不做单步** —— 单步驱动、会话、
 // WebSocket 是 v0.4 的事。这里回答的是「跑完是什么样」。
@@ -18,6 +21,7 @@ export default function Backtest({ meta }: { meta: Meta }) {
   const [picked, setPicked] = useState('')
   const [text, setText] = useState('')
   const [editing, setEditing] = useState(false)
+  const [pickUni, setPickUni] = useState(true)
   const [run, setRunState] = useState<RunResult | null>(getRun())
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
@@ -59,6 +63,21 @@ export default function Backtest({ meta }: { meta: Meta }) {
 
   const current = configs.find((c) => c.name === picked)
 
+  // 配置的原始 JSON 是**唯一真相**，选择器只是它的一个视图：
+  // 读出 data.universe 给选择器，选完写回去。两边各存一份状态必然会不同步。
+  let parsed: Record<string, any> | null = null
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    parsed = null
+  }
+  const universe: UniverseSpec = parsed?.data?.universe ?? {}
+  const setUniverse = (u: UniverseSpec) => {
+    if (!parsed) return
+    const next = { ...parsed, data: { ...parsed.data, universe: u } }
+    setText(JSON.stringify(next, null, 2))
+  }
+
   return (
     <>
       <h2>回测</h2>
@@ -82,10 +101,29 @@ export default function Backtest({ meta }: { meta: Meta }) {
           <button className="primary" onClick={go} disabled={busy || !text}>
             {busy ? '跑着…' : '跑'}
           </button>
+          <button onClick={() => setPickUni(!pickUni)}>
+            {pickUni ? '收起标的池' : '选标的池'}
+          </button>
           <button onClick={() => setEditing(!editing)}>
             {editing ? '收起配置' : '改参数'}
           </button>
         </div>
+
+        {pickUni && (
+          <div style={{ marginTop: 12, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+            {parsed ? (
+              <UniversePicker value={universe} onChange={setUniverse} meta={meta} />
+            ) : (
+              <div className="muted">配置 JSON 当前不合法，改好之后选择器才能用</div>
+            )}
+            <p className="note">
+              标的池决定结论。同一个 <code>macd_cross</code>，
+              在「按 ID 前 300 只」上跑输基准 15 个点，
+              换成「在市主板全部个股」就跑赢 5.6 个点 ——
+              <strong>换池子换的是结论，不是精度</strong>。
+            </p>
+          </div>
+        )}
         {current?.error && <div className="error" style={{ marginTop: 8 }}>{current.error}</div>}
         {editing && (
           <>

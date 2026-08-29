@@ -264,3 +264,30 @@ export type RunResult = {
   roundTrips: RoundTrip[]
   warnings?: string[]
 }
+
+// ---- 标的池 ----
+
+export type UniverseSpec = {
+  symbols?: string[]
+  market?: string[]
+  type?: string
+  board?: string[]
+  exchange?: string[]
+  status?: string
+  require_factor?: boolean
+  limit?: number
+}
+
+export type UniversePreview = {
+  count: number
+  /** 其中在数据里真的有行情的只数 —— 命中数不等于能跑的数 */
+  withBars: number
+  limit: number
+  overLimit: boolean
+  truncated: number
+  sample: {
+    id: number; symbol: string; name: string
+    type: number; board: number
+    bars: number; firstDay: number; lastDay: number
+  }[]
+}

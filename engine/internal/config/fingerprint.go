@@ -70,7 +70,7 @@ func (c *Config) Canonical() ([]byte, error) {
 		"market": c.Data.Market, "freq": c.Data.Freq,
 		"from": c.Data.From, "to": c.Data.To,
 		"universe": map[string]any{
-			"symbols": u.Symbols, "type": u.Type, "board": u.Board,
+			"symbols": u.Symbols, "market": u.Market, "type": u.Type, "board": u.Board,
 			"exchange": u.Exchange, "status": u.Status,
 			"require_factor": u.RequireFactor, "limit": u.Limit,
 		},

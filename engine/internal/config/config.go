@@ -38,8 +38,15 @@ type Module struct {
 // 也没有 point_in_time 开关：bar 表天生是 PIT 的（上市前无行、退市后无行），
 // C3 是结构保证而不是配置项。
 type Universe struct {
-	// Symbols 显式列表。给了就只用它，其余过滤条件忽略。
+	// Symbols 显式列表。给了就只用它，其余过滤条件忽略 ——
+	// 「就在这几只上跑」是最直接的意图，不该再被别的条件二次过滤掉。
 	Symbols []string `json:"symbols,omitempty"`
+	// Market ashare / us / jp / crypto，空表示不限。
+	//
+	// 当前只有 A 股，这个过滤器现在等于不过滤。留着是因为它属于**标的属性**，
+	// 与 data.market（选分区路径）不是一回事 —— 远期一份数据里同时有
+	// 多个市场时，两者会分开起作用（C9）。
+	Market []string `json:"market,omitempty"`
 	// Type stock / etf / all
 	Type string `json:"type,omitempty"`
 	// Board main / chinext / star / bse，空表示不限

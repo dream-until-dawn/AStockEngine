@@ -1,0 +1,69 @@
+{
+  "name": "macd · 指定 5 只白马",
+  "data": {
+    "root": "../../data",
+    "market": "ashare",
+    "freq": "1d",
+    "from": 20200101,
+    "to": 0,
+    "universe": {
+      "symbols": [
+        "600519",
+        "000858",
+        "600036",
+        "601318",
+        "000333"
+      ]
+    }
+  },
+  "market": {
+    "impl": "ashare"
+  },
+  "fee": {
+    "impl": "config",
+    "params": {
+      "path": "../fee/ashare_default.json"
+    }
+  },
+  "slippage": {
+    "impl": "fixed_bps",
+    "params": {
+      "bps": 5
+    }
+  },
+  "sizer": {
+    "impl": "equal_weight",
+    "params": {
+      "slots": 10,
+      "base": "initial"
+    }
+  },
+  "risk": [],
+  "broker": {
+    "volume_cap_ppm": 100000,
+    "allow_partial_fill": true
+  },
+  "portfolio": {
+    "initial_cash_cents": 100000000,
+    "dividend_tax_ppm": 0
+  },
+  "engine": {
+    "indicator_adj": "hfq",
+    "imply_split_from_factor": true
+  },
+  "strategy": {
+    "impl": "macd_cross",
+    "params": {
+      "short": 12,
+      "long": 26,
+      "signal": 9
+    }
+  },
+  "metrics": {
+    "benchmark": "510300",
+    "risk_free_ppm": 0
+  },
+  "recorder": {
+    "level": "summary"
+  }
+}
