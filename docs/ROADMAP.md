@@ -538,9 +538,22 @@ v0.4 的单步 API 可直接复用，无需再补。
 
 ---
 
-### v0.3 — 模块化装配
+### v0.3 🔨 — 模块化装配（第一刀完成 2026-08-29）
 
 **目标**：配置驱动装配 + Web 表单的元数据基础。
+设计与评审决议见 [DESIGN-v0.3-assembly.md](DESIGN-v0.3-assembly.md)，分三刀。
+
+**第一刀 ✅ registry + 配置装配 + Sizer + Risk**
+
+- `internal/spec` —— `ParamSpec` 从 engine 下沉，供所有域自描述
+- `internal/registry` —— **泛型**容器，不认识任何领域类型（否则 trading 与它互相 import 成环）
+- `internal/config` —— 一份 JSON 描述一次运行，`-config` 取代全部命令行开关
+- `Sizer` 5 个实现 / `Risk` 4 个实现，风控**链式**执行
+- `Strategy.OnBar` 改出 `Signal`：策略只说买什么卖什么，数量归 Sizer、限额归 Risk
+- 三个样例策略随之变薄（`buy_and_hold` 连参数都没有了）
+
+回归：对照组 `buy_and_hold` 与 v0.2 **逐分位一致**；
+另两个策略的差异经归因验证只来自一处有意的修正（槽位计数去重）。
 
 - registry + `init()` 注册，JSON 配置装配
 - **ParamSpec 参数自描述**：策略注册时声明参数名称/类型/范围/步长/默认值

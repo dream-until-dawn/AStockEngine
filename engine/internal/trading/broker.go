@@ -58,6 +58,9 @@ const (
 	RejectVolumeCap            // 超出当日成交量占比上限
 	RejectNoPrice              // 无有效参考价（如成交量为 0 导致 VWAP 无法计算）
 	RejectExpired              // 超过有效期未成交
+	// RejectRisk 风控拦截。**具体是哪条规则看 Rejection.Rule** ——
+	// 每加一条风控就加一个枚举值，枚举会退化成规则清单的镜像。
+	RejectRisk
 )
 
 var rejectNames = map[RejectReason]string{
@@ -74,6 +77,7 @@ var rejectNames = map[RejectReason]string{
 	RejectVolumeCap:            "超出成交量占比上限",
 	RejectNoPrice:              "无有效参考价",
 	RejectExpired:              "超过有效期",
+	RejectRisk:                 "风控拦截",
 }
 
 func (r RejectReason) String() string {
@@ -98,6 +102,10 @@ type Rejection struct {
 	Order
 	At     mktdata.TimePoint
 	Reason RejectReason
+	// Rule 风控规则名，仅 Reason==RejectRisk 时有值。
+	// Reason 回答「哪一类障碍」，Rule 回答「哪一条规则」——
+	// v0.4 的单步调试两个都要展示。
+	Rule   string
 	Detail string
 }
 

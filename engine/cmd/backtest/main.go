@@ -1,7 +1,8 @@
-// Command backtest 跑一次完整回测：信号 → 订单 → 成交 → 记账 → 净值序列。
+// Command backtest 按一份 JSON 配置跑一次完整回测：
+// 信号 → 定量 → 风控 → 撮合 → 记账 → 净值序列。
 //
-// 这是 v0.2 的端到端入口。**它只输出原始净值序列，不算绩效指标** ——
-// 夏普、最大回撤、胜率属 v0.3 的 Metrics 模块。
+// v0.3 起**装配全由配置决定**：换 sizer、加风控规则、改费率都不需要重新编译。
+// 命令行只剩「配置在哪」与「结果往哪写」。
 package main
 
 import (
@@ -16,10 +17,13 @@ import (
 	"strings"
 	"time"
 
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/config"
 	eng "github.com/dream-until-dawn/AStockEngine/engine/internal/engine"
-	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
-	"github.com/dream-until-dawn/AStockEngine/engine/internal/strategies"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
+
+	// 策略经 init() 注册进 engine.Strategies，必须导入才会生效。
+	// 这是唯一需要空导入的地方 —— trading 的模块随包一起进来。
+	_ "github.com/dream-until-dawn/AStockEngine/engine/internal/strategies"
 )
 
 // equityPoint 是净值曲线上的一个点。全部为整数（分），
@@ -29,134 +33,75 @@ type equityPoint struct {
 	EquityCents  int64
 	CashCents    int64
 	Positions    int
+	SignalsToday int
 	FillsToday   int
 	RejectsToday int
 }
 
 func main() {
-	dataRoot := flag.String("data", "../data", "数据根目录")
-	feePath := flag.String("fee", "../configs/fee/ashare_default.json", "费率配置")
-	stratName := flag.String("strategy", "macd_cross",
-		"策略："+strings.Join(strategies.Names(), " / "))
-	nInst := flag.Int("instruments", 300, "抽样标的数，0 表示全部")
-	from := flag.Int("from", 20200101, "起始交易日")
-	to := flag.Int("to", 0, "结束交易日，0 表示不限")
-	cashYuan := flag.Int64("cash", 1_000_000, "初始资金（元）")
-	maxHold := flag.Int("max-hold", 10, "最多同时持有")
-	volCapPct := flag.Float64("volume-cap", 10, "单笔成交占当日成交量上限（%）")
-	slipBps := flag.Int64("slippage-bps", 5, "滑点（基点）")
-	taxPct := flag.Float64("dividend-tax", 0, "红利税率（%）")
+	cfgPath := flag.String("config", "", "配置文件路径（必填）")
 	equityOut := flag.String("equity-out", "", "净值序列输出 CSV 路径")
 	snapAt := flag.Int("snapshot-at", 0, "在第 N 步做快照并验证往返")
+	listModules := flag.Bool("modules", false, "列出全部可用模块与参数规格后退出")
 	flag.Parse()
 
-	mk, ok := strategies.Registry[*stratName]
-	if !ok {
-		fatal(fmt.Errorf("未知策略 %q，可选：%s", *stratName,
-			strings.Join(strategies.Names(), " / ")))
+	if *listModules {
+		printModules()
+		return
+	}
+	if *cfgPath == "" {
+		fmt.Fprintln(os.Stderr, "错误: 必须用 -config 指定配置文件")
+		fmt.Fprintln(os.Stderr, "      用 -modules 查看可用模块")
+		os.Exit(1)
 	}
 
-	// ---- 加载数据与配置 ----
-	metaDir := filepath.Join(*dataRoot, "meta")
-	uni, err := mktdata.LoadUniverse(filepath.Join(metaDir, "instruments.parquet"))
+	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		fatal(err)
 	}
-	adj, err := mktdata.LoadAdjuster(filepath.Join(metaDir, "adj_factor.parquet"))
-	if err != nil {
-		fatal(err)
-	}
-	corp, err := mktdata.LoadCorpActions(filepath.Join(metaDir, "corporate_action.parquet"))
-	if err != nil {
-		fatal(err)
-	}
-	fee, err := trading.LoadFee(*feePath)
-	if err != nil {
-		fatal(err)
-	}
-	fmt.Printf("标的 %d 只 | 复权因子 %d 只 | 公司行动 %d 条 | 费率 %q\n",
-		uni.Len(), adj.NumInstruments(), corp.Total(), fee.Name())
-
-	opt := mktdata.LoadOptions{
-		Root:    filepath.Join(*dataRoot, "bar", "market=ashare", "freq=1d"),
-		FromDay: int32(*from), ToDay: int32(*to),
-	}
-	if *nInst > 0 {
-		var ids []mktdata.InstrumentID
-		for _, in := range uni.All() {
-			// 只取个股且有复权事件 —— 这样公司行动分支才会被真正走到
-			if in.Type != mktdata.TypeStock || len(adj.ExDates(in.ID)) == 0 {
-				continue
-			}
-			ids = append(ids, in.ID)
-			if len(ids) >= *nInst {
-				break
-			}
-		}
-		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-		opt.Instruments = ids
-	}
-	col, st, err := mktdata.Load(opt)
-	if err != nil {
-		fatal(err)
-	}
-	fmt.Printf("加载 %d 行 / %d 只 / %d 个时点 / %v\n\n",
-		st.Rows, st.Instruments, st.Steps, st.Total.Round(time.Millisecond))
-
-	initial := *cashYuan * 100
-	params := eng.Params{
-		"max_hold":   float64(*maxHold),
-		"cash_cents": float64(initial),
-	}
-
-	build := func() *eng.Engine {
-		br := trading.NewBroker(trading.NewAShareMarket(), fee,
-			trading.BpsSlippage{Bps: *slipBps},
-			trading.BrokerConfig{
-				VolumeCapPPM:     int64(*volCapPct * 10_000),
-				AllowPartialFill: true,
-			})
-		e, err := eng.New(eng.Deps{
-			Columns: col, Universe: uni, Adjuster: adj, CorpAct: corp,
-			Market: trading.NewAShareMarket(), Broker: br,
-			Portfolio: trading.NewPortfolio(initial),
-		}, mk(), eng.Config{
-			Params:               params,
-			IndicatorAdjMode:     mktdata.AdjHFQ,
-			InitialCashCents:     initial,
-			DividendTaxPPM:       int64(*taxPct * 10_000),
-			ImplySplitFromFactor: true,
-		})
-		if err != nil {
-			fatal(err)
-		}
-		return e
-	}
-
-	// ---- 主回测 ----
-	e := build()
-	curve := make([]equityPoint, 0, col.NumSteps())
-	var snap []byte
-	var fills, rejects int
-	rejectBy := map[string]int{}
 
 	t0 := time.Now()
+	ds, err := config.LoadDataSet(cfg)
+	if err != nil {
+		fatal(err)
+	}
+	loadDur := time.Since(t0)
+
+	e, err := cfg.Assemble(ds)
+	if err != nil {
+		fatal(err)
+	}
+	for _, line := range cfg.Describe(e, ds, loadDur) {
+		fmt.Println(line)
+	}
+	fmt.Println()
+
+	// ---- 主回测 ----
+	initial := cfg.Portfolio.InitialCashCents
+	curve := make([]equityPoint, 0, 4096)
+	var snap []byte
+	var signals, fills, rejects int
+	rejectBy := map[string]int{}
+
+	t1 := time.Now()
 	for !e.Done() {
 		tp, err := e.Step()
 		if err != nil {
 			fatal(err)
 		}
+		ns := len(e.Signals())
 		nf, nr := e.LastCounts()
+		signals += ns
 		fills += nf
 		rejects += nr
 		for _, r := range e.Rejections() {
-			rejectBy[r.Reason.String()]++
+			rejectBy[reasonKey(r)]++
 		}
 		pf := e.Portfolio()
 		curve = append(curve, equityPoint{
 			TradingDay: tp.TradingDay, EquityCents: e.EquityCents(),
 			CashCents: pf.Cash, Positions: countPositions(pf),
-			FillsToday: nf, RejectsToday: nr,
+			SignalsToday: ns, FillsToday: nf, RejectsToday: nr,
 		})
 		if *snapAt > 0 && e.Steps() == *snapAt {
 			if snap, err = e.Snapshot(); err != nil {
@@ -164,17 +109,18 @@ func main() {
 			}
 		}
 	}
-	dur := time.Since(t0)
+	dur := time.Since(t1)
 
 	pf := e.Portfolio()
 	final := e.EquityCents()
-	fmt.Printf("=== %s ===\n", *stratName)
+	fmt.Println("=== 结果 ===")
 	fmt.Printf("  步数 %d  耗时 %v\n", e.Steps(), dur.Round(time.Millisecond))
-	fmt.Printf("  成交 %d 笔  拒单 %d 笔\n", fills, rejects)
+	fmt.Printf("  信号 %d 条  成交 %d 笔  拒单 %d 笔\n", signals, fills, rejects)
 	fmt.Printf("  初始 %.2f 元 → 权益 %.2f 元（%+.2f%%）\n",
 		cents(initial), cents(final), float64(final-initial)/float64(initial)*100)
 	fmt.Printf("  现金 %.2f 元  持仓 %d 只  已实现 %.2f 元\n",
 		cents(pf.Cash), countPositions(pf), cents(pf.RealizedCents))
+	fmt.Printf("  峰值权益 %.2f 元\n", cents(e.PeakEquityCents()))
 	fmt.Printf("  费用合计 %.2f 元（占初始 %.2f%%）",
 		cents(pf.TotalFeeCents()), float64(pf.TotalFeeCents())/float64(initial)*100)
 	for _, k := range sortedKeys(pf.FeeCents) {
@@ -185,14 +131,14 @@ func main() {
 	if len(rejectBy) > 0 {
 		fmt.Println("  拒单原因分布：")
 		for _, k := range sortedStrKeys(rejectBy) {
-			fmt.Printf("    %-16s %d\n", k, rejectBy[k])
+			fmt.Printf("    %-24s %d\n", k, rejectBy[k])
 		}
 	}
 	if n := len(pf.Warnings); n > 0 {
 		fmt.Printf("  账本告警 %d 条，首条：%s\n", n, pf.Warnings[0])
 	}
 
-	// 净值序列的简单描述性统计。**不是绩效指标** —— 那是 v0.3 的事，
+	// 净值序列的简单描述性统计。**不是绩效指标** —— 那是第二刀的 Metrics 模块，
 	// 这里只报告序列本身的形态，便于确认曲线是否合理。
 	if len(curve) > 0 {
 		peak, maxDD := curve[0].EquityCents, 0.0
@@ -201,8 +147,7 @@ func main() {
 				peak = p.EquityCents
 			}
 			if peak > 0 {
-				dd := float64(peak-p.EquityCents) / float64(peak)
-				if dd > maxDD {
+				if dd := float64(peak-p.EquityCents) / float64(peak); dd > maxDD {
 					maxDD = dd
 				}
 			}
@@ -222,7 +167,10 @@ func main() {
 	// ---- 快照往返 ----
 	if snap != nil {
 		fmt.Printf("=== 快照往返（第 %d 步，%.2f MB）===\n", *snapAt, float64(len(snap))/1024/1024)
-		e2 := build()
+		e2, err := cfg.Assemble(ds)
+		if err != nil {
+			fatal(err)
+		}
 		if err := e2.Restore(snap); err != nil {
 			fatal(err)
 		}
@@ -230,15 +178,63 @@ func main() {
 			fatal(err)
 		}
 		b := e2.Portfolio()
-		fmt.Printf("  全程 现金 %.2f / 已实现 %.2f\n", cents(pf.Cash), cents(pf.RealizedCents))
-		fmt.Printf("  恢复 现金 %.2f / 已实现 %.2f\n", cents(b.Cash), cents(b.RealizedCents))
-		if pf.Cash == b.Cash && pf.RealizedCents == b.RealizedCents {
+		fmt.Printf("  全程 现金 %.2f / 已实现 %.2f / 峰值 %.2f\n",
+			cents(pf.Cash), cents(pf.RealizedCents), cents(e.PeakEquityCents()))
+		fmt.Printf("  恢复 现金 %.2f / 已实现 %.2f / 峰值 %.2f\n",
+			cents(b.Cash), cents(b.RealizedCents), cents(e2.PeakEquityCents()))
+		if pf.Cash == b.Cash && pf.RealizedCents == b.RealizedCents &&
+			e.PeakEquityCents() == e2.PeakEquityCents() {
 			fmt.Println("  ✅ 快照恢复后继续步进，账本与全程完全一致")
 		} else {
 			fmt.Println("  ❌ 不一致")
 			os.Exit(1)
 		}
 	}
+}
+
+// reasonKey 把拒单归类。风控拦截要细到规则名 ——
+// 一堆「风控拦截」堆在一起等于没说。
+func reasonKey(r trading.Rejection) string {
+	if r.Reason == trading.RejectRisk && r.Rule != "" {
+		return "风控:" + r.Rule
+	}
+	return r.Reason.String()
+}
+
+func printModules() {
+	fmt.Println("可用模块（配置里按 impl 名选用）：")
+	fmt.Printf("\n  market    %s\n", strings.Join(trading.Markets.Names(), " / "))
+	fmt.Printf("  fee       %s\n", strings.Join(trading.Fees.Names(), " / "))
+	fmt.Printf("  slippage  %s\n", strings.Join(trading.Slippages.Names(), " / "))
+	fmt.Printf("  sizer     %s\n", strings.Join(trading.Sizers.Names(), " / "))
+	fmt.Printf("  risk      %s\n", strings.Join(trading.Risks.Names(), " / "))
+	fmt.Printf("  strategy  %s\n\n", strings.Join(eng.Strategies.Names(), " / "))
+
+	show := func(kind string, names []string, get func(string) ([]eng.ParamSpec, bool)) {
+		for _, n := range names {
+			specs, _ := get(n)
+			if len(specs) == 0 {
+				fmt.Printf("  %s.%s  (无参数)\n", kind, n)
+				continue
+			}
+			fmt.Printf("  %s.%s\n", kind, n)
+			for _, s := range specs {
+				if s.Kind == eng.ParamString {
+					fmt.Printf("      %-16s %-6s 默认 %-14s %v  %s\n",
+						s.Name, s.Kind, s.DefaultStr, s.Options, s.Desc)
+					continue
+				}
+				fmt.Printf("      %-16s %-6s 默认 %-14g [%g, %g]  %s\n",
+					s.Name, s.Kind, s.Default, s.Min, s.Max, s.Desc)
+			}
+		}
+	}
+	fmt.Println("参数规格：")
+	show("sizer", trading.Sizers.Names(), trading.Sizers.Specs)
+	show("risk", trading.Risks.Names(), trading.Risks.Specs)
+	show("slippage", trading.Slippages.Names(), trading.Slippages.Specs)
+	show("fee", trading.Fees.Names(), trading.Fees.Specs)
+	show("strategy", eng.Strategies.Names(), eng.Strategies.Specs)
 }
 
 func writeCurve(path string, curve []equityPoint) error {
@@ -259,7 +255,7 @@ func writeCurve(path string, curve []equityPoint) error {
 
 	// 输出整数分，不做单位换算 —— 下游要什么精度自己定
 	if err := w.Write([]string{"trading_day", "equity_cents", "cash_cents",
-		"positions", "fills", "rejects"}); err != nil {
+		"positions", "signals", "fills", "rejects"}); err != nil {
 		return err
 	}
 	for _, p := range curve {
@@ -268,6 +264,7 @@ func writeCurve(path string, curve []equityPoint) error {
 			strconv.FormatInt(p.EquityCents, 10),
 			strconv.FormatInt(p.CashCents, 10),
 			strconv.Itoa(p.Positions),
+			strconv.Itoa(p.SignalsToday),
 			strconv.Itoa(p.FillsToday),
 			strconv.Itoa(p.RejectsToday),
 		}); err != nil {

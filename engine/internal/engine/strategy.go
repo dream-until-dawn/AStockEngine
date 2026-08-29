@@ -1,54 +1,48 @@
 // Package engine 是 Step() 状态机与策略接口。
 //
-// 第二刀把 Market / Broker / Portfolio / Fee 接入，`OnBar` 由此开始返回订单。
+// v0.3 起策略**只出信号不出数量**：`OnBar` 返回 `[]trading.Signal`，
+// 由 Sizer 折算成订单、Risk 逐条把关。理由见 DESIGN-v0.3-assembly.md 4.1 ——
+// 只要 Qty 还由策略给，Sizer 就没有可以决定的东西，
+// 海选也就无法把「信号逻辑」与「仓位方法」当两个独立维度来扫。
 package engine
 
 import (
+	"encoding/json"
+
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/indicator"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/registry"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/spec"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 )
 
-// ParamKind 参数类型。v0.3 的 Web 表单与海选参数网格都由此生成。
-type ParamKind int8
-
-const (
-	ParamInt ParamKind = iota
-	ParamFloat
-	ParamBool
+// 参数元数据在 v0.3 下沉到了 internal/spec —— Fee / Slippage / Sizer / Risk
+// 都要自描述，留在 engine 包会让 trading 反向依赖 engine。
+// 这些别名让既有代码与文档里的 engine.ParamSpec 继续可用。
+type (
+	ParamKind = spec.ParamKind
+	ParamSpec = spec.ParamSpec
+	Params    = spec.Params
 )
 
-// ParamSpec 是策略的参数自描述。
-//
-// 策略用 Go 编译进引擎，Web 端只能配参数不能写逻辑，因此参数元数据必须
-// 由策略自己声明 —— 它同时喂三处：Web 自动生成表单、海选自动展开参数网格、
-// 配置校验（ROADMAP v0.3）。
-type ParamSpec struct {
-	Name    string    `json:"name"`
-	Kind    ParamKind `json:"kind"`
-	Default float64   `json:"default"`
-	Min     float64   `json:"min"`
-	Max     float64   `json:"max"`
-	Step    float64   `json:"step"`
-	Desc    string    `json:"desc"`
-}
+const (
+	ParamInt    = spec.ParamInt
+	ParamFloat  = spec.ParamFloat
+	ParamBool   = spec.ParamBool
+	ParamString = spec.ParamString
+)
 
-// Params 是一次运行的实际参数取值。
-type Params map[string]float64
+// 信号类型同样住在 trading（它是交易概念，且 Sizer 在那儿），这里给别名。
+type (
+	Signal     = trading.Signal
+	SignalKind = trading.SignalKind
+)
 
-func (p Params) Int(name string, def int) int {
-	if v, ok := p[name]; ok {
-		return int(v)
-	}
-	return def
-}
-
-func (p Params) Float(name string, def float64) float64 {
-	if v, ok := p[name]; ok {
-		return v
-	}
-	return def
-}
+const (
+	SignalEnter  = trading.SignalEnter
+	SignalExit   = trading.SignalExit
+	SignalTarget = trading.SignalTarget
+)
 
 // IndicatorFactory 为单个标的创建一个指标实例。
 //
@@ -131,9 +125,26 @@ type Strategy interface {
 	Name() string
 	Specs() []ParamSpec
 	Init(InitContext) error
-	// OnBar 每个事件时点调用一次，返回本步要下的订单。
+	// OnBar 每个事件时点调用一次，返回本步的交易意图。
 	//
-	// 订单不会立即成交：由 Market 决定最早可执行时点 ——
+	// **返回信号而非订单**：数量由 Sizer 决定，风控由 Risk 链把关。
+	// 策略只回答「买什么、卖什么、多大信心」。
+	//
+	// 信号不会立即成交：Sizer 折算后由 Market 决定最早可执行时点 ——
 	// 主板 T+1、创业板/科创板可 T 日盘后、加密零间隔（设计第 1 节）。
-	OnBar(StepContext) ([]trading.Order, error)
+	OnBar(StepContext) ([]Signal, error)
+}
+
+// Strategies 是策略的注册表。
+//
+// 工厂**忽略参数 JSON**：策略参数经 Config.Params 走 InitContext.Params()，
+// 与 v0.2 的取参方式保持一致，不必让每个策略各写一遍解析。
+// 配置层负责把 strategy.params 解成 Params 并按 Specs() 校验。
+var Strategies = registry.New[Strategy]("strategy")
+
+// RegisterStrategy 是给策略实现用的便捷注册函数：
+// 传一个零参构造器，参数规格从实例上取。
+func RegisterStrategy(name string, make func() Strategy) {
+	Strategies.Register(name, make().Specs(),
+		func(json.RawMessage) (Strategy, error) { return make(), nil })
 }
