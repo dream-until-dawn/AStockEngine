@@ -222,7 +222,14 @@ def main() -> int:
 
     df = pd.DataFrame(all_rows)
     before = len(df)
-    df = df.drop_duplicates(subset=["instrument_id", "ex_date"], keep="last")
+    # 同一除权日可能**既分红又配股**（两者来自不同 indicator，是两条记录）。
+    # 直接 drop_duplicates 会丢掉其中一条，首轮即因此少了 117 行。
+    # 分红行的 rights_* 为 0、配股行的 cash/送转为 0，故按 max 聚合即可无损合并。
+    df = (df.groupby(["instrument_id", "ex_date"], as_index=False)
+            .agg({"record_date": "max", "pay_date": "max",
+                  "cash_before_tax": "max", "stock_dividend": "max",
+                  "stock_transfer": "max", "rights_ratio": "max",
+                  "rights_price": "max"}))
     df = df.sort_values(["instrument_id", "ex_date"]).reset_index(drop=True)
     df = df.astype({
         "instrument_id": "int32", "ex_date": "int32",
