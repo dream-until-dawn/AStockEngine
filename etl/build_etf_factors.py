@@ -56,6 +56,16 @@ _MIN_EVENT_RATIO = 1.001  # 低于此视为无实质调整，跳过
 # 折算是成倍数的，不存在 1.1 倍的折算。
 _SPLIT_THRESHOLD = 1.5
 
+# **份额折算有两个方向**，首版只处理了其一，漏掉了另一半：
+#
+#   拆分（份额增加）  价格下跌  prev/open > 1   如 159527 的 1:3
+#   合并（份额减少）  价格上涨  prev/open < 1   如 510020 的 1:10、510100 的 1:2
+#
+# 合并多发生在 ETF 净值跌得过低时（510020 折算前仅 0.174 元）。
+# 首版的 `raw < _MIN_EVENT_RATIO 即跳过` 把全部合并事件都当成「无实质调整」，
+# 结果是这些 ETF 的价格序列留着 +944%、+100% 这类假暴涨。
+_MERGE_THRESHOLD = 1.0 / _SPLIT_THRESHOLD
+
 
 def snap_ratio(raw: float) -> tuple[float, bool]:
     """把价格推出的比值取整到干净比例。返回 (比例, 是否取整成功)。"""
@@ -149,6 +159,12 @@ def build_factors(bars: pd.DataFrame, events: pd.DataFrame, iid: int) -> tuple[l
                     warns.append(f"{d} 分红后残余比值 {residual:.4f} 未落在常见比例上，按原值使用")
                 ratio = ratio * Decimal(str(k))
                 kind = "dividend+split"
+            elif residual <= _MERGE_THRESHOLD:
+                k, ok = snap_ratio(1.0 / residual)
+                if not ok:
+                    warns.append(f"{d} 分红后残余合并比值 1:{1.0/residual:.4f} 未落在常见比例上，按原值使用")
+                ratio = ratio / Decimal(str(k))
+                kind = "dividend+merge"
         else:
             # 「累计分红 = 0」意味着**金额未知**，不是「没有分红」——
             # 159919 的事件表里 2019-01-14 累计分红为 0，而 2020-09-14 才 0.1520，
@@ -160,17 +176,28 @@ def build_factors(bars: pd.DataFrame, events: pd.DataFrame, iid: int) -> tuple[l
             #           市场波动，误差约在开盘跳空的量级（通常 <1%），
             #           但远小于放着 -9.8% 的断点不管
             raw = prev_close / today_open
-            if raw < _MIN_EVENT_RATIO:
-                continue
             if raw >= _SPLIT_THRESHOLD:
+                # 拆分：份额增加、价格下跌
                 snapped, ok = snap_ratio(raw)
                 if not ok:
-                    warns.append(f"{d} 折算比值 {raw:.4f} 未落在常见比例上，按原值使用")
+                    warns.append(f"{d} 拆分比值 {raw:.4f} 未落在常见比例上，按原值使用")
                 ratio = Decimal(str(snapped))
                 kind = "split"
-            else:
+            elif raw <= _MERGE_THRESHOLD:
+                # 合并：份额减少、价格上涨。比例取倒数后取整，因子随之小于 1
+                inv = 1.0 / raw
+                snapped, ok = snap_ratio(inv)
+                if not ok:
+                    warns.append(f"{d} 合并比值 1:{inv:.4f} 未落在常见比例上，按原值使用")
+                ratio = Decimal(1) / Decimal(str(snapped))
+                kind = "merge"
+            elif raw >= _MIN_EVENT_RATIO:
+                # 金额未知的分红：价格小幅下跌
                 ratio = Decimal(str(raw))
                 kind = "estimated"
+            else:
+                # 事件日价格上涨但不足以构成合并 —— 属正常市场波动，不作调整
+                continue
 
         factor = factor * ratio
         rows.append({
@@ -205,7 +232,7 @@ def main() -> int:
     bars = load_etf_bars(inst)
     print(f"  ETF bar {len(bars)} 行 / {bars['instrument_id'].nunique()} 只", flush=True)
 
-    all_rows, all_warns, stats = [], [], {"dividend": 0, "split": 0, "estimated": 0, "dividend+split": 0,
+    all_rows, all_warns, stats = [], [], {"dividend": 0, "split": 0, "merge": 0, "estimated": 0, "dividend+split": 0, "dividend+merge": 0,
                                           "no_event": 0, "failed": 0}
     started = time.perf_counter()
     for i, r in enumerate(etfs.itertuples(index=False), 1):
@@ -230,7 +257,8 @@ def main() -> int:
             print(f"  {i}/{len(etfs)}  {el:.0f}s  因子 {len(all_rows)} 行", flush=True)
 
     print(f"\n事件统计：现金分红 {stats['dividend']}，份额折算 {stats['split']}，"
-          f"分红+折算同日 {stats['dividend+split']}，"
+          f"份额合并 {stats['merge']}，"
+          f"分红+折算同日 {stats['dividend+split'] + stats['dividend+merge']}，"
           f"无事件 {stats['no_event']} 只，查询失败 {stats['failed']} 只")
 
     if not all_rows:
