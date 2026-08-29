@@ -132,6 +132,35 @@ def _relogin() -> None:
     _SRC.open()
 
 
+def _fetch_factor(task: dict) -> dict:
+    """拉取单只标的的复权因子。与 _fetch_one 同样：异常绝不逃逸。"""
+    iid = task["iid"]
+    last_err = ""
+    for attempt in range(1, task["retries"] + 1):
+        try:
+            f = _SRC.adj_factors(task["symbol"], task["exchange"])
+            if len(f) == 0:
+                return {"iid": iid, "symbol": task["symbol"], "status": "done",
+                        "rows": 0, "data": None, "attempts": attempt, "error": ""}
+            df = pd.DataFrame({
+                "instrument_id": iid,
+                "ex_date": f["ex_date"].astype("int32"),
+                # 因子是 16 位精度字符串，必须经 Decimal 转定点，直接 float 会丢低位
+                "hfq_factor": [sc.to_fixed(v, sc.FACTOR_SCALE) for v in f["factor_raw"]],
+                "hfq_factor_raw": f["factor_raw"].astype(str),
+            })
+            return {"iid": iid, "symbol": task["symbol"], "status": "done",
+                    "rows": len(df), "data": df, "attempts": attempt, "error": ""}
+        except Exception as exc:  # noqa: BLE001
+            last_err = f"{type(exc).__name__}: {exc}"
+            if any(h in last_err.lower() for h in _PERMANENT_HINTS):
+                break
+            if attempt < task["retries"]:
+                time.sleep(min(2.0 * attempt, 10.0))
+    return {"iid": iid, "symbol": task["symbol"], "status": "failed",
+            "rows": 0, "data": None, "attempts": task["retries"], "error": last_err[:400]}
+
+
 def _fetch_one(task: dict) -> dict:
     """拉取单只标的。**任何异常都不得逃逸** —— 一只标的失败不能中断整轮。"""
     iid = task["iid"]
@@ -206,6 +235,46 @@ def flush(frames: list[pd.DataFrame], shard: int) -> tuple[int, int]:
         rows += len(g)
         nbytes += path.stat().st_size
     return rows, nbytes
+
+
+FACTOR_STAGE = layout.CACHE_ROOT / "factors"
+
+
+def flush_factors(frames: list[pd.DataFrame], shard: int) -> int:
+    """因子分片先落到暂存区。全量约 20 万行虽可全放内存，
+    但中断时会全部丢失，故与 bar 同样按批持久化。"""
+    if not frames:
+        return 0
+    df = pd.concat(frames, ignore_index=True)
+    if df.empty:
+        return 0
+    FACTOR_STAGE.mkdir(parents=True, exist_ok=True)
+    df.to_parquet(FACTOR_STAGE / f"part-{shard:05d}.parquet", index=False,
+                  compression="zstd")
+    return len(df)
+
+
+def merge_factors() -> int:
+    """把暂存分片合并进 adj_factor.parquet（含 CSV 镜像），按主键去重。"""
+    files = sorted(FACTOR_STAGE.glob("*.parquet")) if FACTOR_STAGE.exists() else []
+    existing = layout.meta_path("adj_factor")
+    parts = [pd.read_parquet(f) for f in files]
+    if existing.exists():
+        parts.append(pd.read_parquet(existing))
+    if not parts:
+        return 0
+    df = pd.concat(parts, ignore_index=True)
+    before = len(df)
+    df = df.drop_duplicates(subset=["instrument_id", "ex_date"], keep="last")
+    df = df.sort_values(["instrument_id", "ex_date"]).reset_index(drop=True)
+    df = df.astype({"instrument_id": "int32", "ex_date": "int32", "hfq_factor": "int64"})
+    sc.validate_columns(df, "adj_factor")
+    layout.write_meta(df, "adj_factor")
+    for f in files:
+        f.unlink()
+    log.info("adj_factor: %d 行 -> 去重后 %d 行 / %d 只标的",
+             before, len(df), df["instrument_id"].nunique())
+    return len(df)
 
 
 def compact() -> None:
@@ -389,6 +458,72 @@ def verify_all(inst: pd.DataFrame, cal: pd.DataFrame) -> int:
     return total_problems
 
 
+def run_factors(inst: pd.DataFrame, state: dict, args, workers: int) -> tuple[int, int, int]:
+    """同步个股复权因子（新浪）。ETF 不走这里 —— hfq-factor 接口不接受 ETF 代码。"""
+    global _stop_requested
+    fstate = state.setdefault("factors", {})
+    end_ymd = int(args.end.replace("-", ""))
+
+    tasks = []
+    for r in inst.itertuples(index=False):
+        if int(r.type) != int(sc.InstrumentType.STOCK):
+            continue
+        iid = int(r.instrument_id)
+        st = fstate.get(str(iid), {})
+        if st.get("status") == "failed" and not args.retry_failed:
+            continue
+        if int(st.get("synced_through", 0)) >= end_ymd:
+            continue
+        tasks.append({"iid": iid, "symbol": r.symbol,
+                      "exchange": _EXCHANGE_TAG.get(int(r.exchange), "sh"),
+                      "retries": args.retries})
+    if args.limit:
+        tasks = tasks[:args.limit]
+    if not tasks:
+        log.info("复权因子全部已是最新")
+        return 0, 0, 0
+
+    log.info("=== 复权因子：%d 只个股，%d 并发 ===", len(tasks), workers)
+    done = failed = rows = 0
+    shard = int(time.time()) % 100000
+    buf: list[pd.DataFrame] = []
+    started = time.perf_counter()
+
+    with Pool(processes=workers, initializer=_init_worker, initargs=("sina",)) as pool:
+        for i, res in enumerate(pool.imap_unordered(_fetch_factor, tasks), 1):
+            if res["status"] == "done":
+                done += 1
+                if res["data"] is not None:
+                    buf.append(res["data"])
+                    rows += res["rows"]
+            else:
+                failed += 1
+                log.warning("因子失败 %s: %s", res["symbol"], res["error"][:150])
+
+            fstate[str(res["iid"])] = {
+                "symbol": res["symbol"], "status": res["status"],
+                "synced_through": end_ymd if res["status"] == "done" else 0,
+                "rows": res["rows"], "error": res["error"],
+                "updated_at": datetime.now().isoformat(timespec="seconds"),
+            }
+
+            if len(buf) >= args.batch or i == len(tasks) or _stop_requested:
+                flush_factors(buf, shard)
+                buf.clear()
+                shard += 1
+                save_state(state)
+                el = time.perf_counter() - started
+                rate = i / el if el else 0
+                log.info("[因子] %d/%d  完成%d 失败%d  %d行  %.2f只/秒  剩余约%s",
+                         i, len(tasks), done, failed, rows, rate,
+                         str(timedelta(seconds=int((len(tasks) - i) / rate if rate else 0))))
+            if _stop_requested:
+                log.warning("收到停止信号，因子进度已保存")
+                pool.terminate()
+                break
+    return done, failed, rows
+
+
 def print_status(inst: pd.DataFrame, state: dict) -> None:
     recs = state["instruments"]
     total = len(inst)
@@ -444,7 +579,8 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=200, help="每多少只标的落盘一次")
     ap.add_argument("--retries", type=int, default=3, help="单只标的最大尝试次数")
     ap.add_argument("--limit", type=int, default=0, help="只跑前 N 只（试跑用）")
-    ap.add_argument("--only", choices=["stocks", "etfs"], help="只跑其中一类")
+    ap.add_argument("--only", choices=["stocks", "etfs", "factors"],
+                    help="只跑其中一类")
     ap.add_argument("--reset", action="store_true", help="清空既有 bar 与状态后重来")
     ap.add_argument("--retry-failed", action="store_true", help="把失败标的重新纳入")
     ap.add_argument("--status", action="store_true", help="只打印进度")
@@ -490,10 +626,12 @@ def main() -> int:
         etfs = []
     elif args.only == "etfs":
         stocks = []
+    elif args.only == "factors":
+        stocks = etfs = []
 
     log.info("日志文件：%s", log_path)
     log.info("待办：个股 %d，ETF %d；已最新/跳过 %d", len(stocks), len(etfs), skipped)
-    if not stocks and not etfs:
+    if not stocks and not etfs and args.only not in (None, "factors"):
         log.info("全部已是最新，无需更新")
         return 0
 
@@ -506,10 +644,18 @@ def main() -> int:
         d2, f2, r2, shard = run_group(etfs, "sina", max(2, args.workers // 2),
                                       state, args, shard)
 
+    # 复权因子（约束 C2）。与 bar 分开计数：它是另一张表，失败不影响 bar 的完整性。
+    d3 = f3 = r3 = 0
+    if not _stop_requested and args.only in (None, "factors"):
+        d3, f3, r3 = run_factors(inst, state, args, max(2, args.workers // 2))
+        if r3 or FACTOR_STAGE.exists():
+            merge_factors()
+
     elapsed = time.perf_counter() - run_started
     state.setdefault("runs", []).append({
         "at": datetime.now().isoformat(timespec="seconds"),
         "done": d1 + d2, "failed": f1 + f2, "rows": r1 + r2,
+        "factor_done": d3, "factor_failed": f3, "factor_rows": r3,
         "elapsed_sec": round(elapsed, 1), "interrupted": _stop_requested,
     })
     save_state(state)
@@ -524,8 +670,9 @@ def main() -> int:
         problems = verify_all(inst, cal)
 
     log.info("=== 汇总 ===")
-    log.info("完成 %d，失败 %d，新增 %d 行，耗时 %s",
-             d1 + d2, f1 + f2, r1 + r2, str(timedelta(seconds=int(elapsed))))
+    log.info("bar: 完成 %d，失败 %d，新增 %d 行", d1 + d2, f1 + f2, r1 + r2)
+    log.info("因子: 完成 %d，失败 %d，新增 %d 行", d3, f3, r3)
+    log.info("耗时 %s", str(timedelta(seconds=int(elapsed))))
     if f1 + f2:
         log.info("失败标的可用 --retry-failed 重试")
     if _stop_requested:

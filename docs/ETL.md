@@ -43,7 +43,8 @@ C1（未来函数防护）与 C5（可复现性）。
 | `etl/sources/external.py` | 非 Python 数据源的接入（见 [ingest/README.md](../ingest/README.md)） |
 | `etl/build_instruments.py` | 构建 instruments + calendar（全量） |
 | `etl/build_bars.py` | 构建 bar + adj_factor（抽试 / 全量），含质检 |
-| `etl/sync_bars.py` | **bar 全量拉取与每日增量**，断点续跑、并发、自愈、逐年质检 |
+| `etl/sync_bars.py` | **bar 全量拉取与每日增量**，断点续跑、并发、自愈、逐年质检；含个股复权因子同步 |
+| `etl/build_etf_factors.py` | **ETF 复权因子**重建 + 修正事件日 preclose |
 | `etl/dump.py` | 查看 Parquet 内容，还原定点与枚举 |
 
 ---
@@ -74,6 +75,10 @@ C1（未来函数防护）与 C5（可复现性）。
 .\.venv\Scripts\python.exe etl\sync_bars.py --retry-failed  # 重试失败标的
 .\.venv\Scripts\python.exe etl\sync_bars.py --compact       # 合并分片并去重
 .\.venv\Scripts\python.exe etl\sync_bars.py --verify        # 逐年质检
+.\.venv\Scripts\python.exe etl\sync_bars.py --only factors  # 只同步个股复权因子
+
+# ETF 复权因子（个股走 sync_bars，ETF 无对应接口需重建）
+.\.venv\Scripts\python.exe etl\build_etf_factors.py
 
 # 查看数据
 .\.venv\Scripts\python.exe etl\dump.py instruments --where "board==3" --limit 10
@@ -229,6 +234,42 @@ Broker 会在那 13 个交易日误判「涨停不能买」。
   自洽校验的价值不在于发现数据错误，而在于发现**认知与现实的偏差** ——
   这条规则变更发生在编写者的知识截止之后，只能由数据揭示
 
+### 6.9 ETF 折算会伪装成暴跌 ⚠️
+
+159527 广发中证云计算与大数据ETF：
+
+```
+2026-07-21  收盘 2.227
+2026-07-22  开盘 0.720  收盘 0.747   -66.46%   成交量 6800万（平常 500-1600万）
+```
+
+这不是暴跌，是 **1:3 份额折算**。若不处理，引擎会认为持有该 ETF 一天亏 66%
+—— 比原先记录的「分红未反映导致长期收益低估」严重得多。
+
+**收口方案**（`etl/build_etf_factors.py`）：
+
+| 环节 | 做法 | 可靠性 |
+|---|---|---|
+| 事件日期 | `fund_etf_dividend_sina`（非东财） | 权威 |
+| 现金分红 | 「累计分红」差分出每次金额，`ratio = 前收 / (前收 - 分红)` | **精确** |
+| 份额折算 | 分红为 0 的事件，由 `前收 / 开盘` 估算后**取整到干净比例** | 近似 + 取整 |
+
+为什么必须取整：159527 由价格推出的比值是 **3.0931**，而深交所份额数据显示
+`(168,100,450 - 4,000,000) × 3 = 492,301,350`，真实比例是 **3.0** ——
+价格估计偏离 3.1%，直接用会留下 3% 的永久性水平偏移。
+
+**为什么事件日期是关键**：同样是 -66%，落在事件日就是折算，不在事件日就是真跌。
+没有权威的事件日期，任何纯价格启发式都可能把暴跌误判为折算，反之亦然。
+
+验证（159527）：
+
+```
+交易日      原始收盘  因子   后复权收盘
+2026-07-21   2.227   1.0     2.227
+2026-07-22   0.747   3.0     2.241     ← 序列连续，假暴跌消除
+2026-07-23   0.728   3.0     2.184
+```
+
 ### 6.7 停牌行的形态
 
 BaoStock 停牌日照常返回行（这是它优于东财之处）：
@@ -262,8 +303,8 @@ date        open   high   low   close  preclose  volume  amount  turn  tradestat
 
 | # | 项 | 影响 | 状态 |
 |---|---|---|---|
-| 1 | **ETF 无复权** | ETF 分红未反映，长期收益被低估 | 🟡 v0.1 收口项 |
-| 2 | ETF `preclose` 由前一日 close 补齐 | 除权日的 ETF 涨跌停判定会失真 | 同上，依赖 #1 |
+| 1 | ~~ETF 无复权~~ | —— | ✅ 已收口，见 6.9 |
+| 2 | ~~ETF `preclose` 由前一日 close 补齐~~ | —— | ✅ 事件日已按因子修正 |
 | 3 | ETF `turn` 恒为 0 | 新浪不提供流通份额；用换手率的策略不可用于 ETF | 需在 Web 端提示 |
 | 4 | ETF `board` 统一记为主板 | 跟踪创业板/科创板指数的 ETF 实为 20% 涨跌停 | v0.2 由 Market 模块按类别配置 |
 | 5 | 标的名称不做时变 | 回看历史报告显示当前名称 | 已确认接受 |
