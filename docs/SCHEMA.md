@@ -331,12 +331,24 @@ instruments 仅数万行，全量载入内存后解析 JSON 无性能顾虑，
 | `instrument_id` | INT32 | `int32` | 否 | |
 | `ex_date` | INT32 | `int32` | 否 | 除权除息日 |
 | `record_date` | INT32 | `int32` | 是 | 股权登记日 |
-| `pay_date` | INT32 | `int32` | 是 | 派息日 |
+| `pay_date` | INT32 | `int32` | 是 | 派息日。当前数据源不提供，恒为 null（见 5.3） |
 | `cash_before_tax` | INT64 | `int64` | 否 | **每股**税前现金红利，定点 scale 1e6（元） |
 | `stock_dividend` | INT64 | `int64` | 否 | **每股**送股数，定点 scale 1e6 |
 | `stock_transfer` | INT64 | `int64` | 否 | **每股**转增股数，定点 scale 1e6 |
+| `rights_ratio` | INT64 | `int64` | 否 | **每股**配股数，定点 scale 1e6 |
+| `rights_price` | INT64 | `int64` | 否 | 配股价格，定点（见 `price_scale`） |
 
-### 5.1 不存税后金额
+### 5.2 配股为何单列两个字段
+
+配股同样导致除权，但 Portfolio 的处理与分红送转**完全不同**：
+配股需要股东按 `rights_price` 掏钱认购 `rights_ratio` 份额，不认购则被稀释。
+回测须显式选择「参与 / 不参与」，因此价格与比例两者都要存。
+
+数据源的 `分红` 与 `配股` 是同一接口的不同 `indicator`，字段结构也不同，
+须分别抓取。v0.1 首轮只取了 `分红`，导致 7889 个复权因子事件找不到对应记录
+（如 600001 于 2000-05-29 的配股）。
+
+### 5.3 不存税后金额
 
 BaoStock 的 `dividCashPsAfterTax` 存在 `"27.7884或30.876"` 这类
 **非数值字符串**（税率分档所致）。

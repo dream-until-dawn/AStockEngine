@@ -246,6 +246,10 @@ CORPORATE_ACTION_SCHEMA = pa.schema([
     pa.field("cash_before_tax", pa.int64(), nullable=False),
     pa.field("stock_dividend", pa.int64(), nullable=False),
     pa.field("stock_transfer", pa.int64(), nullable=False),
+    # 配股同样导致除权，且需股东掏钱认购、不认购即被稀释，
+    # Portfolio 的处理方式与分红送转完全不同，故单列两个字段
+    pa.field("rights_ratio", pa.int64(), nullable=False),   # 每股配股数，scale 1e6
+    pa.field("rights_price", pa.int64(), nullable=False),   # 配股价格，定点
 ])
 
 TABLE_SCHEMAS = {

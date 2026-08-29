@@ -65,7 +65,11 @@ def fetch_stock(task: dict) -> dict:
             if df is None or len(df) == 0:
                 return {"iid": iid, "symbol": symbol, "status": "done", "rows": []}
             d = df[df["进度"].astype(str) == "实施"].copy()
-            d["ex"] = d["除权除息日"].map(_ymd)
+            if d.empty:
+                return {"iid": iid, "symbol": symbol, "status": "done", "rows": []}
+            # 必须显式转 int64：若过滤后为空，.map() 在 datetime 列上返回的仍是
+            # datetime 类型，后续与 0 比较会抛 TypeError（首轮 70 只即因此失败）
+            d["ex"] = d["除权除息日"].map(_ymd).astype("int64")
             d = d[d["ex"] > 0]
             rows = []
             for r in d.itertuples(index=False):
@@ -84,13 +88,50 @@ def fetch_stock(task: dict) -> dict:
                     "stock_transfer": sc.to_fixed(
                         float(pd.to_numeric(r.转增, errors="coerce") or 0) / _PER_TEN,
                         sc.PER_SHARE_SCALE),
+                    "rights_ratio": 0,
+                    "rights_price": 0,
                 })
+            rows.extend(_fetch_rights(iid, symbol))
             return {"iid": iid, "symbol": symbol, "status": "done", "rows": rows}
         except Exception as exc:  # noqa: BLE001
             last = f"{type(exc).__name__}: {exc}"
             if attempt < task["retries"]:
                 time.sleep(1.5 * attempt)
     return {"iid": iid, "symbol": symbol, "status": "failed", "rows": [], "error": last[:300]}
+
+
+def _fetch_rights(iid: int, symbol: str) -> list[dict]:
+    """配股。与分红是同一接口的不同 indicator，但字段完全不同。
+
+    首轮只取了 `indicator="分红"`，导致 7889 个因子事件没有对应记录 ——
+    600001 在 2000-05-29 的配股即是其中之一。配股同样造成除权，
+    漏掉会让 Portfolio 在除权日对不上账。
+    """
+    try:
+        df = ak.stock_history_dividend_detail(symbol=symbol, indicator="配股")
+    except Exception:  # noqa: BLE001 - 配股缺失不应拖垮该标的的分红记录
+        return []
+    if df is None or len(df) == 0 or "除权日" not in df.columns:
+        return []
+    out = []
+    for r in df.itertuples(index=False):
+        ex = _ymd(getattr(r, "除权日", None))
+        if ex <= 0:
+            continue
+        # 配股方案同样是「每 10 股配 X 股」
+        ratio = float(pd.to_numeric(getattr(r, "配股方案", 0), errors="coerce") or 0) / _PER_TEN
+        price = float(pd.to_numeric(getattr(r, "配股价格", 0), errors="coerce") or 0)
+        if ratio <= 0:
+            continue
+        out.append({
+            "instrument_id": iid, "ex_date": ex,
+            "record_date": _ymd(getattr(r, "股权登记日", None)) or None,
+            "pay_date": None,
+            "cash_before_tax": 0, "stock_dividend": 0, "stock_transfer": 0,
+            "rights_ratio": sc.to_fixed(ratio, sc.PER_SHARE_SCALE),
+            "rights_price": sc.to_fixed(price, sc.PRICE_SCALE_ASHARE),
+        })
+    return out
 
 
 def fetch_etf(task: dict) -> dict:
@@ -119,6 +160,7 @@ def fetch_etf(task: dict) -> dict:
                 "record_date": None, "pay_date": None,
                 "cash_before_tax": sc.to_fixed(float(r.cash), sc.PER_SHARE_SCALE),
                 "stock_dividend": 0, "stock_transfer": 0,
+                "rights_ratio": 0, "rights_price": 0,
             } for r in d.itertuples(index=False)]
             return {"iid": iid, "symbol": symbol, "status": "done", "rows": rows}
         except Exception as exc:  # noqa: BLE001
@@ -186,7 +228,7 @@ def main() -> int:
         "instrument_id": "int32", "ex_date": "int32",
         "record_date": "Int32", "pay_date": "Int32",
         "cash_before_tax": "int64", "stock_dividend": "int64",
-        "stock_transfer": "int64",
+        "stock_transfer": "int64", "rights_ratio": "int64", "rights_price": "int64",
     })
     sc.validate_columns(df, "corporate_action")
     p, c = layout.write_meta(df, "corporate_action")
@@ -195,7 +237,8 @@ def main() -> int:
     has_stock = int(((df["stock_dividend"] + df["stock_transfer"]) > 0).sum())
     print(f"\ncorporate_action  {before} -> 去重后 {len(df)} 行 / "
           f"{df['instrument_id'].nunique()} 只标的 -> {p.name} (+{c.name})")
-    print(f"  含现金分红 {has_cash} 行，含送转 {has_stock} 行")
+    has_rights = int((df["rights_ratio"] > 0).sum())
+    print(f"  含现金分红 {has_cash} 行，含送转 {has_stock} 行，含配股 {has_rights} 行")
     print(f"  除权日范围 {int(df['ex_date'].min())} ~ {int(df['ex_date'].max())}")
 
     # 与 adj_factor 交叉核对：有因子事件的日子原则上应有对应的分红送配记录
