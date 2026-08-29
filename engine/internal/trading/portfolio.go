@@ -65,8 +65,13 @@ type Portfolio struct {
 
 	// RealizedCents 累计已实现盈亏（分）
 	RealizedCents int64
-	// FeeCents 累计费用（分），按 kind 拆分便于归因
+	// FeeCents 累计费用（分），按 kind 拆分便于归因。
+	// **只含付给第三方的真金白银**（佣金 / 印花税 / 过户费），
+	// 这样它才能与券商对账单对得上。
 	FeeCents map[string]int64
+	// SlippageCents 累计滑点（分）。它是执行质量的损耗，不是费用，
+	// 故与 FeeCents 分开记 —— 混在一起会让上面那句对账保证失效。
+	SlippageCents int64
 
 	// 公司行动的告警。有因子事件却无 corporate_action 记录时按因子推算入账，
 	// 属有损近似，必须留痕（设计 4.3）。
@@ -113,6 +118,10 @@ func (pf *Portfolio) ApplyFill(f Fill, sellableFrom int64) error {
 	for k, v := range f.Fee.Items {
 		pf.FeeCents[k] += v
 	}
+	pf.SlippageCents += f.SlippageCents
+	// 摩擦成本：费用 + 滑点。两者对现金的作用完全一致，
+	// 分开记只是为了归因，不是为了区别对待
+	friction := f.Fee.Total + f.SlippageCents
 
 	p := pf.Positions[f.Instrument]
 	if p == nil {
@@ -121,7 +130,7 @@ func (pf *Portfolio) ApplyFill(f Fill, sellableFrom int64) error {
 	}
 
 	if f.Side == SideBuy {
-		cost := amount + f.Fee.Total
+		cost := amount + friction
 		if cost > pf.Cash {
 			return fmt.Errorf("现金不足：需 %d 分，有 %d 分", cost, pf.Cash)
 		}
@@ -138,7 +147,7 @@ func (pf *Portfolio) ApplyFill(f Fill, sellableFrom int64) error {
 	}
 	// 成本按比例结转，保持均价不变；向下取整（保守）
 	costOut := p.CostCents * f.Qty / p.Total
-	proceeds := amount - f.Fee.Total
+	proceeds := amount - friction
 	pf.Cash += proceeds
 	pf.RealizedCents += proceeds - costOut
 	p.CostCents -= costOut
@@ -323,6 +332,7 @@ type PortfolioState struct {
 	Cash          int64                              `json:"cash"`
 	RealizedCents int64                              `json:"realized_cents"`
 	FeeCents      map[string]int64                   `json:"fee_cents"`
+	SlippageCents int64                              `json:"slippage_cents"`
 	Positions     map[mktdata.InstrumentID]*Position `json:"positions"`
 	Warnings      []string                           `json:"warnings,omitempty"`
 }
@@ -340,13 +350,15 @@ func (pf *Portfolio) Snapshot() PortfolioState {
 	}
 	return PortfolioState{
 		InitialCash: pf.InitialCash, Cash: pf.Cash,
-		RealizedCents: pf.RealizedCents, FeeCents: fees, Positions: ps,
+		RealizedCents: pf.RealizedCents, FeeCents: fees,
+		SlippageCents: pf.SlippageCents, Positions: ps,
 		Warnings: append([]string(nil), pf.Warnings...),
 	}
 }
 
 func (pf *Portfolio) Restore(s PortfolioState) {
 	pf.InitialCash, pf.Cash, pf.RealizedCents = s.InitialCash, s.Cash, s.RealizedCents
+	pf.SlippageCents = s.SlippageCents
 	pf.FeeCents = make(map[string]int64, len(s.FeeCents))
 	for k, v := range s.FeeCents {
 		pf.FeeCents[k] = v

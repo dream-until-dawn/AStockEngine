@@ -59,7 +59,7 @@ func (p *probeStrategy) Init(ic eng.InitContext) error {
 	return nil
 }
 
-func (p *probeStrategy) OnBar(ctx eng.StepContext) ([]trading.Order, error) {
+func (p *probeStrategy) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 	bar, ok := ctx.Bar(p.id)
 	if !ok {
 		return nil, nil
@@ -83,7 +83,7 @@ func (p *probeStrategy) OnBar(ctx eng.StepContext) ([]trading.Order, error) {
 		rec.ready[sp.Key] = ind.Ready()
 	}
 	p.recs = append(p.recs, rec)
-	return nil, nil // 观察者不下单
+	return nil, nil // 观察者只看不下单
 }
 
 // runProbe 跑一遍引擎，返回逐步记录。

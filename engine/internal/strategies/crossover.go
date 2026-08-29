@@ -56,14 +56,52 @@ func (c *crossState) cross(id mktdata.InstrumentID, above bool) (golden, death b
 	return above && !prev, !above && prev
 }
 
+// emit 是两个交叉型策略共用的信号生成：金叉建仓、死叉清仓。
+//
+// above 由各策略自己判定（均线比大小 / DIF 比 DEA），其余完全一致。
+func (c *crossState) emit(ctx eng.StepContext, key, tagPrefix string,
+	above func(indicator.Indicator) bool) []eng.Signal {
+
+	held, inFlight := holdingSet(ctx)
+	var sigs []eng.Signal
+
+	for _, id := range ctx.Universe() {
+		if inFlight[id] {
+			continue
+		}
+		ind, ok := ctx.Indicator(id, key)
+		if !ok || !ind.Ready() {
+			// **预热期内的指标值是垃圾**，据此下单会让回测前 N 步产生虚假交易
+			continue
+		}
+		golden, death := c.cross(id, above(ind))
+
+		bar, ok := ctx.Bar(id)
+		if !ok || bar.Suspended() || bar.Close <= 0 {
+			continue
+		}
+		switch {
+		case death && held[id]:
+			sigs = append(sigs, eng.Signal{
+				Instrument: id, Kind: eng.SignalExit, Side: trading.SideSell,
+				Tag: tagPrefix + "_death",
+			})
+		case golden && !held[id]:
+			sigs = append(sigs, eng.Signal{
+				Instrument: id, Kind: eng.SignalEnter, Side: trading.SideBuy,
+				Tag: tagPrefix + "_golden",
+			})
+		}
+	}
+	return sigs
+}
+
 // ---- 双均线 ----
 
 // MACross 双均线：快线上穿慢线买入、下穿卖出。
 type MACross struct {
 	crossState
 	fast, slow int
-	maxHold    int
-	slotCents  int64
 }
 
 func NewMACross() *MACross { return &MACross{crossState: newCrossState()} }
@@ -74,8 +112,6 @@ func (s *MACross) Specs() []eng.ParamSpec {
 	return []eng.ParamSpec{
 		{Name: "fast", Kind: eng.ParamInt, Default: 5, Min: 2, Max: 60, Step: 1, Desc: "快线周期"},
 		{Name: "slow", Kind: eng.ParamInt, Default: 20, Min: 5, Max: 250, Step: 1, Desc: "慢线周期"},
-		{Name: "max_hold", Kind: eng.ParamInt, Default: 10, Min: 1, Max: 200, Step: 1, Desc: "最多同时持有"},
-		{Name: "cash_cents", Kind: eng.ParamFloat, Default: 100_000_000, Min: 0, Max: 1e15, Step: 1, Desc: "总资金（分）"},
 	}
 }
 
@@ -85,11 +121,6 @@ func (s *MACross) Init(ic eng.InitContext) error {
 	if s.fast >= s.slow {
 		return fmt.Errorf("快线周期 %d 必须小于慢线周期 %d", s.fast, s.slow)
 	}
-	s.maxHold = p.Int("max_hold", 10)
-	if s.maxHold < 1 {
-		s.maxHold = 1
-	}
-	s.slotCents = int64(p.Float("cash_cents", 100_000_000)) / int64(s.maxHold)
 	s.crossState = newCrossState()
 	// 指标喂的是后复权价（引擎负责），序列连续才不会在除权日产生假信号
 	ic.Use("ma_fast", func() indicator.Indicator {
@@ -104,9 +135,10 @@ func (s *MACross) Init(ic eng.InitContext) error {
 func (s *MACross) SnapshotState() ([]byte, error) { return s.snapshot() }
 func (s *MACross) RestoreState(b []byte) error    { return s.restore(b) }
 
-func (s *MACross) OnBar(ctx eng.StepContext) ([]trading.Order, error) {
+func (s *MACross) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
+	// 双均线要比两条线，emit 的单指标签名不够用，这里自己走一遍
 	held, inFlight := holdingSet(ctx)
-	var orders []trading.Order
+	var sigs []eng.Signal
 
 	for _, id := range ctx.Universe() {
 		if inFlight[id] {
@@ -115,7 +147,6 @@ func (s *MACross) OnBar(ctx eng.StepContext) ([]trading.Order, error) {
 		fi, ok1 := ctx.Indicator(id, "ma_fast")
 		si, ok2 := ctx.Indicator(id, "ma_slow")
 		if !ok1 || !ok2 || !fi.Ready() || !si.Ready() {
-			// **预热期内的指标值是垃圾**，据此下单会让回测前 N 步产生虚假交易
 			continue
 		}
 		golden, death := s.cross(id, fi.Values()[0] > si.Values()[0])
@@ -124,25 +155,18 @@ func (s *MACross) OnBar(ctx eng.StepContext) ([]trading.Order, error) {
 		if !ok || bar.Suspended() || bar.Close <= 0 {
 			continue
 		}
-		if death && held[id] {
-			if avail := ctx.Available(id); avail > 0 {
-				orders = append(orders, trading.Order{
-					Instrument: id, Side: trading.SideSell, Qty: avail, Tag: "ma_death"})
-				inFlight[id] = true
-			}
-			continue
-		}
-		if golden && !held[id] && len(held)+len(inFlight) < s.maxHold {
-			qty := s.slotCents * 10 / bar.Close
-			if qty < 100 {
-				continue
-			}
-			orders = append(orders, trading.Order{
-				Instrument: id, Side: trading.SideBuy, Qty: qty, Tag: "ma_golden"})
-			inFlight[id] = true
+		switch {
+		case death && held[id]:
+			sigs = append(sigs, eng.Signal{
+				Instrument: id, Kind: eng.SignalExit, Side: trading.SideSell, Tag: "ma_death",
+			})
+		case golden && !held[id]:
+			sigs = append(sigs, eng.Signal{
+				Instrument: id, Kind: eng.SignalEnter, Side: trading.SideBuy, Tag: "ma_golden",
+			})
 		}
 	}
-	return orders, nil
+	return sigs, nil
 }
 
 // ---- MACD ----
@@ -151,8 +175,6 @@ func (s *MACross) OnBar(ctx eng.StepContext) ([]trading.Order, error) {
 type MACDCross struct {
 	crossState
 	short, long, signal int
-	maxHold             int
-	slotCents           int64
 }
 
 func NewMACDCross() *MACDCross { return &MACDCross{crossState: newCrossState()} }
@@ -164,8 +186,6 @@ func (s *MACDCross) Specs() []eng.ParamSpec {
 		{Name: "short", Kind: eng.ParamInt, Default: 12, Min: 2, Max: 60, Step: 1, Desc: "快线周期"},
 		{Name: "long", Kind: eng.ParamInt, Default: 26, Min: 5, Max: 200, Step: 1, Desc: "慢线周期"},
 		{Name: "signal", Kind: eng.ParamInt, Default: 9, Min: 2, Max: 60, Step: 1, Desc: "信号周期"},
-		{Name: "max_hold", Kind: eng.ParamInt, Default: 10, Min: 1, Max: 200, Step: 1, Desc: "最多同时持有"},
-		{Name: "cash_cents", Kind: eng.ParamFloat, Default: 100_000_000, Min: 0, Max: 1e15, Step: 1, Desc: "总资金（分）"},
 	}
 }
 
@@ -175,11 +195,6 @@ func (s *MACDCross) Init(ic eng.InitContext) error {
 	if s.short >= s.long {
 		return fmt.Errorf("快线周期 %d 必须小于慢线周期 %d", s.short, s.long)
 	}
-	s.maxHold = p.Int("max_hold", 10)
-	if s.maxHold < 1 {
-		s.maxHold = 1
-	}
-	s.slotCents = int64(p.Float("cash_cents", 100_000_000)) / int64(s.maxHold)
 	s.crossState = newCrossState()
 	ic.Use("macd", func() indicator.Indicator {
 		return indicator.NewMACD(s.short, s.long, s.signal, indicator.DefaultPriceScale)
@@ -190,57 +205,20 @@ func (s *MACDCross) Init(ic eng.InitContext) error {
 func (s *MACDCross) SnapshotState() ([]byte, error) { return s.snapshot() }
 func (s *MACDCross) RestoreState(b []byte) error    { return s.restore(b) }
 
-func (s *MACDCross) OnBar(ctx eng.StepContext) ([]trading.Order, error) {
-	held, inFlight := holdingSet(ctx)
-	var orders []trading.Order
-
-	for _, id := range ctx.Universe() {
-		if inFlight[id] {
-			continue
-		}
-		ind, ok := ctx.Indicator(id, "macd")
-		if !ok || !ind.Ready() {
-			continue
-		}
+func (s *MACDCross) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
+	return s.emit(ctx, "macd", "macd", func(ind indicator.Indicator) bool {
 		m := ind.(*indicator.MACD)
-		golden, death := s.cross(id, m.DIF() > m.DEA())
-
-		bar, ok := ctx.Bar(id)
-		if !ok || bar.Suspended() || bar.Close <= 0 {
-			continue
-		}
-		if death && held[id] {
-			if avail := ctx.Available(id); avail > 0 {
-				orders = append(orders, trading.Order{
-					Instrument: id, Side: trading.SideSell, Qty: avail, Tag: "macd_death"})
-				inFlight[id] = true
-			}
-			continue
-		}
-		if golden && !held[id] && len(held)+len(inFlight) < s.maxHold {
-			qty := s.slotCents * 10 / bar.Close
-			if qty < 100 {
-				continue
-			}
-			orders = append(orders, trading.Order{
-				Instrument: id, Side: trading.SideBuy, Qty: qty, Tag: "macd_golden"})
-			inFlight[id] = true
-		}
-	}
-	return orders, nil
+		return m.DIF() > m.DEA()
+	}), nil
 }
 
-// Registry 按名称构造策略。
-//
-// v0.3 会把它并入统一的模块 registry（配置驱动装配），
-// 本刀先用一个最小实现，避免 CLI 里出现 switch。
-var Registry = map[string]func() eng.Strategy{
-	"buy_and_hold": func() eng.Strategy { return NewBuyAndHold() },
-	"ma_cross":     func() eng.Strategy { return NewMACross() },
-	"macd_cross":   func() eng.Strategy { return NewMACDCross() },
+// ---- 注册 ----
+
+func init() {
+	eng.RegisterStrategy("buy_and_hold", func() eng.Strategy { return NewBuyAndHold() })
+	eng.RegisterStrategy("ma_cross", func() eng.Strategy { return NewMACross() })
+	eng.RegisterStrategy("macd_cross", func() eng.Strategy { return NewMACDCross() })
 }
 
 // Names 返回全部可用策略名，供 CLI 提示。
-func Names() []string {
-	return []string{"buy_and_hold", "ma_cross", "macd_cross"}
-}
+func Names() []string { return eng.Strategies.Names() }

@@ -1,11 +1,15 @@
 package engine
 
 import (
+	"crypto/sha256"
+	"encoding"
 	"encoding/json"
 	"fmt"
+	"hash"
 
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/indicator"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/record"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 )
 
@@ -43,6 +47,9 @@ type Engine struct {
 	market   trading.Market
 	pf       *trading.Portfolio
 	strategy Strategy
+	sizer    trading.Sizer
+	risk     trading.RiskChain
+	rec      record.Recorder
 	cfg      Config
 
 	factories  map[string]IndicatorFactory
@@ -57,6 +64,23 @@ type Engine struct {
 	ctx   *stepCtx
 	// prices 复用同一张表用于估值，避免每步分配
 	prices map[mktdata.InstrumentID]int64
+
+	// stepEquity 本步开始撮合后的权益，Sizer 与 Risk 共用同一个数 ——
+	// 各自重算会让「按权益的 10%」在同一步里指向不同的值
+	stepEquity int64
+	// peakEquity 历史峰值权益，回撤类风控的基准。**必须进快照** ——
+	// 不进的话恢复后峰值归零，熔断规则立刻失效
+	peakEquity int64
+
+	// signals 本步策略发出的信号，供 Recorder 与单步调试读取
+	signals []trading.Signal
+	// sized 本步 Sizer 折算出的订单（风控之前）
+	sized []trading.Order
+
+	// resultHash 逐笔成交的滚动哈希（C5）。在引擎内算，
+	// 这样它不受 recorder.level 影响 —— 记录多少是给人看的事，
+	// 不该改变「这次运行算出了什么」
+	resultHash hash.Hash
 }
 
 // Deps 是引擎依赖的数据与模块。
@@ -68,6 +92,15 @@ type Deps struct {
 	Market    trading.Market
 	Broker    *trading.Broker
 	Portfolio *trading.Portfolio
+	// Sizer 缺省为 equal_weight{slots:10, base:initial}
+	Sizer trading.Sizer
+	// Risk 缺省为空链（不拦截）
+	Risk trading.RiskChain
+	// Recorder 缺省为 summary 级内存记录器。
+	//
+	// **记录由引擎发起而不是由驱动方发起**：单步驱动、批量海选、实盘增量
+	// 三种模式共用同一个核心（C4），记录逻辑若写在驱动里就要写三遍。
+	Recorder record.Recorder
 }
 
 // New 装配一个引擎。
@@ -85,13 +118,25 @@ func New(d Deps, s Strategy, cfg Config) (*Engine, error) {
 	if d.Portfolio == nil {
 		d.Portfolio = trading.NewPortfolio(cfg.InitialCashCents)
 	}
+	if d.Sizer == nil {
+		sz, err := trading.Sizers.Build("equal_weight", nil)
+		if err != nil {
+			return nil, err
+		}
+		d.Sizer = sz
+	}
+	if d.Recorder == nil {
+		d.Recorder = record.NewMemory(record.Summary, 0)
+	}
 	e := &Engine{
 		col: d.Columns, cur: mktdata.NewCursor(d.Columns), adj: d.Adjuster,
 		uni: d.Universe, corp: d.CorpAct, broker: d.Broker, market: d.Market,
-		pf: d.Portfolio, strategy: s, cfg: cfg,
+		pf: d.Portfolio, strategy: s, sizer: d.Sizer, risk: d.Risk,
+		rec: d.Recorder, cfg: cfg,
 		factories:  make(map[string]IndicatorFactory),
 		indicators: make(map[string]map[mktdata.InstrumentID]indicator.Indicator),
 		prices:     make(map[mktdata.InstrumentID]int64, 1024),
+		resultHash: sha256.New(),
 	}
 	if e.cfg.Params == nil {
 		e.cfg.Params = Params{}
@@ -131,14 +176,17 @@ func (e *Engine) Portfolio() *trading.Portfolio { return e.pf }
 //
 // 阶段顺序不可颠倒，每一处都有理由：
 //
-//	1. 推进游标           当前 bar 变为可见
-//	2. 更新指标           策略读到的指标必须**已含当前 bar**
-//	3. 公司行动入账        除权除息在开盘前生效，**必须先于撮合** ——
-//	                      否则除权日的成交价与持仓基准会错配
-//	4. 撮合到期订单        **必须先于策略** —— 否则策略看不到已成交结果会重复下单
-//	5. 调用策略           策略此时看到的是最新持仓与指标
-//	6. 新订单定价入队      由 Market 决定最早可执行时点；
-//	                      可在本时点成交的（盘后定价）立即撮合
+//  1. 推进游标           当前 bar 变为可见
+//  2. 更新指标           策略读到的指标必须**已含当前 bar**
+//  3. 公司行动入账        除权除息在开盘前生效，**必须先于撮合** ——
+//     否则除权日的成交价与持仓基准会错配
+//  4. 撮合到期订单        **必须先于策略** —— 否则策略看不到已成交结果会重复下单
+//  5. 结算权益与峰值      Sizer 与 Risk 共用同一个权益快照，同一步里不会各算各的
+//  6. 调用策略           策略此时看到的是最新持仓与指标，只出**信号**
+//  7. Sizer 折算数量      信号 → 订单
+//  8. Risk 链逐单把关 + 定价入队
+//     由 Market 决定最早可执行时点；
+//     可在本时点成交的（盘后定价）立即撮合
 func (e *Engine) Step() (mktdata.TimePoint, error) {
 	tp, updated, ok := e.cur.Advance()
 	if !ok {
@@ -147,6 +195,8 @@ func (e *Engine) Step() (mktdata.TimePoint, error) {
 	e.steps++
 	e.fills = e.fills[:0]
 	e.rejects = e.rejects[:0]
+	e.signals = e.signals[:0]
+	e.sized = e.sized[:0]
 
 	// 2. 指标
 	for _, id := range updated {
@@ -175,15 +225,47 @@ func (e *Engine) Step() (mktdata.TimePoint, error) {
 	// 4. 撮合到期订单
 	e.matchPending(tp)
 
-	// 5. 策略
-	orders, err := e.strategy.OnBar(e.ctxFor(tp, updated))
+	// 5. 权益快照与峰值。放在撮合之后、策略之前：
+	//    策略、Sizer、Risk 看到的是同一个已结算的账户状态
+	e.ctxFor(tp, updated)
+	e.stepEquity = e.EquityCents()
+	if e.stepEquity > e.peakEquity {
+		e.peakEquity = e.stepEquity
+	}
+
+	// 6. 策略 —— 只出信号
+	sigs, err := e.strategy.OnBar(e.ctx)
 	if err != nil {
 		return tp, fmt.Errorf("策略在 %d 报错: %w", tp.TradingDay, err)
 	}
+	e.signals = append(e.signals, sigs...)
 
-	// 6. 定价入队；可在本时点成交的立即撮合
+	// 7. Sizer 折算数量
+	orders := e.sizer.Size(sigs, e.ctx)
+	e.sized = append(e.sized, orders...)
+
+	// 8. Risk 把关、定价入队；可在本时点成交的立即撮合
 	e.enqueue(orders, tp)
+
+	// 9. 记录。**放在最后** —— 盘后定价的单会在第 8 步就成交，
+	//    提前记会漏掉它们
+	e.rec.OnStep(record.Step{
+		Time: tp, EquityCents: e.stepEquity, CashCents: e.pf.Cash,
+		Positions:  countPositions(e.pf),
+		NumSignals: len(e.signals), NumFills: len(e.fills), NumRejects: len(e.rejects),
+		Signals: e.signals, Sized: e.sized, Fills: e.fills, Rejections: e.rejects,
+	})
 	return tp, nil
+}
+
+func countPositions(pf *trading.Portfolio) int {
+	n := 0
+	for _, p := range pf.Positions {
+		if p.Total > 0 {
+			n++
+		}
+	}
+	return n
 }
 
 // applyCorporateActions 处理当日的分红送配。
@@ -197,7 +279,7 @@ func (e *Engine) applyCorporateActions(tp mktdata.TimePoint, updated []mktdata.I
 				Instrument: a.Instrument, ExDate: a.ExDate,
 				CashBeforeTax: a.CashBeforeTax,
 				StockDividend: a.StockDividend, StockTransfer: a.StockTransfer,
-				RightsRatio:   a.RightsRatio, RightsPrice: a.RightsPrice,
+				RightsRatio: a.RightsRatio, RightsPrice: a.RightsPrice,
 			}, e.cfg.DividendTaxPPM, tp.TsClose)
 		}
 	}
@@ -282,6 +364,7 @@ func (e *Engine) tryMatch(po *trading.PendingOrder, tp mktdata.TimePoint) bool {
 		return false
 	}
 	e.fills = append(e.fills, fill)
+	fillDigest(e.resultHash, fill)
 	return true
 }
 
@@ -298,6 +381,16 @@ func (e *Engine) enqueue(orders []trading.Order, tp mktdata.TimePoint) {
 				Detail: "标的表中不存在",
 			})
 			continue
+		}
+		// 风控在定价入队**之前**拦截：被拦下的单不该占用挂单队列，
+		// 也不该在几天后突然冒出来成交
+		if len(e.risk) > 0 {
+			checked, rej, ok := e.risk.Check(o, e.ctx)
+			if !ok {
+				e.rejects = append(e.rejects, rej)
+				continue
+			}
+			o = checked
 		}
 		w, ok := e.market.NextExecutable(inst, tp)
 		if !ok {
@@ -357,7 +450,9 @@ func (e *Engine) EquityCents() int64 {
 // ---- 快照（C6）----
 
 type snapshot struct {
-	Steps      int                                   `json:"steps"`
+	Steps int `json:"steps"`
+	// PeakEquity 回撤类风控的基准。不存的话恢复后熔断规则立刻失效
+	PeakEquity int64                                 `json:"peakEquity"`
 	Cursor     mktdata.CursorState                   `json:"cursor"`
 	Indicators map[string]map[string]indicator.State `json:"indicators"`
 	Portfolio  trading.PortfolioState                `json:"portfolio"`
@@ -365,11 +460,22 @@ type snapshot struct {
 	Pending []trading.PendingOrder `json:"pending"`
 	// Strategy 策略自身的跨步状态。实现 StatefulStrategy 的策略才有。
 	Strategy []byte `json:"strategy,omitempty"`
+	// ResultHash 输出指纹的滚动哈希状态。
+	//
+	// 不存的话，从快照恢复后继续跑出来的指纹会缺掉快照之前的全部成交 ——
+	// 而 C6 的实盘模式**每天都从快照恢复**，那样指纹就永远对不上全程运行，
+	// 「同配置同结果」这条也就无从验证。
+	ResultHash []byte `json:"result_hash,omitempty"`
 }
 
 func (e *Engine) Snapshot() ([]byte, error) {
+	rh, err := e.resultHash.(encoding.BinaryMarshaler).MarshalBinary()
+	if err != nil {
+		return nil, fmt.Errorf("序列化输出指纹状态失败: %w", err)
+	}
 	s := snapshot{
-		Steps: e.steps, Cursor: e.cur.Snapshot(),
+		Steps: e.steps, PeakEquity: e.peakEquity, ResultHash: rh,
+		Cursor:     e.cur.Snapshot(),
 		Indicators: make(map[string]map[string]indicator.State, len(e.keys)),
 		Portfolio:  e.pf.Snapshot(),
 		Pending:    append([]trading.PendingOrder(nil), e.pending...),
@@ -421,6 +527,12 @@ func (e *Engine) Restore(data []byte) error {
 	e.pf.Restore(s.Portfolio)
 	e.pending = append([]trading.PendingOrder(nil), s.Pending...)
 	e.steps = s.Steps
+	e.peakEquity = s.PeakEquity
+	if len(s.ResultHash) > 0 {
+		if err := e.resultHash.(encoding.BinaryUnmarshaler).UnmarshalBinary(s.ResultHash); err != nil {
+			return fmt.Errorf("恢复输出指纹状态失败: %w", err)
+		}
+	}
 	if ss, ok := e.strategy.(StatefulStrategy); ok {
 		if len(s.Strategy) == 0 {
 			return fmt.Errorf("策略 %s 声明了跨步状态，但快照中没有 —— "+
@@ -455,11 +567,22 @@ func (c *stepCtx) Bar(id mktdata.InstrumentID) (mktdata.Bar, bool) { return c.e.
 func (c *stepCtx) Instrument(id mktdata.InstrumentID) *mktdata.Instrument {
 	return c.e.uni.Get(id)
 }
-func (c *stepCtx) Portfolio() *trading.Portfolio      { return c.e.pf }
-func (c *stepCtx) Pending() []trading.PendingOrder    { return c.e.pending }
-func (c *stepCtx) Fills() []trading.Fill              { return c.e.fills }
-func (c *stepCtx) Rejections() []trading.Rejection    { return c.e.rejects }
-func (c *stepCtx) EquityCents() int64                 { return c.e.EquityCents() }
+func (c *stepCtx) Portfolio() *trading.Portfolio   { return c.e.pf }
+func (c *stepCtx) Pending() []trading.PendingOrder { return c.e.pending }
+func (c *stepCtx) Fills() []trading.Fill           { return c.e.fills }
+func (c *stepCtx) Rejections() []trading.Rejection { return c.e.rejects }
+
+// EquityCents 返回**本步已结算的权益快照**，而不是每次调用都重算。
+//
+// 策略、Sizer、风控链在同一步里会各问好几次；若每次重算，
+// 「按权益的 10%」在同一步内就可能指向不同的数 —— 那种偏差极难查。
+func (c *stepCtx) EquityCents() int64 { return c.e.stepEquity }
+
+// ---- SizeContext / RiskContext 补齐 ----
+
+func (c *stepCtx) InitialCashCents() int64 { return c.e.cfg.InitialCashCents }
+func (c *stepCtx) PeakEquityCents() int64  { return c.e.peakEquity }
+func (c *stepCtx) Market() trading.Market  { return c.e.market }
 
 func (c *stepCtx) Available(id mktdata.InstrumentID) int64 {
 	return c.e.pf.Available(id, c.time.TsClose)
@@ -506,3 +629,34 @@ func (e *Engine) Rejections() []trading.Rejection { return e.rejects }
 
 // LastCounts 最近一步的成交数与拒单数。
 func (e *Engine) LastCounts() (fills, rejects int) { return len(e.fills), len(e.rejects) }
+
+// 编译期确认 stepCtx 同时满足三个上下文接口。
+// 少一个方法就在这里报错，而不是等到运行时装配失败。
+var (
+	_ StepContext         = (*stepCtx)(nil)
+	_ trading.SizeContext = (*stepCtx)(nil)
+	_ trading.RiskContext = (*stepCtx)(nil)
+)
+
+// ---- 本步中间产物 ----
+
+// Signals 返回本步策略发出的信号。
+func (e *Engine) Signals() []trading.Signal { return e.signals }
+
+// Sized 返回本步 Sizer 折算出的订单（风控之前）。
+//
+// 与 Fills / Rejections 一起，四者构成单步调试要看的完整链条：
+// 信号 → 定量 → 风控 → 成交。缺任何一环都会出现「为什么没买」答不上来的情况。
+func (e *Engine) Sized() []trading.Order { return e.sized }
+
+// PeakEquityCents 历史峰值权益。
+func (e *Engine) PeakEquityCents() int64 { return e.peakEquity }
+
+// Sizer 返回装配的仓位模块。
+func (e *Engine) Sizer() trading.Sizer { return e.sizer }
+
+// Risk 返回装配的风控链。
+func (e *Engine) Risk() trading.RiskChain { return e.risk }
+
+// Recorder 返回装配的记录器。
+func (e *Engine) Recorder() record.Recorder { return e.rec }
