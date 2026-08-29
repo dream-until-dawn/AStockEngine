@@ -4,7 +4,7 @@ import {
   createChart, createSeriesMarkers,
   type IChartApi, type ISeriesApi, type SeriesMarker, type Time, type UTCTimestamp,
 } from 'lightweight-charts'
-import type { KBar, Kline } from '../types'
+import type { KBar, Kline, RunFill } from '../types'
 
 // 三窗格：主图（K 线 + 均线）/ MACD / KDJ。
 //
@@ -34,12 +34,14 @@ function theme(): Theme {
 }
 
 export default function CandleChart({
-  data, priceScale, height = 620, onHover,
+  data, priceScale, height = 620, onHover, fills,
 }: {
   data: Kline
   priceScale: number
   height?: number
   onHover?: (bar: KBar | null) => void
+  /** 本次回测在该标的上的成交，叠成买卖标记 */
+  fills?: RunFill[]
 }) {
   const box = useRef<HTMLDivElement>(null)
   const hoverRef = useRef(onHover)
@@ -88,7 +90,37 @@ export default function CandleChart({
         time: day(b.d), position: 'belowBar' as const,
         color: t.muted, shape: 'arrowUp' as const, text: '除',
       }))
-    if (marks.length > 0 && marks.length <= 400) createSeriesMarkers(candles, marks)
+
+    // 回测成交叠在同一张图上。**这是把「策略为什么在这里买」问清楚的地方** ——
+    // 信号、指标、成交三者摆在一起，才看得出交易发生时图上是什么样。
+    //
+    // 同一天可能有多笔（分批成交），合并成一个标记并把数量加起来，
+    // 否则同一根 K 线上会叠出一摞看不清的箭头。
+    if (fills && fills.length > 0) {
+      // **只画区间内的成交。** 区间外的标记不会被丢掉，
+      // 而是被挤到图的右边缘堆成一摞 —— 看起来像最后几天疯狂交易，
+      // 实际是 2020 年的单子跑到 2026 年的位置上去了。
+      const inRange = new Set(data.bars.map((b) => b.d))
+      const byDay = new Map<number, { side: string; qty: number }>()
+      for (const f of fills) {
+        if (!inRange.has(f.d)) continue
+        const cur = byDay.get(f.d)
+        if (cur && cur.side === f.side) cur.qty += f.qty
+        else byDay.set(f.d, { side: f.side, qty: f.qty })
+      }
+      for (const [d, v] of byDay) {
+        marks.push({
+          time: day(d),
+          position: v.side === 'buy' ? ('belowBar' as const) : ('aboveBar' as const),
+          color: v.side === 'buy' ? t.up : t.down,
+          shape: v.side === 'buy' ? ('arrowUp' as const) : ('arrowDown' as const),
+          text: `${v.side === 'buy' ? '买' : '卖'} ${v.qty}`,
+        })
+      }
+    }
+
+    marks.sort((a, b) => String(a.time).localeCompare(String(b.time)))
+    if (marks.length > 0 && marks.length <= 600) createSeriesMarkers(candles, marks)
 
     // 均线：接口给什么画什么，周期由后端参数决定
     const maSpecs = data.indicators.filter((s) => s.pane === 'main')
@@ -178,7 +210,7 @@ export default function CandleChart({
       mq.removeEventListener('change', onScheme)
       chart.remove()
     }
-  }, [data, priceScale, height])
+  }, [data, priceScale, height, fills])
 
   return <div ref={box} className="chart" style={{ height }} />
 }

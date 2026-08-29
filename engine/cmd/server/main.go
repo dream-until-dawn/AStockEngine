@@ -13,14 +13,25 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/fingerprint"
+
+	// 策略经 init() 注册进 engine.Strategies，必须导入才会生效
+	_ "github.com/dream-until-dawn/AStockEngine/engine/internal/strategies"
 )
+
+// gitCommit 由构建时注入，进结果指纹。
+var gitCommit string
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:8123", "监听地址")
 	dataRoot := flag.String("data", "../data", "数据根目录")
 	feePath := flag.String("fee", "../configs/fee/ashare_default.json", "费率配置")
 	webDir := flag.String("web", "../web/dist", "前端构建产物目录，不存在则只提供 API")
+	cfgDir := flag.String("configs", "../configs/backtest", "回测配置目录")
 	flag.Parse()
+
+	fingerprint.SetEngineVersion(gitCommit)
 
 	if err := checkDataRoot(*dataRoot); err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
@@ -37,6 +48,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "\n错误:", err)
 		os.Exit(1)
 	}
+	store.ConfigDir = *cfgDir
 	first, last := store.DataDays()
 	fmt.Printf("\n就绪：%d 只标的 / %d 行 / %d ~ %d / 合计 %v\n",
 		store.Uni.Len(), store.BarStats.Rows, first, last,
@@ -50,6 +62,8 @@ func main() {
 	mux.HandleFunc("GET /api/factors", store.handleFactorsAll)
 	mux.HandleFunc("GET /api/corp-actions", store.handleCorpAll)
 	mux.HandleFunc("GET /api/kline/{id}", store.handleKline)
+	mux.HandleFunc("GET /api/configs", store.handleConfigs)
+	mux.HandleFunc("POST /api/backtest", store.handleBacktest)
 
 	// 前端产物存在就一并伺服，这样 `go run` 一条命令即可用；
 	// 开发时走 Vite（它把 /api 代理到这里），不依赖本分支。
@@ -160,6 +174,8 @@ const apiIndex = `AStockEngine 数据核对服务
   GET /api/calendar                交易日历 ?market=1&from=&to=&isTradingDay=
   GET /api/factors                 全市场复权因子事件 ?from=&to=&q=
   GET /api/corp-actions            全市场分红送配 ?from=&to=&q=&hasEffect=
+  GET /api/configs                 列出回测配置（含解析结果，供前端改参数）
+  POST /api/backtest               跑一次回测，返回绩效 / 净值 / 成交 / 拒单 / 逐轮
   GET /api/kline/{id}              K 线 + 引擎算出的指标
       ?adj=none|qfq|hfq            复权模式，K 线与指标同基准（默认 none）
       &from=&to=&macd=12,26,9&kdj=9,3,3&ma=5,10,20,60

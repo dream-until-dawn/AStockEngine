@@ -5,7 +5,8 @@ import InstrumentTables from '../components/InstrumentTables'
 import {
   DataTable, DayInput, ErrBox, Field, Loading, downloadCSV, useAsync, type Col,
 } from '../components/ui'
-import type { KBar, Kline as KlineData, Meta } from '../types'
+import { fillsFor, getRun } from '../runStore'
+import type { KBar, Kline as KlineData, Meta, RunFill } from '../types'
 
 const ADJ_LABEL: Record<string, string> = { none: '不复权', qfq: '前复权', hfq: '后复权' }
 
@@ -25,6 +26,13 @@ export default function Kline({ id, meta }: { id: string; meta: Meta }) {
 
   const params = { adj, from, to, ma, macd, kdj }
   const res = useAsync<KlineData>(() => api.kline(id, params), [id, ...Object.values(params)])
+
+  // 最近一次回测在该标的上的成交。没跑过回测就是空数组，图上什么也不多。
+  const run = getRun()
+  const myFills = useMemo(
+    () => (res.data ? fillsFor(res.data.instrument.id) : []),
+    [res.data],
+  )
 
   const bars = res.data?.bars ?? []
   // 没悬停时显示最后一根 —— 空着的读数面板浪费了最值钱的那块位置
@@ -127,7 +135,7 @@ export default function Kline({ id, meta }: { id: string; meta: Meta }) {
           </div>
 
           <div className="chartbox">
-            <CandleChart data={res.data} priceScale={scale} onHover={setHover} />
+            <CandleChart data={res.data} priceScale={scale} onHover={setHover} fills={myFills} />
           </div>
 
           <div className="panel" style={{ marginTop: 14 }}>
@@ -136,7 +144,20 @@ export default function Kline({ id, meta }: { id: string; meta: Meta }) {
               <span><span className="sw" style={{ background: '#4f9dfa' }} />MA / DEA / D</span>
               <span><span className="sw" style={{ background: '#c464e0' }} />MA / J</span>
               <span className="muted">「除」标记 = 复权因子事件日</span>
+              {myFills.length > 0 && (
+                <span>
+                  <span className="sw" style={{ background: 'var(--up)' }} />买入 /
+                  <span className="sw" style={{ background: 'var(--down)', marginLeft: 8 }} />卖出
+                  （本次回测）
+                </span>
+              )}
             </div>
+            {run && myFills.length === 0 && (
+              <p className="note">
+                本次回测（{run.name || '未命名'}）在该标的上<strong>没有成交</strong>。
+                想看有成交的标的，回<a className="link" href="#/backtest">回测</a>页点逐轮交易表里的行。
+              </p>
+            )}
             <p className="note">
               <strong>指标由后端引擎算出</strong>，走的是与回测逐字节相同的代码路径：
               同样的 AdjustBar、同样的 Update 顺序。本次跑了 {res.data.engine.runs} 遍引擎
@@ -164,6 +185,10 @@ export default function Kline({ id, meta }: { id: string; meta: Meta }) {
             )}
           </div>
 
+          {myFills.length > 0 && (
+            <FillPanel fills={myFills} scale={scale} runName={run?.name}
+              inRange={new Set(bars.map((b) => b.d))} />
+          )}
           {showMeta && <InstrumentTables id={id} meta={meta} />}
           {showTable && <BarTable bars={bars} data={res.data} scale={scale} />}
         </>
@@ -316,6 +341,53 @@ function BarTable({ bars, data, scale }: { bars: KBar[]; data: KlineData; scale:
         <button disabled={page <= 1} onClick={() => setPage(page - 1)}>上一页</button>
         <button disabled={page >= pages} onClick={() => setPage(page + 1)}>下一页</button>
       </div>
+    </div>
+  )
+}
+
+// FillPanel 列出本次回测在该标的上的成交。
+//
+// 与图上的箭头是同一份数据的两种看法：图回答「在什么价位」，
+// 表回答「具体多少钱、什么信号触发的」。
+function FillPanel({
+  fills, scale, runName, inRange,
+}: {
+  fills: RunFill[]; scale: number; runName?: string; inRange: Set<number>
+}) {
+  const shown = fills.filter((f) => inRange.has(f.d))
+  const outside = fills.length - shown.length
+  const cols: Col<RunFill>[] = [
+    { key: 'd', title: '交易日', render: (f) => fmtDay(f.d) },
+    {
+      key: 'side', title: '方向', render: (f) => (
+        <span className={f.side === 'buy' ? 'up' : 'down'}>
+          {f.side === 'buy' ? '买入' : '卖出'}
+        </span>
+      ),
+    },
+    { key: 'price', title: '成交价', num: true, render: (f) => (f.price / scale).toFixed(3) },
+    { key: 'qty', title: '数量', num: true, render: (f) => fmtNum(f.qty) },
+    { key: 'amt', title: '成交额', num: true, render: (f) => fmtCompact(f.amount / 100) },
+    { key: 'fee', title: '费用', num: true, render: (f) => (f.fee / 100).toFixed(2) },
+    { key: 'slip', title: '滑点', num: true, render: (f) => (f.slippage / 100).toFixed(2) },
+    { key: 'tag', title: '触发', render: (f) => <span className="tag">{f.tag}</span> },
+  ]
+  return (
+    <div className="panel" style={{ marginTop: 14 }}>
+      <h3>
+        本次回测的成交（当前区间 {shown.length} 笔
+        {outside > 0 && `，区间外还有 ${outside} 笔`}
+        {runName ? ` · ${runName}` : ''}）
+      </h3>
+      <DataTable cols={cols} rows={shown} empty="当前区间内没有成交，把区间放宽试试" />
+      <p className="note">
+        成交价<strong>不含滑点</strong> —— 滑点按成交额单列，
+        所以这一列仍是市场上真实存在的价格，可以直接和上面的 K 线核对。
+        {outside > 0 && (
+          <> 图上只画当前区间内的成交；点<strong>全区间</strong>能看到全部
+            {fills.length} 笔。</>
+        )}
+      </p>
     </div>
   )
 }
