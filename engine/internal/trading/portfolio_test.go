@@ -51,19 +51,19 @@ func TestManualCheckStockRoundTrip(t *testing.T) {
 	}
 
 	wantCash := oneMillionYuan*10 - 170_000_000 - 44_200
-	if pf.Cash != wantCash {
-		t.Errorf("买入后现金 = %d 分，手工核算 %d 分", pf.Cash, wantCash)
+	if pf.CashCents() != wantCash {
+		t.Errorf("买入后现金 = %d 分，手工核算 %d 分", pf.CashCents(), wantCash)
 	}
-	p := pf.Position(inst.ID)
-	if p.Total != 1000 {
-		t.Errorf("持仓 = %d，期望 1000", p.Total)
+	p := pf.Exposure(inst.ID)
+	if p.Long != 1000 {
+		t.Errorf("持仓 = %d，期望 1000", p.Long)
 	}
 	// 成本含买入费用：170044200 分 / 1000 股 = 170044 分/股 = 1700.44 元
-	if p.CostCents != 170_044_200 {
-		t.Errorf("持仓成本 = %d 分，手工核算 170044200 分", p.CostCents)
+	if p.LongCost != 170_044_200 {
+		t.Errorf("持仓成本 = %d 分，手工核算 170044200 分", p.LongCost)
 	}
-	if p.AvgCostCents() != 170_044 {
-		t.Errorf("每股成本 = %d 分，手工核算 170044 分（1700.44 元）", p.AvgCostCents())
+	if p.AvgLongCostCents() != 170_044 {
+		t.Errorf("每股成本 = %d 分，手工核算 170044 分（1700.44 元）", p.AvgLongCostCents())
 	}
 
 	// ---- 卖出 1000 股 @ 1800.000 元 ----
@@ -84,14 +84,14 @@ func TestManualCheckStockRoundTrip(t *testing.T) {
 
 	// 手工：卖出净得 180000000 - 136800 = 179863200
 	//       已实现 = 179863200 - 170044200 = 9819000 分 = 98190 元
-	if pf.RealizedCents != 9_819_000 {
-		t.Errorf("已实现盈亏 = %d 分，手工核算 9819000 分", pf.RealizedCents)
+	if pf.RealizedCents() != 9_819_000 {
+		t.Errorf("已实现盈亏 = %d 分，手工核算 9819000 分", pf.RealizedCents())
 	}
 	wantFinal := oneMillionYuan*10 + 9_819_000
-	if pf.Cash != wantFinal {
-		t.Errorf("最终现金 = %d 分，手工核算 %d 分", pf.Cash, wantFinal)
+	if pf.CashCents() != wantFinal {
+		t.Errorf("最终现金 = %d 分，手工核算 %d 分", pf.CashCents(), wantFinal)
 	}
-	if pf.Position(inst.ID).Total != 0 {
+	if pf.Exposure(inst.ID).Long != 0 {
 		t.Error("清仓后持仓应为 0")
 	}
 	// 累计费用应等于两次之和
@@ -140,7 +140,7 @@ func TestT1Settlement(t *testing.T) {
 	if got := pf.Available(inst.ID, now+1); got != 1000 {
 		t.Errorf("次日可卖 = %d，期望 1000", got)
 	}
-	if got := pf.Position(inst.ID).Total; got != 1000 {
+	if got := pf.Exposure(inst.ID).Long; got != 1000 {
 		t.Errorf("总持仓 = %d，期望 1000（可卖受限但持仓存在）", got)
 	}
 }
@@ -152,22 +152,22 @@ func TestCashDividendCredited(t *testing.T) {
 	fill := Fill{Order: Order{Instrument: inst.ID, Side: SideBuy, Qty: 1000},
 		Price: 10_000, Qty: 1000, Fee: FeeBreakdown{Items: map[string]int64{}}}
 	pf.ApplyFill(fill, 0)
-	before := pf.Cash
+	before := pf.CashCents()
 
 	// 每股税前 0.5 元 = 500000（scale 1e6）；1000 股 → 500 元 = 50000 分
 	pf.ApplyCorporateAction(CorporateAction{
 		Instrument: inst.ID, ExDate: day2024, CashBeforeTax: 500_000,
 	}, 0, 0)
-	if got := pf.Cash - before; got != 50_000 {
+	if got := pf.CashCents() - before; got != 50_000 {
 		t.Errorf("分红入账 = %d 分，手工核算 50000 分（1000 股 × 0.5 元）", got)
 	}
 
 	// 带 10% 红利税
-	before = pf.Cash
+	before = pf.CashCents()
 	pf.ApplyCorporateAction(CorporateAction{
 		Instrument: inst.ID, ExDate: day2024, CashBeforeTax: 500_000,
 	}, 100_000, 0)
-	if got := pf.Cash - before; got != 45_000 {
+	if got := pf.CashCents() - before; got != 45_000 {
 		t.Errorf("税后分红 = %d 分，手工核算 45000 分（税前 500 元 × 90%%）", got)
 	}
 }
@@ -179,9 +179,9 @@ func TestStockDividendDilutesCost(t *testing.T) {
 	fill := Fill{Order: Order{Instrument: inst.ID, Side: SideBuy, Qty: 1000},
 		Price: 10_000, Qty: 1000, Fee: FeeBreakdown{Items: map[string]int64{}}}
 	pf.ApplyFill(fill, 0)
-	p := pf.Position(inst.ID)
-	costBefore := p.CostCents
-	avgBefore := p.AvgCostCents()
+	before := pf.Exposure(inst.ID)
+	costBefore := before.LongCost
+	avgBefore := before.AvgLongCostCents()
 
 	// 每 10 股送 8 转 12 = 每股送 0.8 转 1.2，合计每股 +2 股（比亚迪 2025-07-29 的实例）
 	pf.ApplyCorporateAction(CorporateAction{
@@ -189,22 +189,28 @@ func TestStockDividendDilutesCost(t *testing.T) {
 		StockDividend: 800_000, StockTransfer: 1_200_000,
 	}, 0, 0)
 
-	if p.Total != 3000 {
-		t.Errorf("送转后持仓 = %d，手工核算 3000（1000 × 3）", p.Total)
+	// **必须重新取一次**：Exposure 返回的是值拷贝，不是账本内部的指针。
+	// 这正是把字段私有化想要的效果 —— 拿到手的视图不会在背后被改，
+	// 也改不了账本。旧版返回 *Position，这一行不写也「碰巧」能过。
+	p := pf.Exposure(inst.ID)
+
+	if p.Long != 3000 {
+		t.Errorf("送转后持仓 = %d，手工核算 3000（1000 × 3）", p.Long)
 	}
-	if p.CostCents != costBefore {
-		t.Errorf("送转不应改变总成本：%d → %d", costBefore, p.CostCents)
+	if p.LongCost != costBefore {
+		t.Errorf("送转不应改变总成本：%d → %d", costBefore, p.LongCost)
 	}
-	if got, want := p.AvgCostCents(), avgBefore/3; got != want {
+	if got, want := p.AvgLongCostCents(), avgBefore/3; got != want {
 		t.Errorf("均价 = %d 分，期望摊薄至 %d 分", got, want)
 	}
-	// 批次总量必须与持仓一致，否则可卖数量会与实际脱节
+	// 批次总量必须与持仓一致，否则可卖数量会与实际脱节。
+	// 批次是账本内部结构，经快照取 —— 外部拿不到（也不该拿到）
 	var sum int64
-	for _, l := range p.Lots {
+	for _, l := range pf.Snapshot().Positions[inst.ID].Lots {
 		sum += l.Qty
 	}
-	if sum != p.Total {
-		t.Errorf("批次总量 %d 与持仓 %d 不一致", sum, p.Total)
+	if sum != p.Long {
+		t.Errorf("批次总量 %d 与持仓 %d 不一致", sum, p.Long)
 	}
 }
 
@@ -217,10 +223,10 @@ func TestImpliedSplitWarns(t *testing.T) {
 	pf.ApplyFill(fill, 0)
 
 	pf.ApplyImpliedSplit(inst.ID, day2024, 2.0, 0)
-	if got := pf.Position(inst.ID).Total; got != 2000 {
+	if got := pf.Exposure(inst.ID).Long; got != 2000 {
 		t.Errorf("按因子 2.0 推算后持仓 = %d，期望 2000", got)
 	}
-	if len(pf.Warnings) == 0 {
+	if len(pf.Warnings()) == 0 {
 		t.Error("有损近似必须留痕，未产生告警")
 	}
 }
@@ -238,11 +244,11 @@ func TestPortfolioSnapshotRoundTrip(t *testing.T) {
 	restored := NewPortfolio(0)
 	restored.Restore(snap)
 
-	if restored.Cash != pf.Cash || restored.RealizedCents != pf.RealizedCents {
+	if restored.CashCents() != pf.CashCents() || restored.RealizedCents() != pf.RealizedCents() {
 		t.Error("现金或已实现盈亏未正确恢复")
 	}
-	rp := restored.Position(inst.ID)
-	if rp == nil || rp.Total != 1000 || rp.CostCents != pf.Position(inst.ID).CostCents {
+	rp := restored.Exposure(inst.ID)
+	if rp.Long != 1000 || rp.LongCost != pf.Exposure(inst.ID).LongCost {
 		t.Error("持仓未正确恢复")
 	}
 	if got := restored.Available(inst.ID, 12345); got != 1000 {
@@ -252,8 +258,11 @@ func TestPortfolioSnapshotRoundTrip(t *testing.T) {
 		t.Errorf("恢复后解冻前可卖 = %d，期望 0", got)
 	}
 	// 快照必须是深拷贝，改动恢复后的账本不得影响原账本
-	restored.Cash = 0
-	if pf.Cash == 0 {
-		t.Error("快照不是深拷贝")
+	zeroed := restored.Snapshot()
+	zeroed.Cash = 0
+	zeroed.Positions[inst.ID].Total = 0
+	restored.Restore(zeroed)
+	if pf.CashCents() == 0 || pf.Exposure(inst.ID).Long != 1000 {
+		t.Error("快照不是深拷贝：改动恢复后的账本影响了原账本")
 	}
 }

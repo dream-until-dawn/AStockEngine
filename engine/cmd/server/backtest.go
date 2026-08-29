@@ -269,7 +269,7 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 
 	rec, _ := e.Recorder().(*record.Memory)
 	res.Warnings = append(res.Warnings, rec.Warnings...)
-	if pfw := e.Portfolio().Warnings; len(pfw) > 0 {
+	if pfw := e.Ledger().Warnings(); len(pfw) > 0 {
 		res.Warnings = append(res.Warnings,
 			fmt.Sprintf("账本告警 %d 条，首条：%s", len(pfw), pfw[0]))
 	}

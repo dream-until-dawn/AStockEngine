@@ -129,7 +129,7 @@ func main() {
 	dur := time.Since(t1)
 	rec := e.Recorder()
 
-	pf := e.Portfolio()
+	led := e.Ledger()
 	final := e.EquityCents()
 	fmt.Println("=== 结果 ===")
 	fmt.Printf("  步数 %d  耗时 %v\n", e.Steps(), dur.Round(time.Millisecond))
@@ -137,19 +137,20 @@ func main() {
 	fmt.Printf("  初始 %.2f 元 → 权益 %.2f 元（%+.2f%%）\n",
 		cents(initial), cents(final), float64(final-initial)/float64(initial)*100)
 	fmt.Printf("  现金 %.2f 元  持仓 %d 只  已实现 %.2f 元\n",
-		cents(pf.Cash), countPositions(pf), cents(pf.RealizedCents))
+		cents(led.CashCents()), led.NumPositions(), cents(led.RealizedCents()))
 	fmt.Printf("  峰值权益 %.2f 元\n", cents(e.PeakEquityCents()))
 	fmt.Printf("  费用合计 %.2f 元（占初始 %.2f%%）",
-		cents(pf.TotalFeeCents()), float64(pf.TotalFeeCents())/float64(initial)*100)
-	for _, k := range sortedKeys(pf.FeeCents) {
-		fmt.Printf("  %s %.2f", k, cents(pf.FeeCents[k]))
+		cents(led.TotalFeeCents()), float64(led.TotalFeeCents())/float64(initial)*100)
+	fees := led.FeeCents()
+	for _, k := range sortedKeys(fees) {
+		fmt.Printf("  %s %.2f", k, cents(fees[k]))
 	}
 	fmt.Println()
 	// 滑点单列。它以前藏在成交价里，报告只看得到佣金印花税，
 	// 看不到执行摩擦到底吃掉多少 —— 而它经常比佣金还大
 	fmt.Printf("  滑点合计 %.2f 元（占初始 %.2f%%）  摩擦合计 %.2f 元\n",
-		cents(pf.SlippageCents), float64(pf.SlippageCents)/float64(initial)*100,
-		cents(pf.TotalFeeCents()+pf.SlippageCents))
+		cents(led.SlippageCents()), float64(led.SlippageCents())/float64(initial)*100,
+		cents(led.TotalFeeCents()+led.SlippageCents()))
 
 	if len(rejectBy) > 0 {
 		fmt.Println("  拒单原因分布：")
@@ -157,8 +158,8 @@ func main() {
 			fmt.Printf("    %-24s %d\n", k, rejectBy[k])
 		}
 	}
-	if n := len(pf.Warnings); n > 0 {
-		fmt.Printf("  账本告警 %d 条，首条：%s\n", n, pf.Warnings[0])
+	if w := led.Warnings(); len(w) > 0 {
+		fmt.Printf("  账本告警 %d 条，首条：%s\n", len(w), w[0])
 	}
 
 	if m, ok := rec.(*record.Memory); ok {
@@ -204,15 +205,16 @@ func main() {
 		if err := e2.RunAll(); err != nil {
 			fatal(err)
 		}
-		b := e2.Portfolio()
+		b := e2.Ledger()
 		fmt.Printf("  全程 现金 %.2f / 已实现 %.2f / 峰值 %.2f\n",
-			cents(pf.Cash), cents(pf.RealizedCents), cents(e.PeakEquityCents()))
+			cents(led.CashCents()), cents(led.RealizedCents()), cents(e.PeakEquityCents()))
 		fmt.Printf("  恢复 现金 %.2f / 已实现 %.2f / 峰值 %.2f\n",
-			cents(b.Cash), cents(b.RealizedCents), cents(e2.PeakEquityCents()))
+			cents(b.CashCents()), cents(b.RealizedCents()), cents(e2.PeakEquityCents()))
 		fpFull, fpRestored := e.ResultFingerprint(), e2.ResultFingerprint()
 		fmt.Printf("  全程 指纹 %s\n", fpFull)
 		fmt.Printf("  恢复 指纹 %s\n", fpRestored)
-		ok := pf.Cash == b.Cash && pf.RealizedCents == b.RealizedCents &&
+		ok := led.CashCents() == b.CashCents() &&
+			led.RealizedCents() == b.RealizedCents() &&
 			e.PeakEquityCents() == e2.PeakEquityCents()
 		if ok && fpFull == fpRestored {
 			// 指纹相同才是真的一致：账本三个数相同只说明结果相同，
@@ -337,16 +339,6 @@ func writeCurve(path string, curve []record.Step) error {
 }
 
 func cents(v int64) float64 { return float64(v) / 100 }
-
-func countPositions(pf *trading.Portfolio) int {
-	n := 0
-	for _, p := range pf.Positions {
-		if p.Total > 0 {
-			n++
-		}
-	}
-	return n
-}
 
 func sortedKeys(m map[string]int64) []string {
 	out := make([]string, 0, len(m))

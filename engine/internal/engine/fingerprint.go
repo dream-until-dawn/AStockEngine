@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash"
-	"sort"
 
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
@@ -39,21 +38,16 @@ func (e *Engine) ResultFingerprint() string {
 	h := sha256.New()
 	h.Write(e.resultHash.Sum(nil)) // Sum 不改变原哈希的状态
 
-	pf := e.pf
+	led := e.led
 	fmt.Fprintf(h, "ledger|%d|%d|%d|%d|%d\n",
-		e.steps, pf.Cash, pf.RealizedCents, pf.TotalFeeCents(), pf.SlippageCents)
+		e.steps, led.CashCents(), led.RealizedCents(),
+		led.TotalFeeCents(), led.SlippageCents())
 
-	// map 遍历顺序随机 —— 不排序会让同一次运行每次算出不同指纹
-	ids := make([]mktdata.InstrumentID, 0, len(pf.Positions))
-	for id, p := range pf.Positions {
-		if p.Total > 0 {
-			ids = append(ids, id)
-		}
-	}
-	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
-	for _, id := range ids {
-		p := pf.Positions[id]
-		fmt.Fprintf(h, "pos|%d|%d|%d\n", int32(id), p.Total, p.CostCents)
-	}
+	// EachExposure 保证按 ID 升序 —— map 遍历顺序随机，
+	// 不定序会让同一次运行每次算出不同指纹
+	led.EachExposure(func(id mktdata.InstrumentID, e trading.Exposure) bool {
+		fmt.Fprintf(h, "pos|%d|%d|%d\n", int32(id), e.Long, e.LongCost)
+		return true
+	})
 	return hex.EncodeToString(h.Sum(nil))
 }

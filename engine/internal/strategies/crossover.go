@@ -218,6 +218,7 @@ func init() {
 	eng.RegisterStrategy("buy_and_hold", func() eng.Strategy { return NewBuyAndHold() })
 	eng.RegisterStrategy("ma_cross", func() eng.Strategy { return NewMACross() })
 	eng.RegisterStrategy("macd_cross", func() eng.Strategy { return NewMACDCross() })
+	eng.RegisterStrategy("grid", func() eng.Strategy { return NewGrid() })
 }
 
 // Names 返回全部可用策略名，供 CLI 提示。

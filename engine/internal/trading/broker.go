@@ -243,7 +243,7 @@ func refPrice(ref PriceRef, b mktdata.Bar) (int64, bool) {
 // 这样拒单原因总是指向最根本的那个障碍 ——
 // 停牌的股票不该报「现金不足」。
 func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Bar,
-	now mktdata.TimePoint, pf *Portfolio) (Fill, Rejection, bool) {
+	now mktdata.TimePoint, led Ledger) (Fill, Rejection, bool) {
 
 	rej := func(r RejectReason, detail string) (Fill, Rejection, bool) {
 		return Fill{}, Rejection{Order: po.Order, At: now, Reason: r, Detail: detail}, false
@@ -316,12 +316,13 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 	}
 
 	// 数量合规
-	held := pf.Available(po.Instrument, now.TsClose)
+	held := led.Available(po.Instrument, now.TsClose)
 	qty, ok := br.Market.NormalizeQty(inst, po.Qty, po.Side, held)
 	if !ok {
 		if po.Side == SideSell && held <= 0 {
 			return rej(RejectInsufficientPosition,
-				fmt.Sprintf("可卖 0 股（持仓 %d，T+1 未解冻）", positionTotal(pf, po.Instrument)))
+				fmt.Sprintf("可减仓 0（敞口 %+d，尚未解冻）",
+					led.Exposure(po.Instrument).Net()))
 		}
 		return rej(RejectInvalidQty,
 			fmt.Sprintf("申报 %d，最小 %d，步长 %d", po.Qty, inst.MinOrderQty, inst.QtyStep))
@@ -351,29 +352,19 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 		AmountCents: amount, TradingDay: b.TradingDay,
 	})
 	slip := br.Slippage.CostCents(po.Side, price, qty, b)
-	if po.Side == SideBuy {
-		// 滑点与费用一样要占用现金 —— 漏掉它会让「买得起」的判断偏松，
-		// 成交之后账本才发现钱不够
-		need := amount + fee.Total + slip
-		if need > pf.Cash {
-			return rej(RejectInsufficientCash,
-				fmt.Sprintf("需 %.2f 元，可用 %.2f 元",
-					float64(need)/100, float64(pf.Cash)/100))
-		}
-	} else if qty > held {
-		return rej(RejectInsufficientPosition,
-			fmt.Sprintf("申报卖出 %d，可卖 %d", qty, held))
-	}
-
-	return Fill{
+	fill := Fill{
 		Order: po.Order, At: now, Price: price, Qty: qty,
 		Fee: fee, SlippageCents: slip,
-	}, Rejection{}, true
-}
-
-func positionTotal(pf *Portfolio, id mktdata.InstrumentID) int64 {
-	if p := pf.Position(id); p != nil {
-		return p.Total
 	}
-	return 0
+
+	// **可行性由账本判断，不由撮合器判断。**
+	//
+	// 「买得起吗」的答案取决于账户类型：现货看现金，保证金账户看可用保证金；
+	// 「卖得出吗」同理 —— 现货不能卖超持仓，保证金账户那叫开空。
+	// 撮合器不该知道这个区别。滑点与费用一并计入需求额 ——
+	// 漏掉会让判断偏松，成交之后账本才发现钱不够。
+	if reason, detail, ok := led.CanFill(fill); !ok {
+		return rej(reason, detail)
+	}
+	return fill, Rejection{}, true
 }

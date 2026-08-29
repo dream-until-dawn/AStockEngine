@@ -45,7 +45,7 @@ type Engine struct {
 	corp     *mktdata.CorpActions
 	broker   *trading.Broker
 	market   trading.Market
-	pf       *trading.Portfolio
+	led      trading.Ledger
 	strategy Strategy
 	sizer    trading.Sizer
 	risk     trading.RiskChain
@@ -76,6 +76,9 @@ type Engine struct {
 	signals []trading.Signal
 	// sized 本步 Sizer 折算出的订单（风控之前）
 	sized []trading.Order
+	// liquidations 累计强平。现货账本永远为空 —— 留着是因为强平
+	// **必须能被记录与展示**：权益突然掉一截却查不到原因是最糟的失真
+	liquidations []trading.Liquidation
 
 	// resultHash 逐笔成交的滚动哈希（C5）。在引擎内算，
 	// 这样它不受 recorder.level 影响 —— 记录多少是给人看的事，
@@ -85,13 +88,15 @@ type Engine struct {
 
 // Deps 是引擎依赖的数据与模块。
 type Deps struct {
-	Columns   *mktdata.Columns
-	Universe  *mktdata.Universe
-	Adjuster  *mktdata.Adjuster
-	CorpAct   *mktdata.CorpActions
-	Market    trading.Market
-	Broker    *trading.Broker
-	Portfolio *trading.Portfolio
+	Columns  *mktdata.Columns
+	Universe *mktdata.Universe
+	Adjuster *mktdata.Adjuster
+	CorpAct  *mktdata.CorpActions
+	Market   trading.Market
+	Broker   *trading.Broker
+	// Ledger 账本。缺省为现货账本（A 股）；保证金账本换实现即可，
+	// 引擎不需要知道两者的区别
+	Ledger trading.Ledger
 	// Sizer 缺省为 equal_weight{slots:10, base:initial}
 	Sizer trading.Sizer
 	// Risk 缺省为空链（不拦截）
@@ -115,8 +120,8 @@ func New(d Deps, s Strategy, cfg Config) (*Engine, error) {
 		d.Broker = trading.NewBroker(d.Market, trading.ZeroFee{}, nil,
 			trading.DefaultBrokerConfig())
 	}
-	if d.Portfolio == nil {
-		d.Portfolio = trading.NewPortfolio(cfg.InitialCashCents)
+	if d.Ledger == nil {
+		d.Ledger = trading.NewPortfolio(cfg.InitialCashCents)
 	}
 	if d.Sizer == nil {
 		sz, err := trading.Sizers.Build("equal_weight", nil)
@@ -131,7 +136,7 @@ func New(d Deps, s Strategy, cfg Config) (*Engine, error) {
 	e := &Engine{
 		col: d.Columns, cur: mktdata.NewCursor(d.Columns), adj: d.Adjuster,
 		uni: d.Universe, corp: d.CorpAct, broker: d.Broker, market: d.Market,
-		pf: d.Portfolio, strategy: s, sizer: d.Sizer, risk: d.Risk,
+		led: d.Ledger, strategy: s, sizer: d.Sizer, risk: d.Risk,
 		rec: d.Recorder, cfg: cfg,
 		factories:  make(map[string]IndicatorFactory),
 		indicators: make(map[string]map[mktdata.InstrumentID]indicator.Indicator),
@@ -168,9 +173,9 @@ func (e *Engine) Use(key string, f IndicatorFactory) {
 
 // ---- 状态机 ----
 
-func (e *Engine) Done() bool                    { return e.cur.Done() }
-func (e *Engine) Steps() int                    { return e.steps }
-func (e *Engine) Portfolio() *trading.Portfolio { return e.pf }
+func (e *Engine) Done() bool             { return e.cur.Done() }
+func (e *Engine) Steps() int             { return e.steps }
+func (e *Engine) Ledger() trading.Ledger { return e.led }
 
 // Step 前进一个事件时点。
 //
@@ -225,6 +230,12 @@ func (e *Engine) Step() (mktdata.TimePoint, error) {
 	// 4. 撮合到期订单
 	e.matchPending(tp)
 
+	// 4.5 账本重估。保证金账本在这里判断强平 —— **必须先于策略**：
+	//     强平是市场施加的，不是策略的决定。现货账本什么也不做
+	if liq := e.led.Mark(e.marks(), tp); len(liq) > 0 {
+		e.liquidations = append(e.liquidations, liq...)
+	}
+
 	// 5. 权益快照与峰值。放在撮合之后、策略之前：
 	//    策略、Sizer、Risk 看到的是同一个已结算的账户状态
 	e.ctxFor(tp, updated)
@@ -250,32 +261,22 @@ func (e *Engine) Step() (mktdata.TimePoint, error) {
 	// 9. 记录。**放在最后** —— 盘后定价的单会在第 8 步就成交，
 	//    提前记会漏掉它们
 	e.rec.OnStep(record.Step{
-		Time: tp, EquityCents: e.stepEquity, CashCents: e.pf.Cash,
-		Positions:  countPositions(e.pf),
+		Time: tp, EquityCents: e.stepEquity, CashCents: e.led.CashCents(),
+		Positions:  e.led.NumPositions(),
 		NumSignals: len(e.signals), NumFills: len(e.fills), NumRejects: len(e.rejects),
 		Signals: e.signals, Sized: e.sized, Fills: e.fills, Rejections: e.rejects,
 	})
 	return tp, nil
 }
 
-func countPositions(pf *trading.Portfolio) int {
-	n := 0
-	for _, p := range pf.Positions {
-		if p.Total > 0 {
-			n++
-		}
-	}
-	return n
-}
-
 // applyCorporateActions 处理当日的分红送配。
 func (e *Engine) applyCorporateActions(tp mktdata.TimePoint, updated []mktdata.InstrumentID) {
 	if e.corp != nil {
 		for _, a := range e.corp.OnDay(tp.TradingDay) {
-			if e.pf.Position(a.Instrument) == nil {
+			if e.led.Exposure(a.Instrument).IsEmpty() {
 				continue // 未持仓则无需入账
 			}
-			e.pf.ApplyCorporateAction(trading.CorporateAction{
+			e.led.ApplyCorporateAction(trading.CorporateAction{
 				Instrument: a.Instrument, ExDate: a.ExDate,
 				CashBeforeTax: a.CashBeforeTax,
 				StockDividend: a.StockDividend, StockTransfer: a.StockTransfer,
@@ -289,19 +290,17 @@ func (e *Engine) applyCorporateActions(tp mktdata.TimePoint, updated []mktdata.I
 	if !e.cfg.ImplySplitFromFactor || e.adj == nil {
 		return
 	}
-	for id, p := range e.pf.Positions {
-		if p.Total <= 0 {
-			continue
-		}
+	e.led.EachExposure(func(id mktdata.InstrumentID, _ trading.Exposure) bool {
 		ratio, isEvent := e.adj.EventRatio(id, tp.TradingDay)
 		if !isEvent || ratio <= 1.0 {
-			continue
+			return true
 		}
 		if e.corp != nil && e.corp.Has(id, tp.TradingDay) {
-			continue // 已有记录，按记录处理即可
+			return true // 已有记录，按记录处理即可
 		}
-		e.pf.ApplyImpliedSplit(id, tp.TradingDay, ratio, tp.TsClose)
-	}
+		e.led.ApplyImpliedSplit(id, tp.TradingDay, ratio, tp.TsClose)
+		return true
+	})
 }
 
 // matchPending 撮合已到期的订单，并淘汰过期的。
@@ -349,13 +348,13 @@ func (e *Engine) tryMatch(po *trading.PendingOrder, tp mktdata.TimePoint) bool {
 	if !ok {
 		return false // 该时点无 bar，留待下次
 	}
-	fill, rej, ok := e.broker.Match(po, inst, bar, tp, e.pf)
+	fill, rej, ok := e.broker.Match(po, inst, bar, tp, e.led)
 	if !ok {
 		e.rejects = append(e.rejects, rej)
 		return false
 	}
 	sellable := e.market.SellableFrom(inst, tp)
-	if err := e.pf.ApplyFill(fill, sellable); err != nil {
+	if err := e.led.ApplyFill(fill, sellable); err != nil {
 		// 撮合已校验过资金与持仓，走到这里说明有内部不一致，必须留痕
 		e.rejects = append(e.rejects, trading.Rejection{
 			Order: po.Order, At: tp, Reason: trading.RejectInsufficientCash,
@@ -436,15 +435,13 @@ func (e *Engine) EquityCents() int64 {
 	for id := range e.prices {
 		delete(e.prices, id)
 	}
-	for id, p := range e.pf.Positions {
-		if p.Total <= 0 {
-			continue
-		}
+	e.led.EachExposure(func(id mktdata.InstrumentID, _ trading.Exposure) bool {
 		if b, ok := e.cur.Bar(id); ok {
 			e.prices[id] = b.Close
 		}
-	}
-	return e.pf.EquityCents(e.prices)
+		return true
+	})
+	return e.led.EquityCents(e.prices)
 }
 
 // ---- 快照（C6）----
@@ -455,7 +452,7 @@ type snapshot struct {
 	PeakEquity int64                                 `json:"peakEquity"`
 	Cursor     mktdata.CursorState                   `json:"cursor"`
 	Indicators map[string]map[string]indicator.State `json:"indicators"`
-	Portfolio  trading.PortfolioState                `json:"portfolio"`
+	Ledger     []byte                                `json:"ledger"`
 	// Pending 必须进快照 —— 否则实盘恢复后，昨日挂出的未成交单会凭空消失
 	Pending []trading.PendingOrder `json:"pending"`
 	// Strategy 策略自身的跨步状态。实现 StatefulStrategy 的策略才有。
@@ -473,11 +470,15 @@ func (e *Engine) Snapshot() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("序列化输出指纹状态失败: %w", err)
 	}
+	ledSnap, err := e.led.SnapshotLedger()
+	if err != nil {
+		return nil, fmt.Errorf("序列化账本失败: %w", err)
+	}
 	s := snapshot{
 		Steps: e.steps, PeakEquity: e.peakEquity, ResultHash: rh,
 		Cursor:     e.cur.Snapshot(),
 		Indicators: make(map[string]map[string]indicator.State, len(e.keys)),
-		Portfolio:  e.pf.Snapshot(),
+		Ledger:     ledSnap,
 		Pending:    append([]trading.PendingOrder(nil), e.pending...),
 	}
 	if ss, ok := e.strategy.(StatefulStrategy); ok {
@@ -524,7 +525,9 @@ func (e *Engine) Restore(data []byte) error {
 		}
 		e.indicators[key] = m
 	}
-	e.pf.Restore(s.Portfolio)
+	if err := e.led.RestoreLedger(s.Ledger); err != nil {
+		return err
+	}
 	e.pending = append([]trading.PendingOrder(nil), s.Pending...)
 	e.steps = s.Steps
 	e.peakEquity = s.PeakEquity
@@ -567,7 +570,7 @@ func (c *stepCtx) Bar(id mktdata.InstrumentID) (mktdata.Bar, bool) { return c.e.
 func (c *stepCtx) Instrument(id mktdata.InstrumentID) *mktdata.Instrument {
 	return c.e.uni.Get(id)
 }
-func (c *stepCtx) Portfolio() *trading.Portfolio   { return c.e.pf }
+func (c *stepCtx) Ledger() trading.Ledger          { return c.e.led }
 func (c *stepCtx) Pending() []trading.PendingOrder { return c.e.pending }
 func (c *stepCtx) Fills() []trading.Fill           { return c.e.fills }
 func (c *stepCtx) Rejections() []trading.Rejection { return c.e.rejects }
@@ -585,7 +588,7 @@ func (c *stepCtx) PeakEquityCents() int64  { return c.e.peakEquity }
 func (c *stepCtx) Market() trading.Market  { return c.e.market }
 
 func (c *stepCtx) Available(id mktdata.InstrumentID) int64 {
-	return c.e.pf.Available(id, c.time.TsClose)
+	return c.e.led.Available(id, c.time.TsClose)
 }
 
 func (c *stepCtx) Indicator(id mktdata.InstrumentID, key string) (indicator.Indicator, bool) {
@@ -660,3 +663,23 @@ func (e *Engine) Risk() trading.RiskChain { return e.risk }
 
 // Recorder 返回装配的记录器。
 func (e *Engine) Recorder() record.Recorder { return e.rec }
+
+// marks 收集当前时点各持仓标的的最新价，供账本重估使用。
+//
+// 只取**有敞口的**标的：无敞口的标的重估它没有意义，
+// 而全市场取价在大标的池下是每步几千次查表。
+func (e *Engine) marks() map[mktdata.InstrumentID]int64 {
+	for id := range e.prices {
+		delete(e.prices, id)
+	}
+	e.led.EachExposure(func(id mktdata.InstrumentID, _ trading.Exposure) bool {
+		if b, ok := e.cur.Bar(id); ok {
+			e.prices[id] = b.Close
+		}
+		return true
+	})
+	return e.prices
+}
+
+// Liquidations 返回累计的强平记录。现货账本下恒为空。
+func (e *Engine) Liquidations() []trading.Liquidation { return e.liquidations }

@@ -12,7 +12,7 @@ import (
 // RiskContext 是风控规则可见的账户状态。
 type RiskContext interface {
 	Time() mktdata.TimePoint
-	Portfolio() *Portfolio
+	Ledger() Ledger
 	EquityCents() int64
 	// PeakEquityCents 历史峰值权益，回撤类规则的基准。
 	//
@@ -77,10 +77,7 @@ func heldValueCents(ctx RiskContext, id mktdata.InstrumentID) int64 {
 	if !ok || bar.Close <= 0 {
 		return 0
 	}
-	var qty int64
-	if p := ctx.Portfolio().Position(id); p != nil {
-		qty = p.Total
-	}
+	qty := ctx.Ledger().Exposure(id).Long
 	for _, po := range ctx.Pending() {
 		if po.Instrument == id && po.Side == SideBuy {
 			qty += po.Qty
@@ -107,10 +104,7 @@ func shrinkToBudget(ctx RiskContext, o Order, budgetCents int64) int64 {
 	if maxQty <= 0 {
 		return 0
 	}
-	held := int64(0)
-	if p := ctx.Portfolio().Position(o.Instrument); p != nil {
-		held = p.Total
-	}
+	held := ctx.Ledger().Exposure(o.Instrument).Long
 	q, ok := ctx.Market().NormalizeQty(inst, maxQty, SideBuy, held)
 	if !ok {
 		return 0
@@ -189,11 +183,10 @@ func (r *MaxPositions) Check(o Order, ctx RiskContext) (Order, Rejection, bool) 
 		return o, Rejection{}, true
 	}
 	in := make(map[mktdata.InstrumentID]bool, 64)
-	for id, p := range ctx.Portfolio().Positions {
-		if p.Total > 0 {
-			in[id] = true
-		}
-	}
+	ctx.Ledger().EachExposure(func(id mktdata.InstrumentID, e Exposure) bool {
+		in[id] = true
+		return true
+	})
 	for _, po := range ctx.Pending() {
 		in[po.Instrument] = true
 	}
@@ -281,12 +274,12 @@ func (r *CashReserve) Check(o Order, ctx RiskContext) (Order, Rejection, bool) {
 			committed += po.Qty * b.Close / 10
 		}
 	}
-	usable := ctx.Portfolio().Cash - reserve - committed
+	usable := ctx.Ledger().BuyingPowerCents() - reserve - committed
 	if usable <= 0 {
 		return o, Rejection{
 			Order: o, At: ctx.Time(), Reason: RejectRisk, Rule: r.Name(),
 			Detail: fmt.Sprintf("现金 %.2f，需留存 %.2f，在途已占 %.2f",
-				cents(ctx.Portfolio().Cash), cents(reserve), cents(committed)),
+				cents(ctx.Ledger().BuyingPowerCents()), cents(reserve), cents(committed)),
 		}, false
 	}
 	q := shrinkToBudget(ctx, o, usable)

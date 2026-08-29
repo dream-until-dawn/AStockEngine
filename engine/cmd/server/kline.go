@@ -95,7 +95,7 @@ func (s *Store) runProbe(
 		Columns: sub, Universe: s.Uni, Adjuster: s.Adj, CorpAct: s.Corp,
 		Market: s.Mkt,
 		Broker: trading.NewBroker(s.Mkt, s.Fee, trading.BpsSlippage{}, trading.BrokerConfig{}),
-		Portfolio: trading.NewPortfolio(0),
+		Ledger: trading.NewPortfolio(0),
 	}, probe, eng.Config{IndicatorAdjMode: mode})
 	if err != nil {
 		return nil, 0, fmt.Errorf("装配引擎失败: %w", err)

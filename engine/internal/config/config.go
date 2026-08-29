@@ -26,6 +26,13 @@ import (
 type Module struct {
 	Impl   string          `json:"impl"`
 	Params json.RawMessage `json:"params,omitempty"`
+	// Sources 仅 strategy.impl == "composite" 时有意义：组合的各个决策源。
+	//
+	// 放在 Module 上而不是塞进 params：源本身也是 {impl, params}，
+	// 塞进 params 就得在 JSON 里嵌一层无类型的东西，校验也跟着失效。
+	Sources []Module `json:"sources,omitempty"`
+	// Mode 仅 composite 有意义：union / confirm / veto
+	Mode string `json:"mode,omitempty"`
 }
 
 // Universe 描述标的池。
@@ -239,9 +246,13 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("必须指定 strategy.impl，可选：%s",
 			strings.Join(eng.Strategies.Names(), " / "))
 	}
-	if !eng.Strategies.Has(c.Strategy.Impl) {
-		return fmt.Errorf("未知 strategy 实现 %q，可选：%s",
-			c.Strategy.Impl, strings.Join(eng.Strategies.Names(), " / "))
+	if c.Strategy.Impl == compositeImpl {
+		if err := validateComposite(c.Strategy); err != nil {
+			return err
+		}
+	} else if !eng.Strategies.Has(c.Strategy.Impl) {
+		return fmt.Errorf("未知 strategy 实现 %q，可选：%s（或 %s）",
+			c.Strategy.Impl, strings.Join(eng.Strategies.Names(), " / "), compositeImpl)
 	}
 	seen := map[string]bool{}
 	for i, r := range c.Risk {
@@ -267,7 +278,7 @@ func (c *Config) Validate() error {
 	if c.Data.Univers.Limit < 0 {
 		return fmt.Errorf("data.universe.limit 不能为负")
 	}
-	// 策略参数按 Specs 校验
+	// 策略参数按 Specs 校验（组合策略的参数在各个源上，已由 validateComposite 查过）
 	if specs, ok := eng.Strategies.Specs(c.Strategy.Impl); ok {
 		p, err := decodeStrategyParams(specs, c.Strategy.Params)
 		if err != nil {
@@ -307,8 +318,42 @@ func (c *Config) dryBuild() error {
 			return fmt.Errorf("risk[%d]: %w", i, err)
 		}
 	}
-	if _, err := eng.Strategies.Build(c.Strategy.Impl, nil); err != nil {
-		return fmt.Errorf("strategy: %w", err)
+	if c.Strategy.Impl != compositeImpl {
+		if _, err := eng.Strategies.Build(c.Strategy.Impl, nil); err != nil {
+			return fmt.Errorf("strategy: %w", err)
+		}
+	}
+	return nil
+}
+
+const compositeImpl = "composite"
+
+// validateComposite 在跑之前把组合策略能查的都查掉。
+func validateComposite(m Module) error {
+	if _, err := eng.ParseCombineMode(m.Mode); err != nil {
+		return fmt.Errorf("strategy.mode: %w", err)
+	}
+	if len(m.Sources) == 0 {
+		return fmt.Errorf("strategy.sources 不能为空 —— 组合至少要有一个决策源")
+	}
+	for i, src := range m.Sources {
+		if src.Impl == compositeImpl {
+			// 嵌套组合能表达的东西，用一层加合适的 mode 都能表达，
+			// 而嵌套会让「谁否决谁」变得难以推理
+			return fmt.Errorf("strategy.sources[%d]: 不支持嵌套组合", i)
+		}
+		if !eng.Strategies.Has(src.Impl) {
+			return fmt.Errorf("strategy.sources[%d]: 未知实现 %q，可选：%s",
+				i, src.Impl, strings.Join(eng.Strategies.Names(), " / "))
+		}
+		specs, _ := eng.Strategies.Specs(src.Impl)
+		p, err := decodeStrategyParams(specs, src.Params)
+		if err != nil {
+			return fmt.Errorf("strategy.sources[%d].params: %w", i, err)
+		}
+		if err := spec.ValidateAll(specs, p); err != nil {
+			return fmt.Errorf("strategy.sources[%d].params: %w", i, err)
+		}
 	}
 	return nil
 }

@@ -79,8 +79,9 @@ type StepContext interface {
 	// Instrument 标的静态属性
 	Instrument(id mktdata.InstrumentID) *mktdata.Instrument
 
-	// Portfolio 当前账本（只读使用；直接改动会绕过撮合，破坏账目自洽）
-	Portfolio() *trading.Portfolio
+	// Ledger 当前账本。**只读** —— 字段已全部私有，
+	// 想改账要经撮合，绕过去就没有账目自洽可言了
+	Ledger() trading.Ledger
 	// Available 该标的当前可卖数量（已考虑 T+1）
 	Available(id mktdata.InstrumentID) int64
 	// Pending 尚未成交的订单。策略据此避免重复下单
@@ -108,7 +109,7 @@ type StepContext interface {
 // 但在实现本接口之前，先确认状态是否**真的**需要自己存 ——
 // 多数看似需要的状态其实可以从 StepContext 导出：
 //
-//	「持有哪些标的」 → ctx.Portfolio().Position(id).Total > 0
+//	「持有哪些标的」 → ctx.Ledger().EachExposure(...)
 //	「哪些单在途」   → ctx.Pending()
 //	「可卖多少」     → ctx.Available(id)
 //

@@ -62,7 +62,7 @@ type Signal struct {
 // SizeContext 是 Sizer 可见的账户与行情状态。
 type SizeContext interface {
 	Time() mktdata.TimePoint
-	Portfolio() *Portfolio
+	Ledger() Ledger
 	EquityCents() int64
 	// InitialCashCents 初始资金。定额下注型 Sizer 需要一个不随盈亏漂移的基准
 	InitialCashCents() int64
@@ -94,11 +94,10 @@ var Sizers = registry.New[Sizer]("sizer")
 // 再占一个仓位。**去重**——一只标的同时持有并挂着卖单只算一个占用。
 func occupancy(ctx SizeContext) map[mktdata.InstrumentID]bool {
 	in := make(map[mktdata.InstrumentID]bool, 64)
-	for id, p := range ctx.Portfolio().Positions {
-		if p.Total > 0 {
-			in[id] = true
-		}
-	}
+	ctx.Ledger().EachExposure(func(id mktdata.InstrumentID, e Exposure) bool {
+		in[id] = true
+		return true
+	})
 	for _, po := range ctx.Pending() {
 		in[po.Instrument] = true
 	}
@@ -123,10 +122,7 @@ func buyQty(ctx SizeContext, id mktdata.InstrumentID, budgetCents int64) (int64,
 	if raw <= 0 {
 		return 0, false
 	}
-	held := int64(0)
-	if p := ctx.Portfolio().Position(id); p != nil {
-		held = p.Total
-	}
+	held := ctx.Ledger().Exposure(id).Long
 	return ctx.Market().NormalizeQty(inst, raw, SideBuy, held)
 }
 
@@ -166,10 +162,7 @@ func override(sig Signal, ctx SizeContext) (Order, bool) {
 	if inst == nil {
 		return Order{}, false
 	}
-	held := int64(0)
-	if p := ctx.Portfolio().Position(sig.Instrument); p != nil {
-		held = p.Total
-	}
+	held := ctx.Ledger().Exposure(sig.Instrument).Long
 	qty, ok := ctx.Market().NormalizeQty(inst, sig.Qty, sig.Side, held)
 	if !ok || qty <= 0 {
 		return Order{}, false

@@ -22,7 +22,8 @@ import (
 // 规范化的手段是过一遍 map[string]any 再 Marshal —— Go 的 json 对 map
 // 按键排序，于是配置里写字段的先后顺序不再影响指纹。
 func (c *Config) Canonical() ([]byte, error) {
-	mod := func(m Module) (any, error) {
+	var mod func(m Module) (any, error)
+	mod = func(m Module) (any, error) {
 		out := map[string]any{"impl": m.Impl}
 		p, err := canonicalRaw(m.Params)
 		if err != nil {
@@ -30,6 +31,21 @@ func (c *Config) Canonical() ([]byte, error) {
 		}
 		if p != nil {
 			out["params"] = p
+		}
+		// 组合策略的源与合并方式当然影响结果，必须进指纹
+		if m.Mode != "" {
+			out["mode"] = m.Mode
+		}
+		if len(m.Sources) > 0 {
+			srcs := make([]any, 0, len(m.Sources))
+			for _, sub := range m.Sources {
+				v, err := mod(sub)
+				if err != nil {
+					return nil, err
+				}
+				srcs = append(srcs, v)
+			}
+			out["sources"] = srcs
 		}
 		return out, nil
 	}

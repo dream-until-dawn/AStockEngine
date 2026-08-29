@@ -96,7 +96,11 @@ func TestRejectReasonsAreSpecific(t *testing.T) {
 		if c.held > 0 {
 			pf.ApplyFill(Fill{Order: Order{Instrument: inst.ID, Side: SideBuy, Qty: c.held},
 				Price: 10000, Qty: c.held, Fee: FeeBreakdown{Items: map[string]int64{}}}, 0)
-			pf.Cash = c.cash
+			// 买完把现金复位：这些用例要测的是撮合的拒单分支，
+			// 不该被建仓花掉的钱干扰
+			st := pf.Snapshot()
+			st.Cash = c.cash
+			pf.Restore(st)
 		}
 		po := pending(inst.ID, c.side, c.qty, PriceOpen)
 		_, rej, ok := br.Match(po, inst, c.bar, now(day2024), pf)

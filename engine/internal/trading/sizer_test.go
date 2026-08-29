@@ -21,7 +21,7 @@ type fakeSizeCtx struct {
 	peak    int64
 }
 
-func (c *fakeSizeCtx) Portfolio() *Portfolio   { return c.pf }
+func (c *fakeSizeCtx) Ledger() Ledger          { return c.pf }
 func (c *fakeSizeCtx) EquityCents() int64      { return c.equity }
 func (c *fakeSizeCtx) InitialCashCents() int64 { return c.initial }
 func (c *fakeSizeCtx) PeakEquityCents() int64  { return c.peak }
@@ -47,6 +47,19 @@ var (
 	_ SizeContext = (*fakeSizeCtx)(nil)
 	_ RiskContext = (*fakeSizeCtx)(nil)
 )
+
+// seedPosition 直接种一笔持仓。
+//
+// 账本字段在 v0.3 之后全部私有 —— 测试也不例外，只能经快照进出。
+// 这不是麻烦，是同一条保证：没有任何路径能绕过撮合改账。
+func seedPosition(pf *Portfolio, id mktdata.InstrumentID, qty int64) {
+	st := pf.Snapshot()
+	if st.Positions == nil {
+		st.Positions = map[mktdata.InstrumentID]*Position{}
+	}
+	st.Positions[id] = &Position{Total: qty, Lots: []lot{{Qty: qty}}}
+	pf.Restore(st)
+}
 
 // newCtx 造一个有 n 只标的的场景，每只收盘价 10.000 元。
 func newCtx(n int, cash int64) *fakeSizeCtx {
@@ -138,7 +151,7 @@ func TestEqualWeightBaseInitialVsEquity(t *testing.T) {
 func TestEqualWeightSlotsCountDedup(t *testing.T) {
 	ctx := newCtx(5, 100_000_000)
 	// 标的 1 持有中，且挂着一张卖单 —— 按 v0.2 会占 2 个槽
-	ctx.pf.Positions[1] = &Position{Total: 10_000}
+	seedPosition(ctx.pf, 1, 10_000)
 	ctx.pending = []PendingOrder{{
 		Order: Order{Instrument: 1, Side: SideSell, Qty: 10_000},
 	}}
@@ -156,7 +169,7 @@ func TestEqualWeightSlotsCountDedup(t *testing.T) {
 
 func TestEqualWeightSkipsHeldAndPending(t *testing.T) {
 	ctx := newCtx(3, 100_000_000)
-	ctx.pf.Positions[1] = &Position{Total: 100}
+	seedPosition(ctx.pf, 1, 100)
 	ctx.pending = []PendingOrder{{Order: Order{Instrument: 2, Side: SideBuy, Qty: 100}}}
 
 	orders := mustSizer(t, "equal_weight", `{"slots":10}`).Size(enters(1, 2, 3), ctx)
@@ -168,7 +181,7 @@ func TestEqualWeightSkipsHeldAndPending(t *testing.T) {
 func TestSizerExitUsesAvailable(t *testing.T) {
 	// 清仓卖出的数量是**可卖数量**（已考虑 T+1），不是持仓总量
 	ctx := newCtx(1, 0)
-	ctx.pf.Positions[1] = &Position{Total: 1_000}
+	seedPosition(ctx.pf, 1, 1_000)
 	ctx.avail[1] = 600
 
 	orders := mustSizer(t, "equal_weight", `{"slots":10}`).Size([]Signal{

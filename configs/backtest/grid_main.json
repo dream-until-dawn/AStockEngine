@@ -1,0 +1,68 @@
+{
+  "name": "grid · 在市主板个股 · 跌 5% 加一格",
+  "data": {
+    "root": "../../data",
+    "market": "ashare",
+    "freq": "1d",
+    "from": 20200101,
+    "to": 0,
+    "universe": {
+      "market": [
+        "ashare"
+      ],
+      "type": "stock",
+      "board": [
+        "main"
+      ],
+      "status": "listed"
+    }
+  },
+  "market": {
+    "impl": "ashare"
+  },
+  "fee": {
+    "impl": "config",
+    "params": {
+      "path": "../fee/ashare_default.json"
+    }
+  },
+  "slippage": {
+    "impl": "fixed_bps",
+    "params": {
+      "bps": 5
+    }
+  },
+  "sizer": {
+    "impl": "strength_weighted",
+    "params": {
+      "total_pct": 20
+    }
+  },
+  "risk": [],
+  "broker": {
+    "volume_cap_ppm": 100000,
+    "allow_partial_fill": true
+  },
+  "portfolio": {
+    "initial_cash_cents": 100000000,
+    "dividend_tax_ppm": 0
+  },
+  "engine": {
+    "indicator_adj": "hfq",
+    "imply_split_from_factor": true
+  },
+  "strategy": {
+    "impl": "grid",
+    "params": {
+      "levels": 5,
+      "step_pct": 5
+    }
+  },
+  "metrics": {
+    "benchmark": "510300",
+    "risk_free_ppm": 0
+  },
+  "recorder": {
+    "level": "summary"
+  }
+}

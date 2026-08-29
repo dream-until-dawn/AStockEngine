@@ -11,6 +11,7 @@ import (
 	eng "github.com/dream-until-dawn/AStockEngine/engine/internal/engine"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/record"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/spec"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 )
 
@@ -258,14 +259,9 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 		}
 		chain = append(chain, rr)
 	}
-	strat, err := eng.Strategies.Build(c.Strategy.Impl, nil)
+	strat, params, err := buildStrategy(c.Strategy)
 	if err != nil {
 		return nil, err
-	}
-	specs, _ := eng.Strategies.Specs(c.Strategy.Impl)
-	params, err := decodeStrategyParams(specs, c.Strategy.Params)
-	if err != nil {
-		return nil, fmt.Errorf("strategy.params: %w", err)
 	}
 
 	allowPartial := true
@@ -288,9 +284,9 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 		Broker: trading.NewBroker(market, fee, slip, trading.BrokerConfig{
 			VolumeCapPPM: c.Broker.VolumeCapPPM, AllowPartialFill: allowPartial,
 		}),
-		Portfolio: trading.NewPortfolio(c.Portfolio.InitialCashCents),
-		Sizer:     sizer,
-		Risk:      chain,
+		Ledger: trading.NewPortfolio(c.Portfolio.InitialCashCents),
+		Sizer:  sizer,
+		Risk:   chain,
 	}, strat, eng.Config{
 		Params:               params,
 		IndicatorAdjMode:     adjMode,
@@ -489,4 +485,48 @@ func rawOrEmpty(raw []byte) string {
 		return "(默认参数)"
 	}
 	return string(raw)
+}
+
+// buildStrategy 装配策略，组合策略走另一条路。
+//
+// 返回的 Params 是**引擎级**的那一份：普通策略就是它自己的参数；
+// 组合策略返回空 —— 各源的参数由 Composite 自己在 Init 时分发下去，
+// 因为一份 Params 装不下 N 个源的参数，硬装就得靠前缀，
+// 那会让源看到一个和自己声明不一样的参数名。
+func buildStrategy(m Module) (eng.Strategy, spec.Params, error) {
+	if m.Impl != compositeImpl {
+		s, err := eng.Strategies.Build(m.Impl, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		specs, _ := eng.Strategies.Specs(m.Impl)
+		p, err := decodeStrategyParams(specs, m.Params)
+		if err != nil {
+			return nil, nil, fmt.Errorf("strategy.params: %w", err)
+		}
+		return s, p, nil
+	}
+
+	mode, err := eng.ParseCombineMode(m.Mode)
+	if err != nil {
+		return nil, nil, fmt.Errorf("strategy.mode: %w", err)
+	}
+	sources := make([]eng.Source, 0, len(m.Sources))
+	for i, src := range m.Sources {
+		s, err := eng.Strategies.Build(src.Impl, nil)
+		if err != nil {
+			return nil, nil, fmt.Errorf("strategy.sources[%d]: %w", i, err)
+		}
+		specs, _ := eng.Strategies.Specs(src.Impl)
+		p, err := decodeStrategyParams(specs, src.Params)
+		if err != nil {
+			return nil, nil, fmt.Errorf("strategy.sources[%d].params: %w", i, err)
+		}
+		sources = append(sources, eng.Source{Name: src.Impl, Strategy: s, Params: p})
+	}
+	comp, err := eng.NewComposite(mode, sources)
+	if err != nil {
+		return nil, nil, fmt.Errorf("strategy: %w", err)
+	}
+	return comp, spec.Params{}, nil
 }
