@@ -15,10 +15,24 @@ import os
 
 OUT = os.path.join(os.path.dirname(__file__), "..", "configs", "backtest")
 
-# 单标的用哪一只：A 股取招商银行（主板、全程在市、流动性足），
-# 加密取 BTC / ETH 两只永续。
-ASHARE_ONE = "600036"
-ASHARE_GRID_ONE = "600519"
+# 单标的用哪一只。
+#
+# **一手的钱必须配得上本金** —— 这已经是第三次栽在同一类事上了：
+#
+#   5 元最低佣金  两万本金切 10 份，每份两千，摩擦吃掉 47%
+#   一手的价钱    贵州茅台一手 3,645 ~ 260,100 元，而两万本金的半仓目标
+#                 只有 9,500 元 —— 大部分时间连一手都买不起，
+#                 网格 22 条信号 0 笔成交
+#
+# 所以按「一手最贵多少钱」挑：
+#
+#   601318 中国平安  一手 2,078 ~ 14,499 元  ← 规则树（预算 19,000）
+#   600036 招商银行  一手   590 ~  5,850 元  ← 网格（半仓目标 9,500）
+#
+# 网格要的余量更大：它的目标仓位在 0~100% 之间来回走，
+# 每一格都得买得起 / 卖得动至少一手。
+ASHARE_ONE = "601318"
+ASHARE_GRID_ONE = "600036"
 BTC = "BTC-USDT-SWAP"
 ETH = "ETH-USDT-SWAP"
 
@@ -161,15 +175,25 @@ c["exit"] = [{"impl": "stop_loss", "params": {"pct": 15}}]
 CONFIGS["ashare_multi_ruletree"] = c
 
 # ---- 3. A 股 · 单标的 · 网格 ----
-c = base("ashare", {"symbols": [ASHARE_GRID_ONE]}, ASHARE_GRID_ONE, 2_000_000,
-         "A 股单标的（%s）· 网格 · 越跌越买、涨回基准就全平。"
+# 本金 10 万而不是 2 万：网格把资金切成 2×levels = 10 份，
+# **每一份都必须买得起至少一手**，否则单格调仓会被申报单位规整成 0 ——
+# 信号照发、订单不出，看上去就是「网格不动」。
+#
+# 招商银行一手最贵 5,850 元（58.50 × 100）。两万本金每份只有 2,000 元，
+# 大部分年份连一手都不够，实测 28 条信号只成交 9 笔。
+# 十万本金每份一万，全程都买得起一到两手。
+c = base("ashare", {"symbols": [ASHARE_GRID_ONE]}, ASHARE_GRID_ONE, 10_000_000,
+         "A 股单标的（%s）· 网格 · 5 层 11 线 · 0 线持半仓 · 止损在满仓格下 2 格。"
          "网格在日线上是失真的：真实网格靠盘中挂单，一天可能来回穿好几格，"
          "而这里按收盘价定档，会系统性地低估交易次数。"
          % ASHARE_GRID_ONE)
 c["strategy"] = {"impl": "grid",
-                 "params": {"levels": 5, "step_pct": 5, "short": 0}}
-c["sizer"] = {"impl": "strength_weighted",
-              "params": {"total_pct": 95, "base": "cost"}}
+                 "params": {"levels": 5, "step_pct": 5,
+                            "stop_levels": 2, "short": 0}}
+# 网格配 pct_equity：Target 的 Weight 就是「占这只标的预算的多少」，
+# 直接对得上。strength_weighted 的预算还要先按信心归一化，多绕一层
+c["sizer"] = {"impl": "pct_equity",
+              "params": {"pct": 95, "base": "cost", "max_positions": 1}}
 c["risk"] = []
 c["exit"] = []
 CONFIGS["ashare_single_grid"] = c
@@ -216,13 +240,15 @@ CONFIGS["crypto_multi_ruletree_hedge"] = c
 
 # ---- 6. 加密 · 单标的 · 网格 · 仅开空 ----
 c = base("crypto", {"symbols": [ETH]}, ETH, 100_000,
-         "加密单标的（%s）· 网格 · 仅开空：越涨越空、跌回基准就全平。"
+         "加密单标的（%s）· 网格 · 仅开空 · 5 层 11 线 · 0 线持半仓 · "
+         "止损在满仓格下 2 格（做空的满仓格在上方）。"
          "做空网格只在允许做空的市场可用；配到 A 股上会在装配时直接报错，"
          "而不是安静地跑成零成交。" % ETH)
 c["strategy"] = {"impl": "grid",
-                 "params": {"levels": 5, "step_pct": 5, "short": 1}}
-c["sizer"] = {"impl": "strength_weighted",
-              "params": {"total_pct": 80, "base": "cost"}}
+                 "params": {"levels": 5, "step_pct": 5,
+                            "stop_levels": 2, "short": 1}}
+c["sizer"] = {"impl": "pct_equity",
+              "params": {"pct": 80, "base": "cost", "max_positions": 1}}
 c["risk"] = []
 c["exit"] = []
 CONFIGS["crypto_single_grid_short"] = c

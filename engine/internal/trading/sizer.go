@@ -344,6 +344,118 @@ func buyQtyFit(
 	return 0, false
 }
 
+// entryOrder 按预算生成一张建仓单。
+//
+// `SignalTarget` 走另一条路：它说的不是「买一份」而是**「持到这个比例」**，
+// 于是要先看现在持了多少，再补差额 —— 可能是买、可能是卖、也可能不动。
+// 这是网格那类策略唯一表达得出「加一格 / 减一格」的方式。
+func entryOrder(
+	sig Signal, ctx SizeContext, side Side, budgetCents int64, fitCash bool,
+) (Order, bool) {
+
+	if sig.Kind == SignalTarget {
+		return targetOrder(sig, ctx, side, budgetCents, fitCash)
+	}
+	qty, ok := buyQtyFit(ctx, sig.Instrument, budgetCents, fitCash)
+	if !ok {
+		return Order{}, false
+	}
+	return Order{
+		Instrument: sig.Instrument, Side: side, Qty: qty,
+		Type: orderType(sig), LimitPrice: sig.LimitPrice, Tag: sig.Tag,
+	}, true
+}
+
+// targetOrder 把「持到预算的 Weight 比例」折算成补差额的一张单。
+//
+// # 为什么必须有它
+//
+// 信号模型原本只表达得出「买一份」（Enter）与「全平」（Exit）。
+// 「卖掉十分之一」两者都不是 —— 网格每涨一格减一份，正是这个形状。
+//
+// 从前网格用 `Enter + 卖 + Strength` 凑：单向市场里被 dispatch 当成清仓
+// （全平，Strength 根本没参与），双向市场里更糟，会被当成**反向开仓**。
+// 两个都不是「减一点」。
+//
+// # Weight 是相对**这个 Sizer 给这只标的的预算**
+//
+// 不是相对总权益。`pct_equity pct=95` 下 Weight=0.5 就是 47.5% 的本金；
+// `equal_weight slots=10` 下 Weight=0.5 就是半个槽。
+// 这样同一棵策略换个 Sizer 不必改 Weight 的含义。
+func targetOrder(
+	sig Signal, ctx SizeContext, side Side, budgetCents int64, fitCash bool,
+) (Order, bool) {
+
+	inst := ctx.Instrument(sig.Instrument)
+	bar, ok := ctx.Bar(sig.Instrument)
+	if inst == nil || !ok || bar.Suspended() || bar.Close <= 0 {
+		return Order{}, false
+	}
+	w := sig.Weight
+	if w < 0 {
+		w = 0
+	}
+	if w > 1 {
+		w = 1
+	}
+	want := MulDiv(budgetCents, int64(w*1_000_000), 1_000_000)
+
+	// 现在这条腿上持了多少（按当前价估值）
+	ex := ctx.Ledger().Exposure(sig.Instrument)
+	held := ex.Long
+	if side == SideSell {
+		held = ex.Short
+	}
+	have := NotionalCents(inst, bar.Close, held)
+
+	switch {
+	case want > have:
+		// 补仓：差多少买多少
+		qty, ok := buyQtyFit(ctx, sig.Instrument, want-have, fitCash)
+		if !ok {
+			return Order{}, false
+		}
+		return Order{
+			Instrument: sig.Instrument, Side: side, Qty: qty,
+			Type: orderType(sig), LimitPrice: sig.LimitPrice, Tag: sig.Tag,
+		}, true
+
+	case want < have:
+		// 减仓：**这才是 Target 存在的理由**。方向与开仓相反，且带 Reduce ——
+		// 少了 Reduce，双向账本会把这张单当成反向开仓
+		closeSide := SideSell
+		if side == SideSell {
+			closeSide = SideBuy
+		}
+		raw := QtyForCents(inst, bar.Close, have-want)
+		if raw <= 0 {
+			return Order{}, false
+		}
+		if raw > held {
+			raw = held
+		}
+		avail := held
+		if side == SideBuy {
+			// 现货 T+1：今天买的今天卖不掉
+			if a := ctx.Available(sig.Instrument); a < avail {
+				avail = a
+			}
+		}
+		if raw > avail {
+			raw = avail
+		}
+		qty, ok := ctx.Market().NormalizeQty(inst, raw, closeSide, avail)
+		if !ok || qty <= 0 {
+			return Order{}, false
+		}
+		return Order{
+			Instrument: sig.Instrument, Side: closeSide, Qty: qty, Reduce: true,
+			Type: orderType(sig), LimitPrice: sig.LimitPrice, Tag: sig.Tag,
+		}, true
+	}
+	return Order{}, false // 已经在目标上，不动
+}
+
 // exitOrder 把清仓信号变成平仓单。
 //
 // **方向由信号的 Side 决定平哪一边**：
@@ -489,18 +601,26 @@ func (s *EqualWeight) Size(sigs []Signal, ctx SizeContext) []Order {
 	for _, sig := range entries {
 		// 建仓方向：单向市场恒为买，双向市场跟随信号（Enter + 卖 = 开空）
 		side := entrySide(sig, ctx)
-		// 建仓：预算不足、已在场、仓位已满，三者任一即跳过
-		if slotCents <= 0 || occ.has(sig.Instrument, side) || used >= s.slots {
+		// 建仓：预算不足、已在场、仓位已满，三者任一即跳过。
+		//
+		// **调仓（Target）例外**：它是把已有仓位补到某个比例，
+		// 不是开一个新槽。用「已在场」把它挡掉的话，
+		// 网格从第二格起就再也动不了 —— 而它每一格都在调仓
+		if slotCents <= 0 {
 			continue
 		}
-		qty, ok := buyQtyFit(ctx, sig.Instrument, slotCents, s.fitCash)
+		occupiedHere := occ.has(sig.Instrument, side)
+		if occupiedHere && sig.Kind != SignalTarget {
+			continue
+		}
+		if !occupiedHere && used >= s.slots {
+			continue
+		}
+		o, ok := entryOrder(sig, ctx, side, slotCents, s.fitCash)
 		if !ok {
 			continue
 		}
-		out = append(out, Order{
-			Instrument: sig.Instrument, Side: side, Qty: qty,
-			Type: orderType(sig), LimitPrice: sig.LimitPrice, Tag: sig.Tag,
-		})
+		out = append(out, o)
 		occ.take(sig.Instrument, side)
 		used++
 	}
@@ -644,20 +764,22 @@ func (s *PctEquity) Size(sigs []Signal, ctx SizeContext) []Order {
 	for _, sig := range entries {
 		// 建仓方向：单向市场恒为买，双向市场跟随信号（Enter + 卖 = 开空）
 		side := entrySide(sig, ctx)
-		if budget <= 0 || occ.has(sig.Instrument, side) {
+		// 调仓（Target）例外，理由同 EqualWeight
+		if budget <= 0 {
 			continue
 		}
-		if s.maxPositions > 0 && used >= s.maxPositions {
+		occupiedHere := occ.has(sig.Instrument, side)
+		if occupiedHere && sig.Kind != SignalTarget {
 			continue
 		}
-		qty, ok := buyQtyFit(ctx, sig.Instrument, budget, s.fitCash)
+		if !occupiedHere && s.maxPositions > 0 && used >= s.maxPositions {
+			continue
+		}
+		o, ok := entryOrder(sig, ctx, side, budget, s.fitCash)
 		if !ok {
 			continue
 		}
-		out = append(out, Order{
-			Instrument: sig.Instrument, Side: side, Qty: qty,
-			Type: orderType(sig), LimitPrice: sig.LimitPrice, Tag: sig.Tag,
-		})
+		out = append(out, o)
 		occ.take(sig.Instrument, side)
 		used++
 	}
@@ -721,14 +843,14 @@ func (s *StrengthWeighted) Size(sigs []Signal, ctx SizeContext) []Order {
 	total := eq * s.totalPPM / 1_000_000
 	for _, sig := range enters {
 		budget := int64(float64(total) * (sig.Strength / sum))
-		qty, ok := buyQty(ctx, sig.Instrument, budget)
+		// 走 entryOrder 而不是直接 buyQty —— 否则 Target 信号会被当成
+		// 普通建仓：**只在空仓时买得进一次，之后每一格都变成空操作**。
+		// 实测网格因此 22 条信号只成交 1 笔
+		o, ok := entryOrder(sig, ctx, entrySide(sig, ctx), budget, false)
 		if !ok {
 			continue
 		}
-		out = append(out, Order{
-			Instrument: sig.Instrument, Side: entrySide(sig, ctx), Qty: qty,
-			Type: orderType(sig), LimitPrice: sig.LimitPrice, Tag: sig.Tag,
-		})
+		out = append(out, o)
 	}
 	return out
 }

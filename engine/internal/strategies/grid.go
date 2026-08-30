@@ -9,7 +9,37 @@ import (
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 )
 
-// Grid 网格策略：价格每跌一格加一份，每涨回一格减一份。
+// Grid 网格策略：0 线之上每涨一格减一份，之下每跌一格加一份。
+//
+// # 一张网长什么样（单边 5 格）
+//
+//	       价格          档位   持仓
+//	+5 格  base×1.25      +5    0/10   ← 空仓，以此价重建整张网
+//	+1 格  base×1.05      +1    4/10
+//	 0 线  base            0    5/10   ← 建仓时就在这里，持一半
+//	−1 格  base×0.95      −1    6/10
+//	−5 格  base×0.75      −5   10/10   ← 满仓
+//	−7 格  base×0.65     止损    0/10   ← 全平，以此价重建
+//
+// **资金分成 2×levels 份，0 线持一半。** 分一半而不是全仓建仓，
+// 是为了在跌到底之前每一格都有份可加、涨上去之前每一格都有份可减 ——
+// 否则「网格」就只是一次买入加一次卖出。
+//
+// **止损线在满仓格之下再几格**，不在满仓那一格：−levels 是满仓位而不是
+// 离场位，在那里止损的话，网格从来没有机会「跌到底再涨回来」，
+// 而那正是它赚钱的方式。
+//
+// # 靠 SignalTarget 表达「加一格 / 减一格」
+//
+// 信号模型原本只有「买一份」（Enter）与「全平」（Exit）。
+// 「卖掉十分之一」两者都不是。从前这里用 `Enter + 卖 + Strength` 凑，
+// 而它在单向市场里被当成清仓（全平）、在双向市场里被当成反向开仓 ——
+// 两个都不是「减一点」，于是网格实际上从来没有真正分层减过仓。
+//
+// 现在每一格都发一条 `SignalTarget{Weight: k/2L}`，由 Sizer 看着
+// 当前持仓补差额。加、减、不动三种情况用同一条信号表达。
+//
+// # 为什么有它
 //
 // 写它是为了验证一件事：**引擎的信号模型能不能表达「非信号驱动」的策略。**
 // 网格不是「金叉了就买」，它是「维护一组价位，价格穿过就动」——
@@ -25,9 +55,8 @@ import (
 // 于是日内的来回全被抹掉 —— 它会系统性地低估网格的交易次数。
 // 用最高最低价去猜穿了几格更不老实：那等于假设你在最优点位成交。
 type Grid struct {
-	levels  int     // 单边格数
-	stepPPM int64   // 每格跌幅（百万分之一）
-	perStep float64 // 每格投入占总资金的比例，交给 Sizer 时体现为 Strength
+	levels  int   // 单边格数
+	stepPPM int64 // 每格跌幅（百万分之一）
 
 	// anchor 各标的的基准价（首次见到时的收盘价，定点）。
 	// **一旦定下就不再变** —— 让它跟着价格漂移就成了追涨杀跌，不是网格
@@ -37,6 +66,12 @@ type Grid struct {
 	// short 做空方向的网格：**价格每涨一格开一份空**，跌回来平掉。
 	// 只在允许做空的市场有意义
 	short bool
+	// stopLevels 止损线在 −(levels + stopLevels) 格。0 表示不设止损。
+	//
+	// **必须在 −levels 之下**：−levels 是满仓位，不是离场位 ——
+	// 在满仓那一格就止损的话，网格从来没有机会「跌到底再涨回来」，
+	// 而那正是它赚钱的方式
+	stopLevels int
 }
 
 func NewGrid() *Grid {
@@ -57,6 +92,9 @@ func (s *Grid) Specs() []eng.ParamSpec {
 		// 用 bool 而不是 "long"/"short" 字符串：策略经
 		// InitContext.Params() 取参，而那是 map[string]float64 ——
 		// 字符串到不了这里（规则树能用字符串是因为它走结构化配置那条路）
+		{Name: "stop_levels", Kind: eng.ParamInt, Default: 2, Min: 0, Max: 50, Step: 1,
+			Desc: "止损线在满仓格之下再几格（0=不止损）。" +
+				"触发后全平并以当时价格重建整张网"},
 		{Name: "short", Kind: eng.ParamBool, Default: 0, Min: 0, Max: 1, Step: 1,
 			Desc: "做空网格：越涨越空、跌回来平。" +
 				"关=越跌越买、涨回来平。做空只在允许做空的市场可用（如加密永续）"},
@@ -76,12 +114,12 @@ func (s *Grid) Init(ic eng.InitContext) error {
 		s.levels = 1
 	}
 	s.short = p.Bool("short", false)
+	s.stopLevels = p.Int("stop_levels", 2)
 	stepPct := p.Float("step_pct", 5)
 	if stepPct <= 0 {
 		return fmt.Errorf("step_pct 必须为正")
 	}
 	s.stepPPM = int64(stepPct * 10_000)
-	s.perStep = 1.0 / float64(s.levels)
 	s.anchor = make(map[mktdata.InstrumentID]int64, 4096)
 	s.level = make(map[mktdata.InstrumentID]int, 4096)
 	// 网格不用任何指标 —— 它的全部状态都在自己手里。
@@ -103,50 +141,85 @@ func (s *Grid) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 		}
 		base, seen := s.anchor[id]
 		if !seen {
-			// 第一次见到：定基准，本步不动作。
-			// **基准价必须用不复权价** —— 网格是对着真实价位挂的，
+			// 第一次见到：以此为 0 线，并**立刻建半仓**。
+			// **基准价用不复权价** —— 网格是对着真实价位挂的，
 			// 而 ctx.Bar 给的就是原始价（复权价只喂指标）
-			s.anchor[id] = bar.Close
+			s.anchor[id], s.level[id] = bar.Close, 0
+			sigs = append(sigs, s.target(id, 0, "grid_open"))
 			continue
 		}
 
-		want := s.targetLevel(base, bar.Close)
-		have := s.level[id]
-		if want == have {
-			continue
-		}
-
-		if want > have {
-			// 又穿了几格 —— 加仓。Strength 表达「这次要加多少份」，
-			// 由 strength_weighted 之类的 Sizer 折算成金额
-			s.level[id] = want
+		// 跌破止损线：全平，并以当前价重建整张网。
+		//
+		// **止损线在 −levels 之下**（再往下 stopLevels 格）：
+		// −levels 是满仓位，不是离场位。在满仓那一格就止损的话，
+		// 网格从来没有机会「跌到底再涨回来」—— 那正是它赚钱的方式
+		if s.stopped(base, bar.Close) {
+			s.anchor[id], s.level[id] = bar.Close, 0
 			sigs = append(sigs, eng.Signal{
-				Instrument: id, Kind: eng.SignalEnter, Side: s.openSide(),
-				Strength: float64(want-have) * s.perStep,
-				Tag:      fmt.Sprintf("grid_open_L%d", want),
+				Instrument: id, Kind: eng.SignalExit, Side: s.closeSide(),
+				Tag: "grid_stop",
 			})
 			continue
 		}
 
-		// 退回来了 —— **全平，并把档位归零**。
-		//
-		// 「减仓 N 格」这件事信号模型表达不了：Exit 是全平，
-		// 而 `Enter + 反向` 在单向市场里会被 dispatch 当成清仓、
-		// 在双向市场里会被当成反向开仓 —— 两个都不是「减一点」。
-		//
-		// 从前这里发 `Enter + 卖 + Strength` 并把档位记成 want，
-		// 结果是**仓位已经全平、档位却还记着 2 格**：
-		// 策略以为自己还持有，于是价格再跌一格也不加仓，
-		// 要跌到第 3 格才动。仓位与档位对不上，而且不报错。
-		//
-		// 现在退回任意格都全平、档位归零 —— 行为与实际持仓一致。
-		s.level[id] = 0
-		sigs = append(sigs, eng.Signal{
-			Instrument: id, Kind: eng.SignalExit, Side: s.closeSide(),
-			Tag: fmt.Sprintf("grid_exit_L%d", want),
-		})
+		want := s.targetLevel(base, bar.Close)
+		if want == s.level[id] {
+			continue
+		}
+		s.level[id] = want
+
+		// 涨到 +levels：仓位已经归零，**以此为新的 0 线重建**。
+		// 不重建的话这张网就永远挂在一个远低于现价的位置上，再也不动
+		if want >= s.levels {
+			s.anchor[id], s.level[id] = bar.Close, 0
+			sigs = append(sigs, s.target(id, 0, "grid_rebase"))
+			continue
+		}
+		sigs = append(sigs, s.target(id, want, fmt.Sprintf("grid_L%+d", want)))
 	}
 	return sigs, nil
+}
+
+// target 生成一条「持到第 n 格对应比例」的调仓信号。
+//
+// # 份数怎么算
+//
+// 单边 levels 格 → 上下共 2×levels 格，资金分成 2×levels 份。
+// 0 线持一半，每跌一格加一份，每涨一格减一份：
+//
+//	n = −levels  →  满仓（2L/2L）
+//	n = 0        →  半仓（L/2L）
+//	n = +levels  →  空仓（0/2L）
+//
+// 分一半而不是全仓建仓，是为了**在跌到底之前每一格都有份可加、
+// 涨上去之前每一格都有份可减** —— 否则「网格」就只是一次买入。
+func (s *Grid) target(id mktdata.InstrumentID, n int, tag string) eng.Signal {
+	w := float64(s.levels-n) / float64(2*s.levels)
+	if w < 0 {
+		w = 0
+	}
+	if w > 1 {
+		w = 1
+	}
+	return eng.Signal{
+		Instrument: id, Kind: eng.SignalTarget, Side: s.openSide(),
+		Weight: w, Tag: tag,
+	}
+}
+
+// stopped 判断是否跌破（做空则是涨破）止损线。
+//
+// 止损线在 **−(levels + stopLevels)** 格。stopLevels ≤ 0 表示不设止损。
+func (s *Grid) stopped(base, price int64) bool {
+	if s.stopLevels <= 0 || base <= 0 {
+		return false
+	}
+	n := int64(s.levels + s.stopLevels)
+	if s.short {
+		return price >= base*(1_000_000+n*s.stepPPM)/1_000_000
+	}
+	return price <= base*(1_000_000-n*s.stepPPM)/1_000_000
 }
 
 // openSide / closeSide 开平方向。做空网格整个反过来。

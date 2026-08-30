@@ -1,5 +1,5 @@
 {
-  "name": "A 股单标的（600519）· 网格 · 越跌越买、涨回基准就全平。网格在日线上是失真的：真实网格靠盘中挂单，一天可能来回穿好几格，而这里按收盘价定档，会系统性地低估交易次数。",
+  "name": "A 股单标的（600036）· 网格 · 5 层 11 线 · 0 线持半仓 · 止损在满仓格下 2 格。网格在日线上是失真的：真实网格靠盘中挂单，一天可能来回穿好几格，而这里按收盘价定档，会系统性地低估交易次数。",
   "data": {
     "root": "../../data",
     "market": "ashare",
@@ -8,7 +8,7 @@
     "to": 0,
     "universe": {
       "symbols": [
-        "600519"
+        "600036"
       ]
     }
   },
@@ -28,7 +28,7 @@
     }
   },
   "portfolio": {
-    "initial_cash_cents": 2000000,
+    "initial_cash_cents": 10000000,
     "ledger": "spot"
   },
   "broker": {
@@ -36,7 +36,7 @@
     "allow_partial_fill": true
   },
   "metrics": {
-    "benchmark": "600519",
+    "benchmark": "600036",
     "risk_free_ppm": 0
   },
   "recorder": {
@@ -47,14 +47,16 @@
     "params": {
       "levels": 5,
       "step_pct": 5,
+      "stop_levels": 2,
       "short": 0
     }
   },
   "sizer": {
-    "impl": "strength_weighted",
+    "impl": "pct_equity",
     "params": {
-      "total_pct": 95,
-      "base": "cost"
+      "pct": 95,
+      "base": "cost",
+      "max_positions": 1
     }
   },
   "risk": [],

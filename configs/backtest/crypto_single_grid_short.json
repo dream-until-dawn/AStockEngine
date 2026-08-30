@@ -1,5 +1,5 @@
 {
-  "name": "加密单标的（ETH-USDT-SWAP）· 网格 · 仅开空：越涨越空、跌回基准就全平。做空网格只在允许做空的市场可用；配到 A 股上会在装配时直接报错，而不是安静地跑成零成交。",
+  "name": "加密单标的（ETH-USDT-SWAP）· 网格 · 仅开空 · 5 层 11 线 · 0 线持半仓 · 止损在满仓格下 2 格（做空的满仓格在上方）。做空网格只在允许做空的市场可用；配到 A 股上会在装配时直接报错，而不是安静地跑成零成交。",
   "data": {
     "root": "../../data",
     "market": "crypto",
@@ -49,14 +49,16 @@
     "params": {
       "levels": 5,
       "step_pct": 5,
+      "stop_levels": 2,
       "short": 1
     }
   },
   "sizer": {
-    "impl": "strength_weighted",
+    "impl": "pct_equity",
     "params": {
-      "total_pct": 80,
-      "base": "cost"
+      "pct": 80,
+      "base": "cost",
+      "max_positions": 1
     }
   },
   "risk": [],

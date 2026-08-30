@@ -414,3 +414,116 @@ func TestEnterSellIsFullExitInSpot(t *testing.T) {
 		t.Errorf("卖出应当标成平仓")
 	}
 }
+
+// ---- SignalTarget：加一格 / 减一格 ----
+//
+// 信号模型原本只有「买一份」（Enter）与「全平」（Exit）。
+// 「卖掉十分之一」两者都不是 —— 而网格每涨一格就要减一份。
+
+func targetSig(id int, side Side, w float64) []Signal {
+	return []Signal{{
+		Instrument: mktdata.InstrumentID(id), Kind: SignalTarget,
+		Side: side, Weight: w,
+	}}
+}
+
+// TestTargetOpensFromFlat 空仓时 Target 就是按比例建仓。
+func TestTargetOpensFromFlat(t *testing.T) {
+	ctx := newCtx(1, 1_000_000) // 10,000.00 元；标的 10.000 元
+	got := mustSizer(t, "pct_equity",
+		`{"pct":100,"base":"cost"}`).Size(targetSig(1, SideBuy, 0.5), ctx)
+	if len(got) != 1 {
+		t.Fatalf("应当下出一笔，得到 %d 笔", len(got))
+	}
+	// 预算 10,000.00 元 × 0.5 = 5,000.00 元 → 10.000 元一股 → 500 股
+	if got[0].Qty != 500 || got[0].Side != SideBuy || got[0].Reduce {
+		t.Errorf("应当买入 500 股（不带 Reduce），得到 %+v", got[0])
+	}
+}
+
+// TestTargetReducesPartially **这才是 Target 存在的理由**：卖掉一部分。
+//
+// 从前网格靠 `Enter + 卖 + Strength` 凑，而它在单向市场里被 dispatch
+// 当成清仓（全平），Strength 根本没参与 —— 网格从来没有真正分层减过仓。
+func TestTargetReducesPartially(t *testing.T) {
+	ctx := newCtx(1, 1_000_000)
+	seedPosition(ctx.pf, 1, 1000) // 持 1000 股 = 10,000.00 元
+	ctx.avail[1] = 1000
+
+	// 目标降到预算的 60% = 6,000.00 元 → 600 股，要卖掉 400 股
+	got := mustSizer(t, "pct_equity",
+		`{"pct":100,"base":"cost"}`).Size(targetSig(1, SideBuy, 0.6), ctx)
+	if len(got) != 1 {
+		t.Fatalf("应当下出一笔，得到 %d 笔", len(got))
+	}
+	o := got[0]
+	if o.Side != SideSell {
+		t.Fatalf("减仓应当是卖出，得到 %v", o.Side)
+	}
+	if !o.Reduce {
+		t.Error("减仓单必须带 Reduce —— 少了它双向账本会当成反向开仓")
+	}
+	if o.Qty != 400 {
+		t.Errorf("应当卖 400 股（1000 → 600），得到 %d 股 —— "+
+			"卖光了就说明又退回「全平」了", o.Qty)
+	}
+}
+
+// TestTargetNoOpWhenOnTarget 已经在目标上就不动 —— 不该发一张空单。
+func TestTargetNoOpWhenOnTarget(t *testing.T) {
+	ctx := newCtx(1, 1_000_000)
+	seedPosition(ctx.pf, 1, 500) // 500 股 = 5,000.00 元 = 预算的 50%
+	ctx.avail[1] = 500
+
+	got := mustSizer(t, "pct_equity",
+		`{"pct":100,"base":"cost"}`).Size(targetSig(1, SideBuy, 0.5), ctx)
+	if len(got) != 0 {
+		t.Errorf("已经在目标上不该下单，得到 %+v", got)
+	}
+}
+
+// TestTargetToZeroClosesAll 目标 0 就是全平。
+func TestTargetToZeroClosesAll(t *testing.T) {
+	ctx := newCtx(1, 1_000_000)
+	seedPosition(ctx.pf, 1, 1000)
+	ctx.avail[1] = 1000
+
+	got := mustSizer(t, "pct_equity",
+		`{"pct":100,"base":"cost"}`).Size(targetSig(1, SideBuy, 0), ctx)
+	if len(got) != 1 || got[0].Qty != 1000 || !got[0].Reduce {
+		t.Fatalf("目标 0 应当全平 1000 股，得到 %+v", got)
+	}
+}
+
+// TestTargetRespectsAvailable 现货 T+1：今天买的今天卖不掉。
+func TestTargetRespectsAvailable(t *testing.T) {
+	ctx := newCtx(1, 1_000_000)
+	seedPosition(ctx.pf, 1, 1000)
+	ctx.avail[1] = 300 // 只有 300 股可卖
+
+	got := mustSizer(t, "pct_equity",
+		`{"pct":100,"base":"cost"}`).Size(targetSig(1, SideBuy, 0), ctx)
+	if len(got) != 1 {
+		t.Fatalf("应当下出一笔，得到 %d 笔", len(got))
+	}
+	if got[0].Qty != 300 {
+		t.Errorf("最多只能卖可卖的 300 股，得到 %d 股", got[0].Qty)
+	}
+}
+
+// TestTargetNotBlockedByOccupancy 持仓中的标的照样能调仓。
+//
+// 「已在场」这道闸是防重复建仓的。用它挡住 Target 的话，
+// 网格从第二格起就再也动不了 —— 而它每一格都在调仓。
+func TestTargetNotBlockedByOccupancy(t *testing.T) {
+	ctx := newCtx(2, 1_000_000)
+	seedPosition(ctx.pf, 1, 1000)
+	ctx.avail[1] = 1000
+
+	got := mustSizer(t, "equal_weight",
+		`{"slots":1,"base":"cost"}`).Size(targetSig(1, SideBuy, 0), ctx)
+	if len(got) != 1 {
+		t.Fatalf("持仓中的标的应当能调仓，得到 %d 笔 —— "+
+			"被「已在场」挡掉的话网格从第二格起就不动了", len(got))
+	}
+}
