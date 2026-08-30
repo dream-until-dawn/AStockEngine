@@ -154,7 +154,7 @@ func runOne(ds *config.DataSet, j Job, dir, sweepID, dataFP string) Result {
 		r.Err = err.Error()
 		return r
 	}
-	r.fill(m, st, cfg, dataFP, e.ResultFingerprint())
+	r.fill(e, m, st, cfg, dataFP, e.ResultFingerprint())
 	return r
 }
 

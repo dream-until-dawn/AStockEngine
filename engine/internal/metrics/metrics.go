@@ -77,6 +77,13 @@ type TradeStats struct {
 	GrossWinCents int64   `json:"gross_win_cents"`
 	GrossLossCent int64   `json:"gross_loss_cents"`
 	AvgHoldDays   float64 `json:"avg_hold_days"`
+	// AvgReturnRatio 每轮「盈亏 ÷ 成本」的平均值。
+	//
+	// **与总盈亏除以总成本不是一回事**：后者被大额轮次主导。
+	// 这里要的是「平均一笔做得怎么样」，好与虚拟轮次的
+	// 「（平仓价 − 开仓价）÷ 开仓价」逐笔口径对得上 ——
+	// 两者不同口径的话，「有效性树过滤得对不对」就无从比起
+	AvgReturnRatio float64 `json:"avg_return_ratio"`
 	// BonusTrips 建仓份额来自送股/转增的轮次数，已计入上面的统计但单独报出
 	BonusTrips int `json:"bonus_trips"`
 	// OpenPositions 回测结束时仍持有的标的数，**不计入胜率**
@@ -233,7 +240,8 @@ func computeTrades(fills []trading.Fill, hedge bool) TradeStats {
 	var st TradeStats
 	st.RoundTrips = len(trips)
 	st.CloseBy = make(map[string]int, 4)
-	var holdSum float64
+	var holdSum, retSum float64
+	var retN int
 	for _, t := range trips {
 		st.CloseBy[t.CloseTag]++
 		switch {
@@ -250,10 +258,17 @@ func computeTrades(fills []trading.Fill, hedge bool) TradeStats {
 			st.BonusTrips++
 		}
 		holdSum += float64(t.HoldDays)
+		if t.CostCents > 0 {
+			retSum += float64(t.PnLCents) / float64(t.CostCents)
+			retN++
+		}
 	}
 	if st.RoundTrips > 0 {
 		st.WinRate = float64(st.Wins) / float64(st.RoundTrips)
 		st.AvgHoldDays = holdSum / float64(st.RoundTrips)
+	}
+	if retN > 0 {
+		st.AvgReturnRatio = retSum / float64(retN)
 	}
 	if st.Wins > 0 {
 		st.AvgWinCents = st.GrossWinCents / int64(st.Wins)

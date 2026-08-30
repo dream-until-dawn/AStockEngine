@@ -8,7 +8,9 @@ import (
 	"github.com/parquet-go/parquet-go"
 
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/config"
+	eng "github.com/dream-until-dawn/AStockEngine/engine/internal/engine"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/metrics"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 )
 
 // Result 是结果表的一行：一次回测的全部可比较量。
@@ -70,6 +72,39 @@ type Result struct {
 	SlippageCents int64   `parquet:"slippage_cents"`
 	Turnover      float64 `parquet:"turnover"`
 
+	// ---- 「这个结果是不是策略挣来的」----
+	//
+	// 光看收益分不出四种情况：策略有边际、强平替你止损、熔断替你择时、
+	// 以及压根就是低摩擦低换手显得稳。下面这几列是用来把它们分开的。
+
+	// Liquidations 被强平的轮次数。
+	//
+	// **高杠杆下强平相当于一道很紧的止损** —— 实测同一份配置杠杆从 1 调到 20，
+	// 收益反而从 +115% 涨到 +202%，而强平从 0 次涨到 139 次。
+	// 那不是杠杆挣的钱，是强平替你砍掉了亏损腿
+	Liquidations int32 `parquet:"liquidations"`
+	// HaltExits 被熔断清仓的轮次数。收益来自风控而不是信号时，
+	// 换个市场就没了
+	HaltExits int32 `parquet:"halt_exits"`
+	// StopExits 被止损平掉的轮次数。不做门槛，但要看得见
+	StopExits int32 `parquet:"stop_exits"`
+
+	// FrictionRatio 摩擦（费用 + 滑点）占初始资金的比例。
+	//
+	// 实测 A 股两万本金切 10 份时它是 0.47 —— 那种组比的是费率不是策略
+	FrictionRatio float64 `parquet:"friction_ratio"`
+	// OpenCostRatio 回测结束时仍未平仓的开仓金额占初始资金的比例。
+	// 高的话，收益挂在没结算的浮盈上
+	OpenCostRatio float64 `parquet:"open_cost_ratio"`
+
+	// VirtualTrips 被「有效性」树过滤掉的轮次数；
+	// VirtualEdge = 实仓平均收益率 − 虚拟平均收益率。
+	//
+	// **为正才说明那棵树该留** —— 它过滤掉的确实比留下的差。
+	// 为负就是在帮倒忙，而不装这两列的话，这件事一次也看不出来
+	VirtualTrips int32   `parquet:"virtual_trips"`
+	VirtualEdge  float64 `parquet:"virtual_edge"`
+
 	FinalEquity int64 `parquet:"final_equity"`
 
 	// InputFP / OutputFP —— C5：任何一行都能一键重跑并比对
@@ -83,7 +118,8 @@ type Result struct {
 }
 
 func (r *Result) fill(
-	m metrics.Result, st config.RunStats, cfg *config.Config, dataFP, outFP string,
+	e *eng.Engine, m metrics.Result, st config.RunStats,
+	cfg *config.Config, dataFP, outFP string,
 ) {
 	// **三者必须同口径**：Steps 取绩效的步数而不是引擎的步数。
 	// 引擎在 Walk-Forward 下会多跑一段预热（4 年数据只交易最后 1 年），
@@ -121,6 +157,42 @@ func (r *Result) fill(
 		r.InputFP = fp
 	}
 	r.OutputFP = outFP
+	r.fillAttribution(e, m)
+}
+
+// fillAttribution 填「这个结果是不是策略挣来的」那几列。
+//
+// 光看收益分不出四种情况：策略有边际、强平替你止损、熔断替你择时、
+// 以及压根就是低摩擦低换手显得稳。
+func (r *Result) fillAttribution(e *eng.Engine, m metrics.Result) {
+	by := m.Trades.CloseBy
+	r.Liquidations = int32(by[trading.TagLiquidation])
+	r.HaltExits = int32(by["drawdown_halt"])
+	r.StopExits = int32(by["stop_loss"] + by["trailing_stop"])
+
+	if m.InitialCents > 0 {
+		r.FrictionRatio = float64(m.FeeCents+m.SlippageCents) / float64(m.InitialCents)
+		r.OpenCostRatio = float64(m.Trades.OpenCostCents) / float64(m.InitialCents)
+	}
+
+	// 虚拟轮次：策略说该买、被自己的有效性判断挡下来的那些。
+	//
+	// **VirtualEdge = 实仓平均收益率 − 虚拟平均收益率**，为正才说明
+	// 那棵有效性树该留（它挡掉的确实比放行的差）。为负就是在帮倒忙 ——
+	// 而不装这一列的话，这件事一次也看不出来。
+	//
+	// 两边都用**逐轮**口径（每轮的收益率再取平均），不是总盈亏除以总成本 ——
+	// 后者被大额轮次主导，与虚拟那边的逐笔价差口径对不上。
+	vt := e.VirtualTrips()
+	r.VirtualTrips = int32(len(vt))
+	if len(vt) == 0 || m.Trades.RoundTrips == 0 {
+		return
+	}
+	var vs float64
+	for _, t := range vt {
+		vs += t.Ratio
+	}
+	r.VirtualEdge = m.Trades.AvgReturnRatio - vs/float64(len(vt))
 }
 
 // Score 返回排序用的分数。
@@ -151,7 +223,39 @@ func (r Result) Score(rank string) float64 {
 
 // Passes 报告是否过硬门槛。
 func (r Result) Passes(g Gate) bool {
-	return r.Err == "" && int(r.RoundTrips) >= g.MinRoundTrips
+	if r.Err != "" || int(r.RoundTrips) < g.MinRoundTrips {
+		return false
+	}
+	return r.GateReason(g) == ""
+}
+
+// GateReason 返回被门槛拦下的原因，通过则为空。
+//
+// **分开写是为了报告能说清楚被拦掉的是什么** —— 只报一个总数的话，
+// 「是轮次太少还是强平太多」看不出来，而这两者要采取的行动完全不同。
+func (r Result) GateReason(g Gate) string {
+	if r.Err != "" {
+		return "跑失败"
+	}
+	if int(r.RoundTrips) < g.MinRoundTrips {
+		return "完整轮次不足"
+	}
+	if r.RoundTrips > 0 {
+		if g.MaxLiquidationRatio > 0 {
+			if ratio := float64(r.Liquidations) / float64(r.RoundTrips); ratio > g.MaxLiquidationRatio {
+				return "强平占比过高"
+			}
+		}
+		if g.MaxHaltExitRatio > 0 {
+			if ratio := float64(r.HaltExits) / float64(r.RoundTrips); ratio > g.MaxHaltExitRatio {
+				return "熔断清仓占比过高"
+			}
+		}
+	}
+	if g.MaxFrictionRatio > 0 && r.FrictionRatio > g.MaxFrictionRatio {
+		return "摩擦占比过高"
+	}
+	return ""
 }
 
 // ---- 落盘 ----

@@ -35,6 +35,7 @@ func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
 	fmt.Println("================ 海选结果 ================")
 
 	var failed, gated int
+	gateBy := map[string]int{}
 	for _, r := range rows {
 		if r.Probe != 0 {
 			continue
@@ -43,6 +44,7 @@ func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
 			failed++
 		} else if r.Phase == 1 && !r.Passes(sc.Gate) {
 			gated++
+			gateBy[r.GateReason(sc.Gate)]++
 		}
 	}
 	fmt.Printf("\n共 %d 行结果", len(rows))
@@ -54,6 +56,8 @@ func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
 	}
 	fmt.Println()
 	printFailures(rows)
+	printGateBreakdown(gateBy)
+	printAttribution(rows, sc)
 
 	// ---- 1. 噪声基线 ----
 	n := sweep.MeasureNoise(rows)
@@ -111,7 +115,14 @@ func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
 	}
 	fmt.Println("\n  ✅ 参数确有影响，可以谈区域。")
 
-	// ---- 3. 高原 ----
+	// ---- 3. 逐维边际 ----
+	//
+	// **放在高原之前**：高原要「邻居」，而邻居要求维度是有序的数。
+	// 子树开关这类非数值轴会让几何反推整个失败，
+	// 放在后面的话它们连一个数字都拿不到
+	printAxisMargins(aggs, sets)
+
+	// ---- 4. 高原 ----
 	geom, err := sweep.BuildGrid(sets)
 	if err != nil {
 		fmt.Printf("\n  ⚠ 网格几何反推失败（%v）—— 跳过高原分析\n", err)
@@ -227,4 +238,172 @@ func printFailures(rows []sweep.Result) {
 		}
 		fmt.Printf("  %6d 次  %s\n", by[k], msg)
 	}
+}
+
+// printGateBreakdown 把被硬门槛拦掉的按原因分开报。
+//
+// 只报一个总数的话，「是轮次太少还是强平太多」看不出来 ——
+// 而这两者要采取的行动完全不同：前者该放宽门槛或换更长的窗口，
+// 后者该降杠杆。
+func printGateBreakdown(by map[string]int) {
+	if len(by) <= 1 {
+		return
+	}
+	keys := make([]string, 0, len(by))
+	for k := range by {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return by[keys[i]] > by[keys[j]] })
+	fmt.Print("  门槛拦下的原因：")
+	for i, k := range keys {
+		if i > 0 {
+			fmt.Print("    ")
+		}
+		fmt.Printf("%s %d", k, by[k])
+	}
+	fmt.Println()
+}
+
+// printAttribution 报「这个结果是不是策略挣来的」。
+//
+// 光看收益分不出四种情况：策略有边际、强平替你止损、熔断替你择时、
+// 以及压根就是低摩擦低换手显得稳。这一段就是把它们分开。
+func printAttribution(rows []sweep.Result, sc *sweep.Config) {
+	var n, liq, halt, stop, vt int
+	var fric, openc, edge float64
+	var edgeN int
+	for _, r := range rows {
+		if r.Probe != 0 || r.Err != "" || r.Phase != 1 {
+			continue
+		}
+		n++
+		liq += int(r.Liquidations)
+		halt += int(r.HaltExits)
+		stop += int(r.StopExits)
+		vt += int(r.VirtualTrips)
+		fric += r.FrictionRatio
+		openc += r.OpenCostRatio
+		if r.VirtualTrips > 0 {
+			edge += r.VirtualEdge
+			edgeN++
+		}
+	}
+	if n == 0 {
+		return
+	}
+	fmt.Println("\n=== 结果从哪来（全部样本外窗口合计）===")
+	fmt.Printf("  强平 %d 轮    熔断清仓 %d 轮    止损 %d 轮\n", liq, halt, stop)
+	if liq > 0 {
+		fmt.Println("  ⚠ 有强平 —— 高杠杆下它相当于一道很紧的止损。" +
+			"收益里有多少是它砍出来的，收益本身答不了")
+	}
+	if halt > 0 {
+		fmt.Println("  ⚠ 有熔断清仓 —— 那部分收益来自风控而不是信号，换个市场就没了")
+	}
+	fmt.Printf("  平均摩擦占初始资金 %.2f%%    平均未平仓开仓金额占比 %.2f%%\n",
+		fric/float64(n)*100, openc/float64(n)*100)
+	if edgeN > 0 {
+		fmt.Printf("  有效性树：过滤掉 %d 轮，平均边际 %+.2f 个百分点"+
+			"（实仓逐轮收益率 − 虚拟逐轮收益率）\n", vt, edge/float64(edgeN)*100)
+		if edge < 0 {
+			fmt.Println("  ⚠ 边际为负 —— 这棵有效性树挡掉的比它放行的更好，它在帮倒忙")
+		}
+	}
+}
+
+// printAxisMargins 逐维报「这个轴的每个取值，OOS 中位数是多少」。
+//
+// # 为什么需要它
+//
+// 高原分析要「邻居」，而邻居要求维度是**有序的数**。
+// 子树开关（有效性树留 / 不留）、离场链的有无这类轴不是数 ——
+// 高原分析对它们直接跳过，于是「这棵树到底值不值得留」这个问题
+// 反而没人回答。
+//
+// 边际视图不需要有序：把参数按这一维的取值分组，各看各的中位数。
+// 它答不了「哪片区域稳健」，但答得了「这个轴有没有用、往哪边用」。
+func printAxisMargins(aggs map[int32]*sweep.ParamAgg, sets []sweep.ParamSet) {
+	// 每组参数的取值表：param_id → {轴 → 取值}。
+	// ParamSet.Values 就是这张表，不必再从 JSON 解一遍
+	byID := map[int32]map[string]any{}
+	axes := map[string]bool{}
+	for _, s := range sets {
+		byID[s.ID] = s.Values
+		for k := range s.Values {
+			axes[k] = true
+		}
+	}
+	if len(axes) == 0 {
+		return
+	}
+	names := make([]string, 0, len(axes))
+	for k := range axes {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+
+	fmt.Println("\n=== 逐维边际（把参数按这一维分组，各看各的 OOS 中位数）===")
+	fmt.Println("  它答不了「哪片区域稳健」，但答得了「这个轴有没有用、往哪边用」——")
+	fmt.Println("  子树开关这类非数值轴只有这一个视图，高原分析对它们无能为力。")
+	for _, ax := range names {
+		groups := map[string][]float64{}
+		for id, a := range aggs {
+			if a.Windows == 0 || a.ThinCoverage {
+				continue
+			}
+			vals, ok := byID[id]
+			if !ok {
+				continue
+			}
+			groups[axisLabel(vals[ax])] = append(groups[axisLabel(vals[ax])], a.Median)
+		}
+		if len(groups) < 2 {
+			continue // 只有一个取值活下来，比不出东西
+		}
+		keys := make([]string, 0, len(groups))
+		for k := range groups {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		fmt.Printf("\n  %s\n", ax)
+		for _, k := range keys {
+			v := groups[k]
+			fmt.Printf("    %-28s OOS 中位数 %s%%   （%d 组）\n",
+				k, pp(median(v)), len(v))
+		}
+	}
+}
+
+// axisLabel 把一个取值印成短标签。子树用「有 / 无」而不是整段 JSON ——
+// 一棵树打印出来占三行，而这里要的是「哪一档」。
+func axisLabel(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return "（无）"
+	case map[string]any:
+		if r, ok := t["right"].(map[string]any); ok {
+			if val, ok := r["value"]; ok {
+				return fmt.Sprintf("有 · 阈值 %v", val)
+			}
+		}
+		return "有"
+	case []any:
+		if len(t) == 0 {
+			return "（空链）"
+		}
+		return fmt.Sprintf("%d 条", len(t))
+	}
+	return fmt.Sprint(v)
+}
+
+func median(v []float64) float64 {
+	if len(v) == 0 {
+		return math.NaN()
+	}
+	s := append([]float64(nil), v...)
+	sort.Float64s(s)
+	if len(s)%2 == 1 {
+		return s[len(s)/2]
+	}
+	return (s[len(s)/2-1] + s[len(s)/2]) / 2
 }

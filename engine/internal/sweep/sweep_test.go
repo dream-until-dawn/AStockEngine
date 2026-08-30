@@ -535,3 +535,79 @@ func TestMakeWindowsMinOverride(t *testing.T) {
 		t.Errorf("切出 %d 个窗口，想要 3", len(got))
 	}
 }
+
+// ---- 子树开关 ----
+//
+// 「这棵有效性树值不值得留」是个真问题，而它不是数值轴 ——
+// 要在「挂着这棵子树」与「整棵拿掉」之间切。
+
+func TestExpandSubtreeToggle(t *testing.T) {
+	base := `{
+	  "strategy": {"params": {
+	    "indicators": [{"name":"macd","params":{"short":12}}],
+	    "valid": {"left":{"kind":"ind"},"cmp":"lt","right":{"kind":"value","value":70}}
+	  }},
+	  "exit": [{"impl":"stop_loss","params":{"pct":10}}]
+	}`
+	c := &Config{Grid: map[string]json.RawMessage{
+		// null = 拿掉这棵子树；对象 = 换成另一棵
+		"strategy.params.valid": json.RawMessage(
+			`[null, {"left":{"kind":"ind"},"cmp":"gt","right":{"kind":"value","value":30}}]`),
+		"strategy.params.indicators[0].params.short": json.RawMessage(`[8, 12]`),
+	}}
+	sets, err := c.Expand([]byte(base))
+	if err != nil {
+		t.Fatalf("展开失败: %v", err)
+	}
+	if len(sets) != 4 {
+		t.Fatalf("2 × 2 应当展开成 4 组，得到 %d 组", len(sets))
+	}
+
+	var nullCount, treeCount int
+	for _, s := range sets {
+		var m map[string]any
+		if err := json.Unmarshal(s.Config, &m); err != nil {
+			t.Fatal(err)
+		}
+		p := m["strategy"].(map[string]any)["params"].(map[string]any)
+		if p["valid"] == nil {
+			nullCount++
+		} else {
+			treeCount++
+		}
+	}
+	if nullCount != 2 || treeCount != 2 {
+		t.Errorf("应当各 2 组（拿掉 / 换一棵），得到 null %d / 树 %d",
+			nullCount, treeCount)
+	}
+}
+
+// TestExpandToggleWholeChain 整条 exit / risk 链的有无也能扫。
+//
+// 「带不带止损」本身就是一个轴，而它同样不是数值。
+func TestExpandToggleWholeChain(t *testing.T) {
+	base := `{"exit": [{"impl":"stop_loss","params":{"pct":10}}], "x": 1}`
+	c := &Config{Grid: map[string]json.RawMessage{
+		"exit": json.RawMessage(`[[], [{"impl":"stop_loss","params":{"pct":15}}]]`),
+	}}
+	sets, err := c.Expand([]byte(base))
+	if err != nil {
+		t.Fatalf("展开失败: %v", err)
+	}
+	if len(sets) != 2 {
+		t.Fatalf("应当展开成 2 组，得到 %d 组", len(sets))
+	}
+	var empty, one int
+	for _, s := range sets {
+		var m map[string]any
+		json.Unmarshal(s.Config, &m)
+		if len(m["exit"].([]any)) == 0 {
+			empty++
+		} else {
+			one++
+		}
+	}
+	if empty != 1 || one != 1 {
+		t.Errorf("应当一组无止损、一组有，得到 空 %d / 有 %d", empty, one)
+	}
+}

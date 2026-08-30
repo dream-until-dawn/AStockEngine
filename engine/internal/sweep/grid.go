@@ -103,6 +103,24 @@ type NoiseProbe struct {
 type Gate struct {
 	// MinRoundTrips 完整轮次下限。样本不足时任何统计量都不可信
 	MinRoundTrips int `json:"min_round_trips"`
+
+	// 下面三条拦的是同一类自欺：**这个结果不是策略挣来的**。
+	// 光看收益分不出「策略有边际」「强平替你止损」「熔断替你择时」
+	// 「低摩擦低换手显得稳」这四种情况。
+
+	// MaxLiquidationRatio 强平轮次占总轮次的上限（0 = 不限）。
+	//
+	// 高杠杆下强平相当于一道很紧的止损 —— 实测同一份配置杠杆 1 → 20，
+	// 收益从 +115% 涨到 +202%，而强平从 0 次涨到 139 次。
+	// 那不是杠杆挣的钱，是强平替你砍掉了亏损腿，换个行情就反过来
+	MaxLiquidationRatio float64 `json:"max_liquidation_ratio,omitempty"`
+	// MaxHaltExitRatio 熔断清仓轮次占总轮次的上限（0 = 不限）。
+	// 收益来自风控而不是信号时，换个市场就没了
+	MaxHaltExitRatio float64 `json:"max_halt_exit_ratio,omitempty"`
+	// MaxFrictionRatio 摩擦占初始资金的上限（0 = 不限）。
+	//
+	// 实测 A 股两万本金切 10 份时它是 0.47 —— 那种组比的是费率不是策略
+	MaxFrictionRatio float64 `json:"max_friction_ratio,omitempty"`
 }
 
 // LoadConfig 读一份海选配置。
