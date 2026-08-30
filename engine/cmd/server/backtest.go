@@ -360,10 +360,13 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 		}
 		res.RoundTrips = append(res.RoundTrips, d)
 	}
-	// 虚拟轮次接在真实轮次后面，由前端按 virtual 标记区分。
+	// 虚拟轮次与真实轮次放进**同一张表**，由前端按 virtual 标记区分 ——
+	// 它们要被一起看：「被过滤掉的那些后来怎么样了」只有和真实成交
+	// 并排才读得出来。
 	//
-	// **放进同一张表而不是另开一张**：它们要被一起看 ——
-	// 「被过滤掉的那些后来怎么样了」只有和真实成交并排才读得出来
+	// 排序在下面统一做：**按开仓日**，两者交错。
+	// 全堆在表尾的话，「这一天策略做了什么决定」就得在两段之间来回翻，
+	// 而那正是虚拟轮次唯一的用处
 	for _, vt := range e.VirtualTrips() {
 		d := tripDTO{
 			ID: int32(vt.Instrument), OpenDay: vt.OpenDay, CloseDay: vt.CloseDay,
@@ -376,6 +379,7 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 		}
 		res.RoundTrips = append(res.RoundTrips, d)
 	}
+	sortTripDTOs(res.RoundTrips)
 
 	// ---- 指纹 ----
 	dataFP, _, err := fingerprint.Data(mustAbs(s.DataRoot))
@@ -660,4 +664,31 @@ func julianDay(d int32) int32 {
 	a := y / 100
 	b := 2 - a + a/4
 	return int32(365.25*float64(y+4716)) + int32(30.6001*float64(m+1)) + day + b - 1524
+}
+
+// sortTripDTOs 按**开仓日**排逐轮明细，实仓与虚拟交错。
+//
+// 不按平仓日排：这张表读的是「策略在哪一天做了什么决定、后来怎么样」，
+// 开仓日才是决定发生的时刻。按平仓日排会把同一天开的几笔拆散到表的各处。
+//
+// 后面几级都是为了**定序**：同一天可能有多笔，而虚拟轮次来自策略、
+// 真实轮次来自成交配对，两边的原始顺序不同源 ——
+// 不排死的话同一份配置两次跑出的表不一样。
+func sortTripDTOs(rows []tripDTO) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		a, b := rows[i], rows[j]
+		if a.OpenDay != b.OpenDay {
+			return a.OpenDay < b.OpenDay
+		}
+		if a.CloseDay != b.CloseDay {
+			return a.CloseDay < b.CloseDay
+		}
+		if a.ID != b.ID {
+			return a.ID < b.ID
+		}
+		if a.Short != b.Short {
+			return !a.Short // 多在前
+		}
+		return !a.Virtual && b.Virtual // 同一天同一只，实仓排在虚拟之前
+	})
 }

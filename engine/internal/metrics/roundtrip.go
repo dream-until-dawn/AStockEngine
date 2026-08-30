@@ -217,6 +217,10 @@ func collectOpen(queues map[lotKey][]openLot) map[mktdata.InstrumentID]OpenLeg {
 // **必须定序**：同一天平掉的多笔轮次来自不同队列，而队列存在 map 里，
 // 不排的话同一份配置两次跑出的逐轮明细顺序不同 ——
 // C5 就是在这类地方失守的。
+//
+// 这里排的是**给下游一个确定的顺序**，不是展示顺序。
+// 展示怎么排由调用方决定 —— 服务端把虚拟轮次并进来之后按**开仓日**
+// 重排（见 sortTripDTOs），因为那张表读的是「哪一天做了什么决定」。
 func sortTrips(trips []RoundTrip) {
 	sort.SliceStable(trips, func(i, j int) bool {
 		if trips[i].CloseDay != trips[j].CloseDay {
