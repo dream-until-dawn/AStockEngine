@@ -260,19 +260,33 @@ function CondEditor({
   onWrap: () => void
 }) {
   const cols = columns(cat, inds)
+  // 升 / 降只看左侧与它自己上一根的关系 —— 右侧没有意义，直接不显示。
+  // 留一个用不上的下拉在那里，只会让人以为「右边填什么会影响结果」
+  const unary = (cat.unaryCmps ?? []).includes(node.cmp ?? '')
   return (
     <div className="filters" style={{ marginTop: 4, alignItems: 'center' }}>
       <OperandPick
         value={node.left!} onChange={(o) => onChange({ ...node, left: o })}
         cols={cols} allowValue={false}
       />
-      <select value={node.cmp} onChange={(e) => onChange({ ...node, cmp: e.target.value })}>
+      <select value={node.cmp} onChange={(e) => {
+        const cmp = e.target.value
+        const nextUnary = (cat.unaryCmps ?? []).includes(cmp)
+        // 切到升降就把右侧删掉，切回来补一个默认值 ——
+        // 留着一个用不上的 right 会让配置里多出没人读的字段
+        onChange(nextUnary
+          ? { ...node, cmp, right: undefined }
+          : { ...node, cmp, right: node.right ?? { kind: 'value', value: 0 } })
+      }}>
         {cat.cmps.map((c) => <option key={c.code} value={c.code}>{c.label}</option>)}
       </select>
-      <OperandPick
-        value={node.right!} onChange={(o) => onChange({ ...node, right: o })}
-        cols={cols} allowValue
-      />
+      {!unary && (
+        <OperandPick
+          value={node.right ?? { kind: 'value', value: 0 }}
+          onChange={(o) => onChange({ ...node, right: o })}
+          cols={cols} allowValue
+        />
+      )}
       <button onClick={onWrap} title="把这个条件包进一个条件组">分组</button>
       <button onClick={() => onChange(null)}>删除</button>
     </div>

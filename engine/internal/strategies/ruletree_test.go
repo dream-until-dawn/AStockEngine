@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"testing"
 
+	eng "github.com/dream-until-dawn/AStockEngine/engine/internal/engine"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/indicator"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
 )
 
@@ -135,20 +137,20 @@ func TestRuleTreeRejectsBadIndicatorParams(t *testing.T) {
 func TestCrossNeedsPriorObservation(t *testing.T) {
 	s := NewRuleTree()
 	id := mktdata.InstrumentID(1)
-	// 第一次：差值为正，但没有上一步
-	if s.evalCross(cmpCrossU, +1, "buy", id) {
-		t.Error("第一次观察不该算作上穿")
+	// 第一次：差值为正，但没有上一步 —— 应为「未知」而不是假
+	if got := s.evalCross(cmpCrossU, +1, "buy", id); got != triUnknown {
+		t.Errorf("第一次观察应为「未知」而不是 %v —— 没有上一步就答不上来", got)
 	}
 	// 仍为正 —— 没有穿越
-	if s.evalCross(cmpCrossU, +1, "buy", id) {
+	if triTrue == s.evalCross(cmpCrossU, +1, "buy", id) {
 		t.Error("持续在上方不是上穿")
 	}
 	// 翻到负
-	if s.evalCross(cmpCrossU, -1, "buy", id) {
+	if triTrue == s.evalCross(cmpCrossU, -1, "buy", id) {
 		t.Error("下穿不该报成上穿")
 	}
 	// 再翻回正 —— 这才是上穿
-	if !s.evalCross(cmpCrossU, +1, "buy", id) {
+	if triTrue != s.evalCross(cmpCrossU, +1, "buy", id) {
 		t.Error("由下方翻到上方应算上穿")
 	}
 }
@@ -157,7 +159,7 @@ func TestCrossBelow(t *testing.T) {
 	s := NewRuleTree()
 	id := mktdata.InstrumentID(1)
 	s.evalCross(cmpCrossD, +1, "sell", id)
-	if !s.evalCross(cmpCrossD, -1, "sell", id) {
+	if triTrue != s.evalCross(cmpCrossD, -1, "sell", id) {
 		t.Error("由上方翻到下方应算下穿")
 	}
 }
@@ -171,7 +173,7 @@ func TestCrossIsPerNode(t *testing.T) {
 	id := mktdata.InstrumentID(1)
 	s.evalCross(cmpCrossU, -1, "buy", id)
 	s.evalCross(cmpCrossD, -1, "sell", id)
-	if !s.evalCross(cmpCrossU, +1, "buy", id) {
+	if triTrue != s.evalCross(cmpCrossU, +1, "buy", id) {
 		t.Error("buy 节点应当记得自己的上一步")
 	}
 }
@@ -201,7 +203,7 @@ func TestRuleTreeSnapshotRoundTrip(t *testing.T) {
 		t.Errorf("虚拟持仓没恢复：%v", b.virtual)
 	}
 	// 恢复后再喂一个正值，应当判为上穿（说明 prev=-1 被带过来了）
-	if !b.evalCross(cmpCrossU, +1, "buy", 7) {
+	if triTrue != b.evalCross(cmpCrossU, +1, "buy", 7) {
 		t.Error("穿越状态没恢复")
 	}
 }
@@ -218,5 +220,170 @@ func TestRuleTreeSnapshotIsDeterministic(t *testing.T) {
 	b, _ := s.SnapshotState()
 	if string(a) != string(b) {
 		t.Error("同一状态两次快照的字节不同 —— map 顺序没定序")
+	}
+}
+
+// ---- 三值逻辑 ----
+//
+// 「答不上来」不是「假」。指标预热未完成时条件既不真也不假，
+// 而这个区别在组合里会**改变答案**。第一版把未就绪一律当假，
+// 于是一个长周期指标能把整棵树拖住 —— 哪怕另一支已经确定为真。
+
+// evalNode 是给测试用的求值入口：把一棵树在一个假 ctx 上求值。
+// 用「未声明的指标引用」制造「未知」—— operand 取不到值就是未知。
+// fakeStep 只覆盖 Indicator 一个方法 —— 嵌入接口后其余方法都在，
+// 调用会 panic，而这些测试不该碰它们。碰了就是测试写错了地方。
+type fakeStep struct{ eng.StepContext }
+
+func (fakeStep) Indicator(mktdata.InstrumentID, string) (indicator.Indicator, bool) {
+	return nil, false // 永远取不到 → 引用指标的条件必然「未知」
+}
+
+func evalTri(t *testing.T, n *Node) tri {
+	t.Helper()
+	s := NewRuleTree()
+	ec := &evalCtx{s: s, ctx: fakeStep{}, id: 1}
+	return s.eval(n, ec, "t")
+}
+
+func constCond(v float64, cmp string, r float64) *Node {
+	return &Node{
+		Left:  &Operand{Kind: "value", Value: v},
+		Cmp:   cmp,
+		Right: &Operand{Kind: "value", Value: r},
+	}
+}
+
+// unknownCond 造一个必然「答不上来」的条件：引用一个不存在的指标。
+// 求值时 ctx 为 nil，取不到指标 → 未知。
+func unknownCond() *Node {
+	return &Node{
+		Left:  &Operand{Kind: "value", Value: 1},
+		Cmp:   "gt",
+		Right: &Operand{Kind: "ind", Ind: "nope", Field: "X"},
+	}
+}
+
+func TestTriOrTrueBeatsUnknown(t *testing.T) {
+	// 真 ∨ 未知 = 真（未知那支是什么都不影响）
+	n := &Node{Op: "or", Children: []*Node{constCond(2, "gt", 1), unknownCond()}}
+	if got := evalTri(t, n); got != triTrue {
+		t.Errorf("真 ∨ 未知 应为真，得到 %v", got)
+	}
+}
+
+func TestTriOrFalseWithUnknown(t *testing.T) {
+	// 假 ∨ 未知 = 未知
+	n := &Node{Op: "or", Children: []*Node{constCond(1, "gt", 2), unknownCond()}}
+	if got := evalTri(t, n); got != triUnknown {
+		t.Errorf("假 ∨ 未知 应为未知，得到 %v", got)
+	}
+}
+
+func TestTriAndFalseBeatsUnknown(t *testing.T) {
+	// 假 ∧ 未知 = 假
+	n := &Node{Op: "and", Children: []*Node{constCond(1, "gt", 2), unknownCond()}}
+	if got := evalTri(t, n); got != triFalse {
+		t.Errorf("假 ∧ 未知 应为假，得到 %v", got)
+	}
+}
+
+func TestTriAndTrueWithUnknown(t *testing.T) {
+	// 真 ∧ 未知 = 未知
+	n := &Node{Op: "and", Children: []*Node{constCond(2, "gt", 1), unknownCond()}}
+	if got := evalTri(t, n); got != triUnknown {
+		t.Errorf("真 ∧ 未知 应为未知，得到 %v", got)
+	}
+}
+
+// TestTriNotUnknown 未知取反还是未知。
+func TestTriNotUnknown(t *testing.T) {
+	n := &Node{Op: "not", Children: []*Node{unknownCond()}}
+	if got := evalTri(t, n); got != triUnknown {
+		t.Errorf("¬未知 应为未知，得到 %v", got)
+	}
+}
+
+// TestTriOnlyTrueEmitsSignal 只有确定为真才产生信号，未知与假一样不下单。
+func TestTriOnlyTrueEmitsSignal(t *testing.T) {
+	s := NewRuleTree()
+	ec := &evalCtx{s: s, ctx: fakeStep{}, id: 1}
+	if s.evalTree(unknownCond(), ec, "t") {
+		t.Error("未知不该产生信号")
+	}
+	if s.evalTree(constCond(1, "gt", 2), ec, "t") {
+		t.Error("假不该产生信号")
+	}
+	if !s.evalTree(constCond(2, "gt", 1), ec, "t") {
+		t.Error("真应当产生信号")
+	}
+}
+
+// ---- 升降 ----
+
+// TestTrendRisingFalling 相对上一根是升还是降；**相等视为下降**。
+func TestTrendRisingFalling(t *testing.T) {
+	s := NewRuleTree()
+	id := mktdata.InstrumentID(1)
+	// 第一次没有上一根 —— 未知
+	if got := s.evalTrend(cmpRising, 10, "n", id); got != triUnknown {
+		t.Errorf("第一次应为未知，得到 %v", got)
+	}
+	if got := s.evalTrend(cmpRising, 11, "n", id); got != triTrue {
+		t.Errorf("10 → 11 应为上升，得到 %v", got)
+	}
+	if got := s.evalTrend(cmpRising, 11, "n", id); got != triFalse {
+		t.Errorf("11 → 11 不算上升（相等视为下降），得到 %v", got)
+	}
+}
+
+func TestTrendFallingIncludesEqual(t *testing.T) {
+	s := NewRuleTree()
+	id := mktdata.InstrumentID(1)
+	s.evalTrend(cmpFalling, 10, "n", id)
+	if got := s.evalTrend(cmpFalling, 10, "n", id); got != triTrue {
+		t.Errorf("相等应视为下降，得到 %v", got)
+	}
+	if got := s.evalTrend(cmpFalling, 9, "n", id); got != triTrue {
+		t.Errorf("10 → 9 应为下降，得到 %v", got)
+	}
+	if got := s.evalTrend(cmpFalling, 12, "n", id); got != triFalse {
+		t.Errorf("9 → 12 不是下降，得到 %v", got)
+	}
+}
+
+// TestTrendConfigAcceptsUnaryCmp 升降不需要右侧。
+func TestTrendConfigAcceptsUnaryCmp(t *testing.T) {
+	cfgOK(t, `{`+macdInds+`,
+		"buy":{"left":{"kind":"ind","ind":"macd","field":"DIF"},"cmp":"rising"},
+		"sell":{"left":{"kind":"bar","field":"close"},"cmp":"falling"}}`)
+}
+
+// TestTrendRejectsConstantLeft 常数不会升也不会降。
+func TestTrendRejectsConstantLeft(t *testing.T) {
+	cfgErr(t, `{"indicators":[],
+		"buy":{"left":{"kind":"value","value":1},"cmp":"rising"},
+		"sell":{"left":{"kind":"bar","field":"close"},"cmp":"falling"}}`,
+		"常数不会升也不会降")
+}
+
+// TestPrevSnapshotKeepsZero 取值为 0 的状态不能在快照里被省掉。
+//
+// 键在表里就代表「见过」。省掉 0 会让「见过且当时为 0」退化成「没见过」，
+// 恢复后第一根就误判 —— 而 C6 的实盘每天从快照恢复。
+func TestPrevSnapshotKeepsZero(t *testing.T) {
+	a := NewRuleTree()
+	a.evalTrend(cmpRising, 0, "n", 1) // 记下 0
+	snap, err := a.SnapshotState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := NewRuleTree()
+	if err := b.RestoreState(snap); err != nil {
+		t.Fatal(err)
+	}
+	// 恢复后喂 1：若 0 被省掉，这里会是「未知」而不是「上升」
+	if got := b.evalTrend(cmpRising, 1, "n", 1); got != triTrue {
+		t.Errorf("恢复后 0 → 1 应为上升，得到 %v —— 取值 0 的状态被省掉了", got)
 	}
 }

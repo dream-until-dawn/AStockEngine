@@ -761,6 +761,27 @@ func (e *Engine) Risk() trading.RiskChain { return e.risk }
 // Exits 返回装配的离场规则链。
 func (e *Engine) Exits() trading.ExitChain { return e.exits }
 
+// WarmupReporter 供**能报出预热情况**的策略实现。
+//
+// 预热是逐标的的：MACD(12,26,9) 要 35 根、MA200 要 200 根，
+// 而每只标的从自己上市那天起算。Ready() 已经保证了未就绪的不参与决策，
+// 但此前**没有任何地方把它显示出来** —— 用户只看到「信号少」，
+// 看不出是条件不满足还是指标还没算出来。
+type WarmupReporter interface {
+	Warmup() (evaluated, notReady int)
+}
+
+// Warmup 返回上一步进入决策集合与仍在预热的标的数。
+// ok 为 false 表示当前策略不报这个。
+func (e *Engine) Warmup() (evaluated, notReady int, ok bool) {
+	w, is := e.strategy.(WarmupReporter)
+	if !is {
+		return 0, 0, false
+	}
+	ev, nr := w.Warmup()
+	return ev, nr, true
+}
+
 // Recorder 返回装配的记录器。
 func (e *Engine) Recorder() record.Recorder { return e.rec }
 

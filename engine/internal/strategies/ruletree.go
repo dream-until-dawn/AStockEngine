@@ -39,12 +39,26 @@ type RuleTree struct {
 	// virtual 虚拟持仓集合。**必须跨步保存** ——
 	// 从快照恢复后它归零，被过滤掉的机会会立刻重新触发买入
 	virtual map[mktdata.InstrumentID]bool
-	// crossPrev 各交叉条件上一步的差值符号，按 (节点路径, 标的) 索引。
-	// 没有它就表达不了金叉死叉 —— 而那是最常用的一类条件
-	crossPrev map[crossKey]int8
+	// notReady 上一步里有多少只标的因指标未就绪而没进决策集合。
+	//
+	// **预热是逐标的的**：MACD(12,26,9) 要 35 根、MA200 要 200 根，
+	// 而每只标的从自己上市那天起算。一只上市 30 天的新股在 MA200 的
+	// 策略里就是「还没进决策范围」—— 这本来就由 Ready() 保证，
+	// 但此前**没有任何地方把它显示出来**，用户只看到「信号少」。
+	notReady int
+	// evaluated 上一步实际进入决策集合的标的数
+	evaluated int
+
+	// prev 各**有记忆的条件**上一步的值，按 (节点路径, 标的) 索引。
+	//
+	//   穿越（cross_above / cross_below）存 左−右 的差值
+	//   升降（rising / falling）      存 左侧本身的值
+	//
+	// **键在表里就代表「见过」** —— 0 是合法取值，不能拿它当哨兵。
+	prev map[stateKey]float64
 }
 
-type crossKey struct {
+type stateKey struct {
 	node string
 	id   mktdata.InstrumentID
 }
@@ -100,7 +114,16 @@ const (
 	cmpNE     = "ne"
 	cmpCrossU = "cross_above" // 左侧由下方上穿右侧（金叉）
 	cmpCrossD = "cross_below" // 左侧由上方下穿右侧（死叉）
+	// 升降只看左侧与**它自己上一根**的关系，右侧不用。
+	// **相等视为下降** —— 这是明确定死的口径，不是随手选的：
+	// 留一个「持平」的第三态会让「上升 or 下降」不再覆盖全部情形，
+	// 用户拼出来的树会出现自己想不到的空隙。
+	cmpRising  = "rising"
+	cmpFalling = "falling"
 )
+
+// unaryCmp 报告该比较符只用左侧。
+func unaryCmp(c string) bool { return c == cmpRising || c == cmpFalling }
 
 // BarFields 是可用作条件左右侧的行情列。
 //
@@ -119,8 +142,8 @@ type ruleTreeCfg struct {
 
 func NewRuleTree() *RuleTree {
 	return &RuleTree{
-		virtual:   make(map[mktdata.InstrumentID]bool, 1024),
-		crossPrev: make(map[crossKey]int8, 4096),
+		virtual: make(map[mktdata.InstrumentID]bool, 1024),
+		prev:    make(map[stateKey]float64, 4096),
 	}
 }
 
@@ -210,23 +233,27 @@ func validateNode(n *Node, inds []indSpec, path string) error {
 		return nil
 	}
 	switch n.Cmp {
-	case cmpGT, cmpGTE, cmpLT, cmpLTE, cmpEQ, cmpNE, cmpCrossU, cmpCrossD:
+	case cmpGT, cmpGTE, cmpLT, cmpLTE, cmpEQ, cmpNE,
+		cmpCrossU, cmpCrossD, cmpRising, cmpFalling:
 	default:
 		return fmt.Errorf("%s: 未知的比较符 %q", path, n.Cmp)
 	}
-	for _, o := range []struct {
-		side string
-		o    *Operand
-	}{{"left", n.Left}, {"right", n.Right}} {
-		if err := validateOperand(o.o, inds, path+"."+o.side); err != nil {
-			return err
+	if err := validateOperand(n.Left, inds, path+".left"); err != nil {
+		return err
+	}
+	if unaryCmp(n.Cmp) {
+		if n.Left.Kind == "value" {
+			return fmt.Errorf("%s: 常数不会升也不会降", path)
 		}
+		return nil // 升降只看左侧，不用右侧
+	}
+	if err := validateOperand(n.Right, inds, path+".right"); err != nil {
+		return err
 	}
 	if n.Left.Kind == "value" && n.Right.Kind == "value" {
 		return fmt.Errorf("%s: 两侧都是常数 —— 这个条件的取值与行情无关", path)
 	}
-	if (n.Cmp == cmpCrossU || n.Cmp == cmpCrossD) &&
-		n.Left.Kind == "value" {
+	if (n.Cmp == cmpCrossU || n.Cmp == cmpCrossD) && n.Left.Kind == "value" {
 		return fmt.Errorf("%s: 穿越条件的左侧不能是常数", path)
 	}
 	return nil
@@ -273,7 +300,7 @@ func (s *RuleTree) Init(ic eng.InitContext) error {
 		return fmt.Errorf("rule_tree 尚未配置")
 	}
 	s.virtual = make(map[mktdata.InstrumentID]bool, 1024)
-	s.crossPrev = make(map[crossKey]int8, 4096)
+	s.prev = make(map[stateKey]float64, 4096)
 	for _, in := range s.inds {
 		kind, params := in.Kind, in.Params
 		ic.Use(in.Name, func() indicator.Indicator {
@@ -295,15 +322,12 @@ type evalCtx struct {
 	id  mktdata.InstrumentID
 	// bar 后复权 bar。价格列与指标同基准，否则除权日会凭空穿越
 	bar mktdata.Bar
-	// notReady 求值过程中遇到未就绪的指标时置位。
-	// **未就绪不等于「条件为假」** —— 它是「还答不上来」，
-	// 此时整棵树都不该产生信号，否则回测的前 N 步会出现虚假交易
-	notReady bool
 }
 
 func (s *RuleTree) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 	held, inFlight := holdingSet(ctx)
 	var sigs []eng.Signal
+	s.notReady, s.evaluated = 0, 0
 
 	for _, id := range ctx.Universe() {
 		bar, ok := ctx.Bar(id)
@@ -323,9 +347,18 @@ func (s *RuleTree) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 		// 买入树里的穿越状态就此过期 —— 等到卖掉之后再评估买入，
 		// 拿的是很久以前的 prev，于是凭空多出或漏掉一次穿越。
 		// 这类错不报错、不崩溃，只是信号悄悄不对。
-		buyOK := s.evalTree(s.buy, ec, "buy")
-		validOK := s.evalTree(s.valid, ec, "valid")
-		sellOK := s.evalTree(s.sell, ec, "sell")
+		// 三棵树里只要有一棵**确定不了**，这只标的这一步就不在决策集合里。
+		// 记下来供报告与单步调试展示 —— 否则用户只看到「信号少」，
+		// 看不出是「条件不满足」还是「指标还没预热完」
+		buyTri := s.eval(s.buy, ec, "buy")
+		validTri := s.eval(s.valid, ec, "valid")
+		sellTri := s.eval(s.sell, ec, "sell")
+		if buyTri == triUnknown || validTri == triUnknown || sellTri == triUnknown {
+			s.notReady++
+		} else {
+			s.evaluated++
+		}
+		buyOK, validOK, sellOK := buyTri == triTrue, validTri == triTrue, sellTri == triTrue
 
 		// 求值完了才谈能不能下单。停牌 / 零成交 / 在途单都只影响**下单**，
 		// 不影响上面的状态更新
@@ -368,98 +401,157 @@ func (s *RuleTree) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 	return sigs, nil
 }
 
-// evalTree 求一棵树的值，**未就绪一律当作假**。
+// tri 是三值逻辑：真 / 假 / **还答不上来**。
 //
-// nil 树的语义分两种，由调用方的用法决定：valid 为 nil 时视为恒真
-// （只配了买卖两棵树时行为与普通策略一致），故这里返回 true。
+// 「答不上来」不是「假」。指标预热未完成时条件既不真也不假 ——
+// 而这个区别在**组合**里会改变答案：
+//
+//	A ∨ B，A 为真、B 未知  →  真（B 是什么都不影响）
+//	A ∧ B，A 为假、B 未知  →  假
+//	A ∧ B，A 为真、B 未知  →  未知
+//
+// 第一版把「任一处未就绪」一律当假，于是一个长周期指标会把整棵树拖住，
+// 哪怕另一支已经确定为真。那不是保守，是错的。
+type tri int8
+
+const (
+	triFalse tri = iota
+	triTrue
+	triUnknown
+)
+
+func triOf(b bool) tri {
+	if b {
+		return triTrue
+	}
+	return triFalse
+}
+
+// evalTree 求一棵树的值。**只有确定为真才产生信号** ——
+// 未知与假一样不下单，但两者在组合里的行为不同（见 tri）。
+//
+// nil 树视为恒真：valid 为空时行为与普通的两棵树策略一致。
 func (s *RuleTree) evalTree(n *Node, ec *evalCtx, path string) bool {
 	if n == nil {
 		return true
 	}
-	ec.notReady = false
-	v := s.eval(n, ec, path)
-	// **未就绪不等于「条件为假」，但结果一样是不产生信号。**
-	// 区别在于：为假是「答了，答案是否」，未就绪是「还答不上来」。
-	// 两者都不该下单，而预热期内下单会让回测的前 N 步出现虚假交易
-	return v && !ec.notReady
+	return s.eval(n, ec, path) == triTrue
 }
 
-// eval 求一棵树的值。path 用于给交叉条件定位状态槽。
-func (s *RuleTree) eval(n *Node, ec *evalCtx, path string) bool {
+// eval 求一棵树的值。path 用于给**有记忆的条件**（穿越 / 升降）定位状态槽。
+//
+// **两种组合都不短路**：有记忆的条件要每步更新自己的 prev，
+// 短路掉的分支下次就会拿一个过期的值去比，判定随之错乱。
+func (s *RuleTree) eval(n *Node, ec *evalCtx, path string) tri {
 	if n == nil {
-		return true
+		return triTrue
 	}
 	switch n.Op {
 	case "and":
+		res := triTrue
 		for i, c := range n.Children {
-			if !s.eval(c, ec, fmt.Sprintf("%s.%d", path, i)) {
-				return false
+			switch s.eval(c, ec, fmt.Sprintf("%s.%d", path, i)) {
+			case triFalse:
+				res = triFalse
+			case triUnknown:
+				if res != triFalse {
+					res = triUnknown
+				}
 			}
 		}
-		return true
+		return res
 	case "or":
-		// **不短路**：交叉条件要每步更新自己的 prev，
-		// 短路掉的分支下次就会拿一个过期的 prev 去比，穿越判定随之错乱
-		res := false
+		res := triFalse
 		for i, c := range n.Children {
-			if s.eval(c, ec, fmt.Sprintf("%s.%d", path, i)) {
-				res = true
+			switch s.eval(c, ec, fmt.Sprintf("%s.%d", path, i)) {
+			case triTrue:
+				res = triTrue
+			case triUnknown:
+				if res != triTrue {
+					res = triUnknown
+				}
 			}
 		}
 		return res
 	case "not":
-		return !s.eval(n.Children[0], ec, path+".0")
+		switch s.eval(n.Children[0], ec, path+".0") {
+		case triTrue:
+			return triFalse
+		case triFalse:
+			return triTrue
+		}
+		return triUnknown
 	}
 	return s.evalCond(n, ec, path)
 }
 
-func (s *RuleTree) evalCond(n *Node, ec *evalCtx, path string) bool {
+func (s *RuleTree) evalCond(n *Node, ec *evalCtx, path string) tri {
 	l, okL := ec.operand(n.Left)
+	if !okL {
+		return triUnknown
+	}
+	if unaryCmp(n.Cmp) {
+		return s.evalTrend(n.Cmp, l, path, ec.id)
+	}
 	r, okR := ec.operand(n.Right)
-	if !okL || !okR {
-		ec.notReady = true
-		return false
+	if !okR {
+		return triUnknown
 	}
 	switch n.Cmp {
 	case cmpGT:
-		return l > r
+		return triOf(l > r)
 	case cmpGTE:
-		return l >= r
+		return triOf(l >= r)
 	case cmpLT:
-		return l < r
+		return triOf(l < r)
 	case cmpLTE:
-		return l <= r
+		return triOf(l <= r)
 	case cmpEQ:
-		return l == r
+		return triOf(l == r)
 	case cmpNE:
-		return l != r
+		return triOf(l != r)
 	case cmpCrossU, cmpCrossD:
 		return s.evalCross(n.Cmp, l-r, path, ec.id)
 	}
-	return false
+	return triFalse
+}
+
+// evalTrend 判定「相对上一根 bar 是升还是降」。
+//
+// **相等视为下降**（口径定死，见 cmpRising 的注释）。
+// 第一次见到该标的时返回未知 —— 没有上一根就谈不上升降。
+func (s *RuleTree) evalTrend(cmp string, v float64, path string, id mktdata.InstrumentID) tri {
+	k := stateKey{node: path, id: id}
+	prev, seen := s.prev[k]
+	s.prev[k] = v
+	if !seen {
+		return triUnknown
+	}
+	if cmp == cmpRising {
+		return triOf(v > prev)
+	}
+	return triOf(v <= prev)
 }
 
 // evalCross 判定穿越：看差值的符号是否从一侧翻到另一侧。
 //
 // **第一次见到该标的时恒为假** —— 没有上一步就谈不上「穿过」。
 // 这与指标预热同理：答不上来时不产生信号，而不是猜一个。
-func (s *RuleTree) evalCross(cmp string, diff float64, path string, id mktdata.InstrumentID) bool {
-	k := crossKey{node: path, id: id}
-	cur := int8(0)
-	if diff > 0 {
-		cur = 1
-	} else if diff < 0 {
-		cur = -1
+func (s *RuleTree) evalCross(cmp string, diff float64, path string, id mktdata.InstrumentID) tri {
+	k := stateKey{node: path, id: id}
+	prev, seen := s.prev[k]
+	s.prev[k] = diff
+	if !seen {
+		return triUnknown
 	}
-	prev, seen := s.crossPrev[k]
-	s.crossPrev[k] = cur
-	if !seen || prev == 0 || cur == 0 {
-		return false
+	if prev == 0 || diff == 0 {
+		// 恰好相等的那一根既算不上穿过也算不上没穿过，等下一根再说
+		return triFalse
 	}
 	if cmp == cmpCrossU {
-		return prev < 0 && cur > 0
+		return triOf(prev < 0 && diff > 0)
 	}
-	return prev > 0 && cur < 0
+	return triOf(prev > 0 && diff < 0)
 }
 
 // operand 取一侧的值。ok 为 false 表示「还答不上来」（指标未就绪）。
@@ -511,14 +603,14 @@ func barField(b mktdata.Bar, f string) float64 {
 // ---- 跨步状态 ----
 
 type ruleTreeState struct {
-	Virtual []int32         `json:"virtual"`
-	Cross   map[string]int8 `json:"cross"`
+	Virtual []int32            `json:"virtual"`
+	Prev    map[string]float64 `json:"prev"`
 }
 
 func (s *RuleTree) SnapshotState() ([]byte, error) {
 	st := ruleTreeState{
 		Virtual: make([]int32, 0, len(s.virtual)),
-		Cross:   make(map[string]int8, len(s.crossPrev)),
+		Prev:    make(map[string]float64, len(s.prev)),
 	}
 	for id := range s.virtual {
 		st.Virtual = append(st.Virtual, int32(id))
@@ -526,11 +618,10 @@ func (s *RuleTree) SnapshotState() ([]byte, error) {
 	// 排序：map 遍历顺序随机，不排的话同一状态会序列化出不同字节，
 	// 而快照本身会进指纹（C5）
 	sort.Slice(st.Virtual, func(i, j int) bool { return st.Virtual[i] < st.Virtual[j] })
-	for k, v := range s.crossPrev {
-		if v == 0 {
-			continue // 0 是「无方向」，省体积
-		}
-		st.Cross[fmt.Sprintf("%s|%d", k.node, int32(k.id))] = v
+	// **不能省略取值为 0 的项**：键在表里就代表「见过」，
+	// 省掉 0 会让「见过且当时为 0」退化成「没见过」，恢复后第一根就误判
+	for k, v := range s.prev {
+		st.Prev[fmt.Sprintf("%s|%d", k.node, int32(k.id))] = v
 	}
 	return json.Marshal(st)
 }
@@ -544,23 +635,32 @@ func (s *RuleTree) RestoreState(b []byte) error {
 	for _, id := range st.Virtual {
 		s.virtual[mktdata.InstrumentID(id)] = true
 	}
-	s.crossPrev = make(map[crossKey]int8, len(st.Cross))
-	for k, v := range st.Cross {
+	s.prev = make(map[stateKey]float64, len(st.Prev))
+	for k, v := range st.Prev {
 		i := strings.LastIndex(k, "|")
 		if i < 0 {
-			return fmt.Errorf("快照中的交叉状态键 %q 格式不对", k)
+			return fmt.Errorf("快照中的状态键 %q 格式不对", k)
 		}
 		var id int32
 		if _, err := fmt.Sscan(k[i+1:], &id); err != nil {
 			return fmt.Errorf("快照中的标的 ID %q 无法解析: %w", k[i+1:], err)
 		}
-		s.crossPrev[crossKey{node: k[:i], id: mktdata.InstrumentID(id)}] = v
+		s.prev[stateKey{node: k[:i], id: mktdata.InstrumentID(id)}] = v
 	}
 	return nil
 }
 
 // VirtualCount 返回当前虚拟持仓数，供单步调试展示。
 func (s *RuleTree) VirtualCount() int { return len(s.virtual) }
+
+// Warmup 返回上一步「进了决策集合」与「指标未就绪」的标的数。
+//
+// **预热是逐标的的**：MACD(12,26,9) 要 35 根、MA200 要 200 根，
+// 每只标的从自己上市那天起算。一只上市 30 天的新股在 MA200 的策略里
+// 就是还没进决策范围 —— 这由 Ready() 保证，但要能看见才有意义。
+func (s *RuleTree) Warmup() (evaluated, notReady int) {
+	return s.evaluated, s.notReady
+}
 
 var (
 	_ eng.Strategy         = (*RuleTree)(nil)

@@ -213,28 +213,33 @@ func (ev stepEvent) quiet() bool {
 
 // sessionState 是「现在停在哪儿、账上什么样」。
 type sessionState struct {
-	ID          string        `json:"id"`
-	Name        string        `json:"name"`
-	Step        int           `json:"step"`
-	TotalSteps  int           `json:"totalSteps"`
-	Day         int32         `json:"day"`
-	FirstDay    int32         `json:"firstDay"`
-	LastDay     int32         `json:"lastDay"`
-	Done        bool          `json:"done"`
-	Started     bool          `json:"started"`
-	Universe    int           `json:"universe"`
-	Equity      int64         `json:"equity"`
-	Cash        int64         `json:"cash"`
-	Initial     int64         `json:"initial"`
-	Peak        int64         `json:"peak"`
-	Realized    int64         `json:"realized"`
-	Fee         int64         `json:"fee"`
-	Slippage    int64         `json:"slippage"`
-	Holdings    []positionDTO `json:"holdings"`
-	Pending     []pendingDTO  `json:"pending"`
-	Indicators  []string      `json:"indicators"`
-	Warnings    []string      `json:"warnings,omitempty"`
-	Disclosures []string      `json:"disclosures,omitempty"`
+	ID         string        `json:"id"`
+	Name       string        `json:"name"`
+	Step       int           `json:"step"`
+	TotalSteps int           `json:"totalSteps"`
+	Day        int32         `json:"day"`
+	FirstDay   int32         `json:"firstDay"`
+	LastDay    int32         `json:"lastDay"`
+	Done       bool          `json:"done"`
+	Started    bool          `json:"started"`
+	Universe   int           `json:"universe"`
+	Equity     int64         `json:"equity"`
+	Cash       int64         `json:"cash"`
+	Initial    int64         `json:"initial"`
+	Peak       int64         `json:"peak"`
+	Realized   int64         `json:"realized"`
+	Fee        int64         `json:"fee"`
+	Slippage   int64         `json:"slippage"`
+	Holdings   []positionDTO `json:"holdings"`
+	Pending    []pendingDTO  `json:"pending"`
+	Indicators []string      `json:"indicators"`
+	// Evaluated / NotReady 上一步进入决策集合、以及仍在预热的标的数。
+	// **预热是逐标的的**，看不到它就分不清「条件不满足」与「还没算出来」
+	Evaluated   int      `json:"evaluated"`
+	NotReady    int      `json:"notReady"`
+	HasWarmup   bool     `json:"hasWarmup"`
+	Warnings    []string `json:"warnings,omitempty"`
+	Disclosures []string `json:"disclosures,omitempty"`
 }
 
 // ---- 会话内部：把引擎状态翻译成 DTO ----
@@ -297,6 +302,7 @@ func (s *Store) state(sess *Session) sessionState {
 	if tp, ok := e.Now(); ok {
 		st.Day = tp.TradingDay
 	}
+	st.Evaluated, st.NotReady, st.HasWarmup = e.Warmup()
 	if tp, ok := e.PeekAt(0); ok {
 		st.FirstDay = tp.TradingDay
 	}

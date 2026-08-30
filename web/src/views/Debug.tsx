@@ -334,7 +334,22 @@ function Account({ state: s }: { state: SessionState }) {
         <Stat k="已实现" v={money(s.realized)} />
         <Stat k="费用" v={money(s.fee)} sub={`滑点 ${money(s.slippage)}`} />
         <Stat k="峰值回撤" v={`${(dd * 100).toFixed(2)}%`} sub={`峰值 ${money(s.peak)}`} />
+        {s.hasWarmup && (
+          <Stat
+            k="决策集合"
+            v={`${fmtNum(s.evaluated ?? 0)} 只`}
+            sub={`${fmtNum(s.notReady ?? 0)} 只指标未就绪`}
+          />
+        )}
       </div>
+      {s.hasWarmup && (s.notReady ?? 0) > 0 && (
+        <p className="note">
+          <strong>预热是逐标的的</strong>：MACD(12,26,9) 要 35 根、MA200 要 200 根，
+          而每只标的从<strong>自己上市那天</strong>起算。
+          上面那 {fmtNum(s.notReady ?? 0)} 只还没攒够 bar，这一步不参与决策 ——
+          不是条件不满足，是还答不上来。
+        </p>
+      )}
       {!!s.warnings?.length && s.warnings.slice(0, 3).map((w, i) => (
         <p className="note" key={i}>⚠ {w}</p>
       ))}

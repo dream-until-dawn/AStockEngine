@@ -90,6 +90,8 @@ func (s *Store) handleModules(w http.ResponseWriter, _ *http.Request) {
 		// 前端抄一份就会分叉
 		"barFields": strategies.BarFields,
 		"cmps":      cmpCatalog(),
+		// 只用左侧的比较符，界面据此隐藏右侧下拉
+		"unaryCmps": unaryCmps(),
 		// 下面几个不是 registry 里的模块，但表单要用到它们的取值域。
 		// 放在同一个响应里，前端就只需要一次请求
 		"enums": map[string]any{
@@ -236,5 +238,12 @@ func cmpCatalog() []map[string]string {
 		{"code": "ne", "label": "不等于"},
 		{"code": "cross_above", "label": "上穿（金叉）"},
 		{"code": "cross_below", "label": "下穿（死叉）"},
+		// 升降只看左侧与它自己上一根的关系，右侧不用。
+		// **相等视为下降** —— 口径定死，免得「上升 or 下降」漏掉持平那一档
+		{"code": "rising", "label": "较上一根上升"},
+		{"code": "falling", "label": "较上一根下降（含持平）"},
 	}
 }
+
+// UnaryCmps 只用左侧的比较符，界面据此隐藏右侧。
+func unaryCmps() []string { return []string{"rising", "falling"} }

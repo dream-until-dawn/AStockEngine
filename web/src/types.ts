@@ -338,6 +338,10 @@ export interface SessionState {
   done: boolean; started: boolean; universe: number
   equity: number; cash: number; initial: number; peak: number
   realized: number; fee: number; slippage: number
+  /** 上一步进入决策集合、以及仍在预热的标的数 */
+  evaluated?: number
+  notReady?: number
+  hasWarmup?: boolean
   holdings: DbgPosition[]
   pending: DbgPending[]
   indicators: string[]
@@ -428,6 +432,8 @@ export interface ModuleCatalog {
   barFields: string[]
   /** 比较符及其中文名 */
   cmps: { code: string; label: string }[]
+  /** 只用左侧的比较符（升 / 降），界面据此隐藏右侧 */
+  unaryCmps: string[]
 }
 
 /** 配置里的一个模块槽位：选一个实现 + 给它一段参数。 */
