@@ -106,13 +106,31 @@ export default function ConfigBuilder({
         </p>
       </Section>
 
-      <Section title={`风控链 · ${(cfg.risk ?? []).length} 条`}>
-        <RiskChain
+      <Section title={`离场规则 · ${(cfg.exit ?? []).length} 条 · 止损 / 止盈`}>
+        <RuleChain
+          list={cat.exit}
+          value={(cfg.exit ?? []) as ModuleValue[]}
+          onChange={(v) => set('exit', v)}
+          note={cat.notes.exit}
+          empty="没有离场规则 —— 只有策略自己发的卖出信号能平仓。"
+          addLabel="+ 加一条离场规则"
+        />
+      </Section>
+
+      <Section title={`风控链 · ${(cfg.risk ?? []).length} 条 · 开仓限制`}>
+        <RuleChain
           list={cat.risk}
           value={(cfg.risk ?? []) as ModuleValue[]}
           onChange={(v) => set('risk', v)}
           note={cat.notes.risk}
+          empty="没有风控规则 —— 订单不受拦截。"
+          addLabel="+ 加一条风控规则"
         />
+        <p className="note">
+          注意 <code>drawdown_halt</code> 是<strong>账户级</strong>的：
+          从峰值权益回撤到阈值后<strong>停止开新仓</strong>，
+          它<strong>不会平掉已有持仓</strong>。逐仓的止损止盈在上面那一段。
+        </p>
       </Section>
 
       <Section title="撮合与成本">
@@ -484,20 +502,22 @@ function rangeLabel(from?: number, to?: number): string {
   return `${f} ~ ${t}`
 }
 
-// ---- 风控链 ----
+// ---- 规则链（风控与离场共用）----
 
-function RiskChain({
-  list, value, onChange, note,
+function RuleChain({
+  list, value, onChange, note, empty, addLabel,
 }: {
   list: ModuleSpec[]
   value: ModuleValue[]
   onChange: (v: ModuleValue[]) => void
   note?: string
+  empty: string
+  addLabel: string
 }) {
   return (
     <>
       {note && <p className="note">{note}</p>}
-      {value.length === 0 && <p className="note">没有风控规则 —— 订单不受拦截。</p>}
+      {value.length === 0 && <p className="note">{empty}</p>}
       {value.map((r, i) => (
         <div key={i} style={{
           border: '1px solid var(--border)', borderRadius: 4,
@@ -527,7 +547,7 @@ function RiskChain({
       <button style={{ marginTop: 8 }} onClick={() => {
         const m = list[0]
         onChange([...value, { impl: m.name, params: defaults(m.specs) }])
-      }}>+ 加一条规则</button>
+      }}>{addLabel}</button>
     </>
   )
 }

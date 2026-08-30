@@ -59,6 +59,7 @@ type Engine struct {
 	sizer    trading.Sizer
 	risk     trading.RiskChain
 	rec      record.Recorder
+	exits    trading.ExitChain
 	cfg      Config
 
 	factories  map[string]IndicatorFactory
@@ -110,6 +111,11 @@ type Deps struct {
 	Sizer trading.Sizer
 	// Risk 缺省为空链（不拦截）
 	Risk trading.RiskChain
+	// Exits 离场规则链（止损 / 止盈 / 移动止损）。缺省为空链。
+	//
+	// 它是**第三类决策来源**，与策略并列而非从属：策略产生 alpha，
+	// 离场规则做风险管理。排在策略之前，且信号会覆盖策略在同一标的上的判断
+	Exits trading.ExitChain
 	// Recorder 缺省为 summary 级内存记录器。
 	//
 	// **记录由引擎发起而不是由驱动方发起**：单步驱动、批量海选、实盘增量
@@ -145,7 +151,7 @@ func New(d Deps, s Strategy, cfg Config) (*Engine, error) {
 	e := &Engine{
 		col: d.Columns, cur: mktdata.NewCursor(d.Columns), adj: d.Adjuster,
 		uni: d.Universe, corp: d.CorpAct, broker: d.Broker, market: d.Market,
-		led: d.Ledger, strategy: s, sizer: d.Sizer, risk: d.Risk,
+		led: d.Ledger, strategy: s, sizer: d.Sizer, risk: d.Risk, exits: d.Exits,
 		rec: d.Recorder, cfg: cfg,
 		factories:  make(map[string]IndicatorFactory),
 		indicators: make(map[string]map[mktdata.InstrumentID]indicator.Indicator),
@@ -260,15 +266,23 @@ func (e *Engine) Step() (mktdata.TimePoint, error) {
 		e.peakEquity = e.stepEquity
 	}
 
-	// 6~8 只在 TradeFrom 之后执行。预热期照常走完 2~5
+	// 5.5~8 只在 TradeFrom 之后执行。预热期照常走完 2~5
 	// （指标、公司行动、撮合、重估）—— 撮合也要走，否则预热期跨过来的
 	// 在途单会永远挂着
 	if e.cfg.TradeFrom == 0 || tp.TradingDay >= e.cfg.TradeFrom {
+		// 5.5 离场规则 —— **在策略之前**。
+		//
+		// 止损必须压过策略的判断：策略说「继续持有」时止损也要能平掉。
+		// 靠合并顺序来保证优先级太脆弱，所以直接排在前面，
+		// 并在下面显式覆盖策略在同一标的上的信号
+		exitSigs := e.exits.OnStep(e.ctx)
+
 		// 6. 策略 —— 只出信号
 		sigs, err := e.strategy.OnBar(e.ctx)
 		if err != nil {
 			return tp, fmt.Errorf("策略在 %d 报错: %w", tp.TradingDay, err)
 		}
+		sigs = mergeExits(exitSigs, sigs)
 		e.signals = append(e.signals, sigs...)
 
 		// 7. Sizer 折算数量
@@ -288,6 +302,32 @@ func (e *Engine) Step() (mktdata.TimePoint, error) {
 		Signals: e.signals, Sized: e.sized, Fills: e.fills, Rejections: e.rejects,
 	})
 	return tp, nil
+}
+
+// mergeExits 把离场信号排在前面，并**丢掉策略在同一标的上的信号**。
+//
+// 不丢的话会出现两种荒唐情形：策略当天要加仓、止损当天要清仓，
+// 两张单一起进 Sizer；或者策略也发了卖出，于是同一只标的被下两次卖单，
+// 第二张必然因无券可卖被拒。
+//
+// **离场赢**。这就是把它排在策略之前的全部意义。
+func mergeExits(exits, sigs []Signal) []Signal {
+	if len(exits) == 0 {
+		return sigs
+	}
+	blocked := make(map[mktdata.InstrumentID]bool, len(exits))
+	for _, s := range exits {
+		blocked[s.Instrument] = true
+	}
+	out := make([]Signal, 0, len(exits)+len(sigs))
+	out = append(out, exits...)
+	for _, s := range sigs {
+		if blocked[s.Instrument] {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // applyCorporateActions 处理当日的分红送配。
@@ -478,6 +518,10 @@ type snapshot struct {
 	Pending []trading.PendingOrder `json:"pending"`
 	// Strategy 策略自身的跨步状态。实现 StatefulStrategy 的策略才有。
 	Strategy []byte `json:"strategy,omitempty"`
+	// Exits 离场规则链的跨步状态。移动止损的峰值在这里 ——
+	// 不存的话，从快照恢复后峰值归零，移动止损**静默失效**：
+	// 不报错、不异常，只是再也不会触发
+	Exits []byte `json:"exits,omitempty"`
 	// ResultHash 输出指纹的滚动哈希状态。
 	//
 	// 不存的话，从快照恢复后继续跑出来的指纹会缺掉快照之前的全部成交 ——
@@ -508,6 +552,13 @@ func (e *Engine) Snapshot() ([]byte, error) {
 			return nil, fmt.Errorf("策略状态快照失败: %w", err)
 		}
 		s.Strategy = b
+	}
+	if len(e.exits) > 0 {
+		b, err := e.exits.SnapshotState()
+		if err != nil {
+			return nil, fmt.Errorf("离场规则状态快照失败: %w", err)
+		}
+		s.Exits = b
 	}
 	for _, key := range e.keys {
 		m := make(map[string]indicator.State, len(e.indicators[key]))
@@ -564,6 +615,11 @@ func (e *Engine) Restore(data []byte) error {
 		}
 		if err := ss.RestoreState(s.Strategy); err != nil {
 			return fmt.Errorf("恢复策略状态失败: %w", err)
+		}
+	}
+	if len(e.exits) > 0 {
+		if err := e.exits.RestoreState(s.Exits); err != nil {
+			return fmt.Errorf("恢复离场规则状态失败: %w", err)
 		}
 	}
 	return nil
@@ -660,6 +716,7 @@ var (
 	_ StepContext         = (*stepCtx)(nil)
 	_ trading.SizeContext = (*stepCtx)(nil)
 	_ trading.RiskContext = (*stepCtx)(nil)
+	_ trading.ExitContext = (*stepCtx)(nil)
 )
 
 // ---- 本步中间产物 ----
@@ -681,6 +738,9 @@ func (e *Engine) Sizer() trading.Sizer { return e.sizer }
 
 // Risk 返回装配的风控链。
 func (e *Engine) Risk() trading.RiskChain { return e.risk }
+
+// Exits 返回装配的离场规则链。
+func (e *Engine) Exits() trading.ExitChain { return e.exits }
 
 // Recorder 返回装配的记录器。
 func (e *Engine) Recorder() record.Recorder { return e.rec }

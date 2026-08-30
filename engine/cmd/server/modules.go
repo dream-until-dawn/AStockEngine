@@ -77,6 +77,7 @@ func (s *Store) handleModules(w http.ResponseWriter, _ *http.Request) {
 		"strategy": collect(eng.Strategies.Names(), eng.Strategies.Specs, eng.Strategies.Desc),
 		"sizer":    collect(trading.Sizers.Names(), trading.Sizers.Specs, trading.Sizers.Desc),
 		"risk":     collect(trading.Risks.Names(), trading.Risks.Specs, trading.Risks.Desc),
+		"exit":     collect(trading.Exits.Names(), trading.Exits.Specs, trading.Exits.Desc),
 		"slippage": collect(trading.Slippages.Names(), trading.Slippages.Specs, trading.Slippages.Desc),
 		"fee":      collect(trading.Fees.Names(), trading.Fees.Specs, trading.Fees.Desc),
 		"market":   collect(trading.Markets.Names(), trading.Markets.Specs, trading.Markets.Desc),
@@ -105,6 +106,11 @@ func (s *Store) handleModules(w http.ResponseWriter, _ *http.Request) {
 				"且不可复现（C5）。前复权只允许出现在展示路径上。",
 			"risk": "风控是一条链：多条规则顺序执行，任一条拒绝即拒绝，" +
 				"通过的订单可被前一条缩量后传给下一条。顺序有意义。",
+			"exit": "离场规则「产生」卖单，风控只「过滤」订单 —— 两者形状不同，" +
+				"所以止损塞不进风控链。离场规则排在策略之前，" +
+				"它发出的信号会覆盖策略在同一标的上的判断：" +
+				"策略说「继续持有」时止损也要能平掉。" +
+				"同一标的只发一次信号，靠前的规则赢。",
 		},
 	})
 }

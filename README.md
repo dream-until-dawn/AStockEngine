@@ -167,6 +167,7 @@ docs/          设计文档
 | [WEB.md](docs/WEB.md) | 数据核对台：接口、五个视图、七条设计决策 |
 | [DESIGN-v0.3-assembly.md](docs/DESIGN-v0.3-assembly.md) | 模块化装配：registry、Sizer/Risk、Metrics 的三个坑、结果指纹 |
 | [DESIGN-v0.5-selection.md](docs/DESIGN-v0.5-selection.md) | 策略海选：**噪声基线 19 个百分点**、为什么单点收益率不可比、高原判定 |
+| [DESIGN-v0.6-exit.md](docs/DESIGN-v0.6-exit.md) | 离场规则：止损/止盈/移动止损，以及**为什么它塞不进风控链** |
 | [DESIGN-v0.2-dataflow.md](docs/DESIGN-v0.2-dataflow.md) | 行情数据流设计评审 |
 | [DESIGN-v0.2-trading.md](docs/DESIGN-v0.2-trading.md) | 交易语义设计评审 |
 | [probe/REPORT-v0.0.md](docs/probe/REPORT-v0.0.md) | 技术选型的实测依据 |

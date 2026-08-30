@@ -415,6 +415,8 @@ export interface ModuleCatalog {
   strategy: ModuleSpec[]
   sizer: ModuleSpec[]
   risk: ModuleSpec[]
+  /** 离场规则：止损 / 止盈 / 移动止损。与 risk 是两类东西 */
+  exit: ModuleSpec[]
   slippage: ModuleSpec[]
   fee: ModuleSpec[]
   market: ModuleSpec[]

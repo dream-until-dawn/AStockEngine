@@ -121,13 +121,19 @@ type RecorderCfg struct {
 
 // Config 是一次运行的完整描述。
 type Config struct {
-	Name      string       `json:"name,omitempty"`
-	Data      Data         `json:"data"`
-	Market    Module       `json:"market"`
-	Fee       Module       `json:"fee"`
-	Slippage  Module       `json:"slippage"`
-	Sizer     Module       `json:"sizer"`
-	Risk      []Module     `json:"risk,omitempty"`
+	Name     string   `json:"name,omitempty"`
+	Data     Data     `json:"data"`
+	Market   Module   `json:"market"`
+	Fee      Module   `json:"fee"`
+	Slippage Module   `json:"slippage"`
+	Sizer    Module   `json:"sizer"`
+	Risk     []Module `json:"risk,omitempty"`
+	// Exit 离场规则链：止损 / 止盈 / 移动止损。
+	//
+	// **与 risk 是两回事**：risk 过滤订单（只能拦截或缩量），
+	// exit 产生订单（平掉已有持仓）。止损塞不进 risk，
+	// 因为 Risk.Check 的形状是「订单进、订单出」
+	Exit      []Module     `json:"exit,omitempty"`
 	Broker    BrokerCfg    `json:"broker"`
 	Portfolio PortfolioCfg `json:"portfolio"`
 	Engine    EngineCfg    `json:"engine"`
@@ -319,6 +325,11 @@ func (c *Config) dryBuild() error {
 	for i, r := range c.Risk {
 		if _, err := trading.Risks.Build(r.Impl, r.Params); err != nil {
 			return fmt.Errorf("risk[%d]: %w", i, err)
+		}
+	}
+	for i, r := range c.Exit {
+		if _, err := trading.Exits.Build(r.Impl, r.Params); err != nil {
+			return fmt.Errorf("exit[%d]: %w", i, err)
 		}
 	}
 	if c.Strategy.Impl != compositeImpl {

@@ -262,6 +262,14 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 		}
 		chain = append(chain, rr)
 	}
+	exits := make(trading.ExitChain, 0, len(c.Exit))
+	for i, r := range c.Exit {
+		er, err := trading.Exits.Build(r.Impl, r.Params)
+		if err != nil {
+			return nil, fmt.Errorf("exit[%d]: %w", i, err)
+		}
+		exits = append(exits, er)
+	}
 	strat, params, err := buildStrategy(c.Strategy)
 	if err != nil {
 		return nil, err
@@ -290,6 +298,7 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 		Ledger: trading.NewPortfolio(c.Portfolio.InitialCashCents),
 		Sizer:  sizer,
 		Risk:   chain,
+		Exits:  exits,
 	}, strat, eng.Config{
 		Params:               params,
 		IndicatorAdjMode:     adjMode,
@@ -532,6 +541,11 @@ func (c *Config) Describe(e *eng.Engine, ds *DataSet, load time.Duration) []stri
 	if len(risks) > 0 {
 		riskStr = strings.Join(risks, " → ")
 	}
+	exits := e.Exits().Names()
+	exitStr := "无"
+	if len(exits) > 0 {
+		exitStr = strings.Join(exits, " → ")
+	}
 	name := c.Name
 	if name == "" {
 		name = "(未命名)"
@@ -546,6 +560,7 @@ func (c *Config) Describe(e *eng.Engine, ds *DataSet, load time.Duration) []stri
 		fmt.Sprintf("策略    %s %s", c.Strategy.Impl, rawOrEmpty(c.Strategy.Params)),
 		fmt.Sprintf("仓位    %s %s", c.Sizer.Impl, rawOrEmpty(c.Sizer.Params)),
 		fmt.Sprintf("风控    %s", riskStr),
+		fmt.Sprintf("离场    %s", exitStr),
 		fmt.Sprintf("市场    %s   费率 %s   滑点 %s %s",
 			c.Market.Impl, c.Fee.Impl, c.Slippage.Impl, rawOrEmpty(c.Slippage.Params)),
 		fmt.Sprintf("撮合    成交量上限 %.2f%%  部分成交 %v",
