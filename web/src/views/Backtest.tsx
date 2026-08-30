@@ -1,11 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import { fmtCompact, fmtDay, fmtNum, runApi } from '../api'
 import EquityChart from '../components/EquityChart'
-import UniversePicker from '../components/UniversePicker'
+import ConfigBuilder from '../components/ConfigBuilder'
 import { DataTable, ErrBox, Loading, downloadCSV, type Col } from '../components/ui'
 import { getRun, setRun } from '../runStore'
 import type {
-  ConfigItem, Meta, RoundTrip, RunFill, RunReject, RunResult, UniverseSpec,
+  ConfigItem, Meta, RoundTrip, RunFill, RunReject, RunResult,
 } from '../types'
 
 // 回测结果视图。**只看跑完的结果，不做单步** —— 单步驱动、会话、
@@ -71,12 +71,9 @@ export default function Backtest({ meta }: { meta: Meta }) {
   } catch {
     parsed = null
   }
-  const universe: UniverseSpec = parsed?.data?.universe ?? {}
-  const setUniverse = (u: UniverseSpec) => {
-    if (!parsed) return
-    const next = { ...parsed, data: { ...parsed.data, universe: u } }
-    setText(JSON.stringify(next, null, 2))
-  }
+  // 装配器与 JSON 编辑器是同一份数据的两个视图：
+  // 装配器改完，整份写回 text；text 是唯一真相
+  const setCfg = (next: Record<string, any>) => setText(JSON.stringify(next, null, 2))
 
   return (
     <>
@@ -102,19 +99,19 @@ export default function Backtest({ meta }: { meta: Meta }) {
             {busy ? '跑着…' : '跑'}
           </button>
           <button onClick={() => setPickUni(!pickUni)}>
-            {pickUni ? '收起标的池' : '选标的池'}
+            {pickUni ? '收起装配' : '装配 / 改参数'}
           </button>
           <button onClick={() => setEditing(!editing)}>
-            {editing ? '收起配置' : '改参数'}
+            {editing ? '收起 JSON' : '看 JSON'}
           </button>
         </div>
 
         {pickUni && (
           <div style={{ marginTop: 12, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
             {parsed ? (
-              <UniversePicker value={universe} onChange={setUniverse} meta={meta} />
+              <ConfigBuilder cfg={parsed} onChange={setCfg} meta={meta} />
             ) : (
-              <div className="muted">配置 JSON 当前不合法，改好之后选择器才能用</div>
+              <div className="muted">配置 JSON 当前不合法，改好之后装配器才能用</div>
             )}
             <p className="note">
               标的池决定结论。同一个 <code>macd_cross</code>，

@@ -112,6 +112,8 @@ export const runApi = {
   universe: (u: import('./types').UniverseSpec) =>
     post<import('./types').UniversePreview>('/universe', u),
   backtest: (cfg: unknown) => post<import('./types').RunResult>('/backtest', cfg),
+  // 模块目录 —— 引擎 registry 里的同一份 ParamSpec，前端不另存一份
+  modules: () => get<import('./types').ModuleCatalog>('/modules'),
 }
 
 // ---- 单步调试会话（v0.4）----

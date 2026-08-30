@@ -382,3 +382,49 @@ export interface Inspect {
   indicators: DbgIndicator[]
   pending?: DbgPending[]
 }
+
+// ---- 模块目录（v1.0 可视化装配）----
+//
+// **前端不维护任何一份模块清单或参数默认值。**
+// 全部来自 /api/modules，也就是引擎 registry 里的同一份 ParamSpec。
+// 抄一份到前端会立刻分叉：引擎加了风控规则前端不知道，
+// 引擎把上限从 100 改成 500 前端还在按 100 拦 —— 表单填得出、引擎不认。
+
+export interface ParamSpec {
+  name: string
+  kind: 'int' | 'float' | 'bool' | 'string'
+  desc: string
+  default: number
+  min: number
+  max: number
+  step: number
+  defaultStr?: string
+  options?: string[]
+  /** true 表示没有上下限（引擎里 min==max 就是「不限」的写法） */
+  unbounded: boolean
+}
+
+export interface ModuleSpec {
+  name: string
+  specs: ParamSpec[]
+}
+
+export interface ModuleCatalog {
+  strategy: ModuleSpec[]
+  sizer: ModuleSpec[]
+  risk: ModuleSpec[]
+  slippage: ModuleSpec[]
+  fee: ModuleSpec[]
+  market: ModuleSpec[]
+  enums: Record<string, { code: string; label: string }[]>
+  notes: Record<string, string>
+}
+
+/** 配置里的一个模块槽位：选一个实现 + 给它一段参数。 */
+export interface ModuleValue {
+  impl: string
+  params?: Record<string, unknown>
+  /** 仅 strategy.impl === 'composite' 时有意义 */
+  sources?: ModuleValue[]
+  mode?: string
+}

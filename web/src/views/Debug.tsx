@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { dbgApi, fmtCompact, fmtDay, fmtNum, runApi } from '../api'
+import ConfigBuilder from '../components/ConfigBuilder'
 import { DataTable, type Col } from '../components/ui'
 import type {
   ConfigItem, DbgPending, DbgPosition, Inspect, Meta,
@@ -19,11 +20,12 @@ import type {
 const yuan = (c: number) => c / 100
 const money = (c: number) => fmtNum(yuan(c), 2)
 
-export default function Debug({ meta: _meta }: { meta: Meta }) {
+export default function Debug({ meta }: { meta: Meta }) {
   const [configs, setConfigs] = useState<ConfigItem[]>([])
   const [picked, setPicked] = useState('')
   const [text, setText] = useState('')
   const [editing, setEditing] = useState(false)
+  const [building, setBuilding] = useState(false)
 
   const [state, setState] = useState<SessionState | null>(null)
   const [events, setEvents] = useState<StepEvent[]>([])
@@ -105,6 +107,14 @@ export default function Debug({ meta: _meta }: { meta: Meta }) {
 
   const cur = configs.find((c) => c.name === picked)
 
+  // JSON 是唯一真相，装配器只是它的一个视图
+  let parsed: Record<string, any> | null = null
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    parsed = null
+  }
+
   return (
     <>
       <div className="panel">
@@ -129,13 +139,36 @@ export default function Debug({ meta: _meta }: { meta: Meta }) {
               >
                 {configs.map((c) => <option key={c.name} value={c.name}>{c.name}</option>)}
               </select>
+              <button onClick={() => setBuilding((v) => !v)}>
+                {building ? '收起装配' : '装配 / 选标的池'}
+              </button>
               <button onClick={() => setEditing((v) => !v)}>
-                {editing ? '收起配置' : '改配置'}
+                {editing ? '收起 JSON' : '看 JSON'}
               </button>
               <button className="primary" disabled={busy || !text} onClick={create}>
                 {busy ? '装配中…' : '开始调试'}
               </button>
             </div>
+            {building && (
+              <div style={{
+                marginTop: 12, borderTop: '1px solid var(--border)', paddingTop: 12,
+              }}>
+                {parsed ? (
+                  <ConfigBuilder
+                    cfg={parsed}
+                    onChange={(next) => setText(JSON.stringify(next, null, 2))}
+                    meta={meta}
+                  />
+                ) : (
+                  <div className="muted">配置 JSON 当前不合法，改好之后装配器才能用</div>
+                )}
+                <p className="note">
+                  单步调试尤其该把<strong>标的池收窄</strong> ——
+                  几只标的就能看清一条完整的漏斗，
+                  3,000 只的信号列表反而看不出哪一环出了问题。
+                </p>
+              </div>
+            )}
             {cur?.error && <div className="error" style={{ marginTop: 8 }}>{cur.error}</div>}
             {editing && (
               <textarea
