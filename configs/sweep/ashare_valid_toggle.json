@@ -1,5 +1,5 @@
 {
-  "name": "A 股小池 · 有效性树值不值得留（子树开关）",
+  "name": "A 股小池 · 有效性树与止损值不值得留（子树开关）",
   "base": "base/pool12.json",
   "grid": {
     "strategy.params.valid": [
@@ -47,7 +47,23 @@
         {
           "impl": "stop_loss",
           "params": {
-            "pct": 15
+            "pct": 4
+          }
+        }
+      ],
+      [
+        {
+          "impl": "stop_loss",
+          "params": {
+            "pct": 6
+          }
+        }
+      ],
+      [
+        {
+          "impl": "stop_loss",
+          "params": {
+            "pct": 8
           }
         }
       ]
@@ -85,7 +101,7 @@
     "perturb_pct": 0.1
   },
   "gate": {
-    "min_round_trips": 30,
+    "min_round_trips": 10,
     "max_liquidation_ratio": 0.1,
     "max_halt_exit_ratio": 0.2,
     "max_friction_ratio": 0.25
