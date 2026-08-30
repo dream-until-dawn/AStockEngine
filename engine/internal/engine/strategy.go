@@ -145,7 +145,10 @@ var Strategies = registry.New[Strategy]("strategy")
 
 // RegisterStrategy 是给策略实现用的便捷注册函数：
 // 传一个零参构造器，参数规格从实例上取。
-func RegisterStrategy(name string, make func() Strategy) {
-	Strategies.Register(name, make().Specs(),
+//
+// desc 是一句话中文说明，**必填** —— 没有它，用户在下拉框里
+// 只看得到一个英文标识符。
+func RegisterStrategy(name, desc string, make func() Strategy) {
+	Strategies.Register(name, desc, make().Specs(),
 		func(json.RawMessage) (Strategy, error) { return make(), nil })
 }

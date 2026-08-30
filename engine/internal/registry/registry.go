@@ -27,6 +27,10 @@ import (
 type Factory[T any] func(params json.RawMessage) (T, error)
 
 type entry[T any] struct {
+	// desc 一句话中文说明。**放在注册表里而不是前端**：
+	// 前端抄一份模块清单，引擎加一个实现前端就不知道，
+	// 而「表单里没有、引擎里有」与「表单里有、引擎里没有」一样糟。
+	desc  string
 	specs []spec.ParamSpec
 	make  Factory[T]
 }
@@ -47,13 +51,27 @@ func New[T any](kind string) *Registry[T] {
 //
 // **重名直接 panic。** 注册发生在 init() 里，重名是编译期就该发现的编程错误；
 // 静默覆盖会让「配置里写的那个」和「实际跑的那个」不是同一个东西。
-func (r *Registry[T]) Register(name string, specs []spec.ParamSpec, f Factory[T]) {
+func (r *Registry[T]) Register(
+	name, desc string, specs []spec.ParamSpec, f Factory[T],
+) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, dup := r.m[name]; dup {
 		panic(fmt.Sprintf("registry[%s]: 实现 %q 重复注册", r.kind, name))
 	}
-	r.m[name] = entry[T]{specs: specs, make: f}
+	if desc == "" {
+		// 强制要求：没有说明的模块，用户在下拉框里只看得到一个英文标识符。
+		// 空着就 panic，比允许空着然后慢慢积累一堆没说明的模块强
+		panic(fmt.Sprintf("registry[%s]: 实现 %q 没有中文说明", r.kind, name))
+	}
+	r.m[name] = entry[T]{desc: desc, specs: specs, make: f}
+}
+
+// Desc 返回某实现的中文说明。
+func (r *Registry[T]) Desc(name string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.m[name].desc
 }
 
 // Build 按名字构造实现。

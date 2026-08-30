@@ -479,7 +479,7 @@ func (s *StrengthWeighted) Size(sigs []Signal, ctx SizeContext) []Order {
 // ---- 注册 ----
 
 func init() {
-	Sizers.Register("equal_weight", equalWeightSpecs,
+	Sizers.Register("equal_weight", "等权：把资金等分成 N 份，每个信号占一份", equalWeightSpecs,
 		func(raw json.RawMessage) (Sizer, error) {
 			p, err := registry.DecodeParams(equalWeightSpecs, raw)
 			if err != nil {
@@ -492,7 +492,7 @@ func init() {
 			return &EqualWeight{slots: p.Int("slots", 10), base: base}, nil
 		})
 
-	Sizers.Register("fixed_cash", fixedCashSpecs,
+	Sizers.Register("fixed_cash", "每笔投入固定金额", fixedCashSpecs,
 		func(raw json.RawMessage) (Sizer, error) {
 			p, err := registry.DecodeParams(fixedCashSpecs, raw)
 			if err != nil {
@@ -505,7 +505,7 @@ func init() {
 			return &FixedCash{cents: c, maxPositions: p.Int("max_positions", 0)}, nil
 		})
 
-	Sizers.Register("fixed_qty", fixedQtySpecs,
+	Sizers.Register("fixed_qty", "每笔固定股数 / 份数", fixedQtySpecs,
 		func(raw json.RawMessage) (Sizer, error) {
 			p, err := registry.DecodeParams(fixedQtySpecs, raw)
 			if err != nil {
@@ -516,7 +516,7 @@ func init() {
 			}, nil
 		})
 
-	Sizers.Register("pct_equity", pctEquitySpecs,
+	Sizers.Register("pct_equity", "每笔投入当前权益的固定百分比（随盈亏复利）", pctEquitySpecs,
 		func(raw json.RawMessage) (Sizer, error) {
 			p, err := registry.DecodeParams(pctEquitySpecs, raw)
 			if err != nil {
@@ -528,7 +528,7 @@ func init() {
 			}, nil
 		})
 
-	Sizers.Register("strength_weighted", strengthWeightedSpecs,
+	Sizers.Register("strength_weighted", "按信号强度分配：策略给的 Strength 越高分到越多", strengthWeightedSpecs,
 		func(raw json.RawMessage) (Sizer, error) {
 			p, err := registry.DecodeParams(strengthWeightedSpecs, raw)
 			if err != nil {

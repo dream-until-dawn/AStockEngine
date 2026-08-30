@@ -215,15 +215,27 @@ func (s *MACDCross) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 // ---- 注册 ----
 
 func init() {
-	eng.RegisterStrategy("buy_and_hold", func() eng.Strategy { return NewBuyAndHold() })
-	eng.RegisterStrategy("ma_cross", func() eng.Strategy { return NewMACross() })
-	eng.RegisterStrategy("macd_cross", func() eng.Strategy { return NewMACDCross() })
-	eng.RegisterStrategy("grid", func() eng.Strategy { return NewGrid() })
+	eng.RegisterStrategy("buy_and_hold",
+		"买入持有：首个可交易日买入并一直持有，用作基准",
+		func() eng.Strategy { return NewBuyAndHold() })
+	eng.RegisterStrategy("ma_cross",
+		"双均线：快线上穿慢线买入、下穿卖出（趋势跟随）",
+		func() eng.Strategy { return NewMACross() })
+	eng.RegisterStrategy("macd_cross",
+		"MACD 金叉买入、死叉卖出（趋势跟随）",
+		func() eng.Strategy { return NewMACDCross() })
+	eng.RegisterStrategy("grid",
+		"网格：价格每跌一格加一份、涨回一格减一份（震荡市）",
+		func() eng.Strategy { return NewGrid() })
 	// 下面两个不是「再多两个策略」，是给海选补维度：
 	// ma_cross 与 macd_cross 都在赌趋势延续，只扫这两个得不出
 	// 关于「技术分析」的结论，只能得出关于「均线」的结论
-	eng.RegisterStrategy("rsi_reversion", func() eng.Strategy { return NewRSIReversion() })
-	eng.RegisterStrategy("donchian_breakout", func() eng.Strategy { return NewDonchianBreakout() })
+	eng.RegisterStrategy("rsi_reversion",
+		"RSI 均值回归：跌破超卖线买入、回落出超买区卖出（与趋势跟随相反）",
+		func() eng.Strategy { return NewRSIReversion() })
+	eng.RegisterStrategy("donchian_breakout",
+		"唐奇安通道突破：创 N 日新高买入、跌破 M 日新低卖出（突破）",
+		func() eng.Strategy { return NewDonchianBreakout() })
 }
 
 // Names 返回全部可用策略名，供 CLI 提示。

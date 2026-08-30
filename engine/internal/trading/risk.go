@@ -364,7 +364,7 @@ func cents(v int64) float64 { return float64(v) / 100 }
 // ---- 注册 ----
 
 func init() {
-	Risks.Register("max_position_pct", maxPositionPctSpecs,
+	Risks.Register("max_position_pct", "单只标的市值占总权益的上限，超限缩量或拒单", maxPositionPctSpecs,
 		func(raw json.RawMessage) (Risk, error) {
 			p, err := registry.DecodeParams(maxPositionPctSpecs, raw)
 			if err != nil {
@@ -376,7 +376,7 @@ func init() {
 			}, nil
 		})
 
-	Risks.Register("max_positions", maxPositionsSpecs,
+	Risks.Register("max_positions", "最多同时持有多少只标的（持有与在途去重后计数）", maxPositionsSpecs,
 		func(raw json.RawMessage) (Risk, error) {
 			p, err := registry.DecodeParams(maxPositionsSpecs, raw)
 			if err != nil {
@@ -385,7 +385,7 @@ func init() {
 			return &MaxPositions{n: p.Int("n", 20)}, nil
 		})
 
-	Risks.Register("drawdown_halt", drawdownHaltSpecs,
+	Risks.Register("drawdown_halt", "回撤熔断：自峰值权益回撤超过阈值后停止开新仓", drawdownHaltSpecs,
 		func(raw json.RawMessage) (Risk, error) {
 			p, err := registry.DecodeParams(drawdownHaltSpecs, raw)
 			if err != nil {
@@ -394,7 +394,7 @@ func init() {
 			return &DrawdownHalt{ppm: int64(p.Float("pct", 30) * 10_000)}, nil
 		})
 
-	Risks.Register("min_turnover", minTurnoverSpecs,
+	Risks.Register("min_turnover", "流动性门槛：当日成交额太低的标的不开新仓（卖出永远放行）", minTurnoverSpecs,
 		func(raw json.RawMessage) (Risk, error) {
 			p, err := registry.DecodeParams(minTurnoverSpecs, raw)
 			if err != nil {
@@ -407,7 +407,7 @@ func init() {
 			}, nil
 		})
 
-	Risks.Register("cash_reserve", cashReserveSpecs,
+	Risks.Register("cash_reserve", "现金预留：始终留一部分现金不参与买入", cashReserveSpecs,
 		func(raw json.RawMessage) (Risk, error) {
 			p, err := registry.DecodeParams(cashReserveSpecs, raw)
 			if err != nil {

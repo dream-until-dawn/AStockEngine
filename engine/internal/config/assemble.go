@@ -351,6 +351,11 @@ func (c *Config) narrow(
 }
 
 // feeParams 把 fee.params.path 解成相对配置文件的路径后再交给 registry。
+//
+// **只改 path，其余参数原样带过去。** 早先这里是直接重建一个
+// `{"path": ...}` 交出去的 —— 那会把同一段里的其他参数
+// （如 commission_ppm 佣金覆盖）**整个丢掉**，而且不报错：
+// 引擎照常跑，只是覆盖没生效，费用还是文件里的默认值。
 func (c *Config) feeParams() []byte {
 	if c.Fee.Impl != "config" {
 		return c.Fee.Params
@@ -359,8 +364,25 @@ func (c *Config) feeParams() []byte {
 	if err != nil || path == "" {
 		return c.Fee.Params
 	}
-	resolved := c.resolvePath(path)
-	return []byte(fmt.Sprintf(`{"path":%q}`, resolved))
+	var m map[string]json.RawMessage
+	if len(c.Fee.Params) > 0 {
+		if err := json.Unmarshal(c.Fee.Params, &m); err != nil {
+			return c.Fee.Params
+		}
+	}
+	if m == nil {
+		m = map[string]json.RawMessage{}
+	}
+	resolved, err := json.Marshal(c.resolvePath(path))
+	if err != nil {
+		return c.Fee.Params
+	}
+	m["path"] = resolved
+	out, err := json.Marshal(m)
+	if err != nil {
+		return c.Fee.Params
+	}
+	return out
 }
 
 func decodeFeePath(raw []byte) (string, error) {

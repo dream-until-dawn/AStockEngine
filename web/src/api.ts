@@ -114,6 +114,9 @@ export const runApi = {
   backtest: (cfg: unknown) => post<import('./types').RunResult>('/backtest', cfg),
   // 模块目录 —— 引擎 registry 里的同一份 ParamSpec，前端不另存一份
   modules: () => get<import('./types').ModuleCatalog>('/modules'),
+  // 费率文件与它们**实际生效的规则** —— 费率是 A 股策略的主要亏损来源
+  // 之一（实测摩擦占初始资金 20.45%），不能只给一个填路径的文本框
+  fees: () => get<{ dir: string; files: import('./types').FeeFile[] }>('/fees'),
 }
 
 // ---- 单步调试会话（v0.4）----

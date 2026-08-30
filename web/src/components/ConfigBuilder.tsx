@@ -1,7 +1,9 @@
 import { useEffect, useState } from 'react'
 import { runApi } from '../api'
 import UniversePicker from './UniversePicker'
-import type { Meta, ModuleCatalog, ModuleSpec, ModuleValue, ParamSpec, UniverseSpec } from '../types'
+import type {
+  FeeFile, FeeRule, Meta, ModuleCatalog, ModuleSpec, ModuleValue, ParamSpec, UniverseSpec,
+} from '../types'
 
 // 可视化装配配置。
 //
@@ -118,7 +120,7 @@ export default function ConfigBuilder({
           <ModuleSlot label="市场规则" list={cat.market}
             value={(cfg.market ?? { impl: 'ashare' }) as ModuleValue}
             onChange={(v) => set('market', v)} />
-          <ModuleSlot label="费率" list={cat.fee}
+          <FeeSlot cat={cat}
             value={(cfg.fee ?? { impl: 'zero' }) as ModuleValue}
             onChange={(v) => set('fee', v)} />
           <ModuleSlot label="滑点" list={cat.slippage}
@@ -216,7 +218,7 @@ function StrategySlot({
         <Field label="实现">
           <select value={value.impl}
             onChange={(e) => onChange(switchImpl(cat.strategy, value, e.target.value))}>
-            {cat.strategy.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+            <ImplOptions list={cat.strategy} />
             {/* composite 不在 registry 里 —— 它是装配层的东西，
                 由 sources 与 mode 描述，没有自己的 ParamSpec */}
             <option value="composite">composite（多决策源组合）</option>
@@ -261,8 +263,7 @@ function StrategySlot({
                     sources: sources.map((x, j) =>
                       j === i ? switchImpl(cat.strategy, x, e.target.value) : x),
                   })}>
-                  {cat.strategy.map((m) =>
-                    <option key={m.name} value={m.name}>{m.name}</option>)}
+                  <ImplOptions list={cat.strategy} />
                 </select>
                 <button disabled={i === 0} onClick={() => onChange({
                   ...value, sources: swap(sources, i, i - 1),
@@ -313,7 +314,7 @@ function ModuleSlot({
         {label && <span className="k" style={{ minWidth: 68 }}>{label}</span>}
         <select value={value.impl}
           onChange={(e) => onChange(switchImpl(list, value, e.target.value))}>
-          {list.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+          <ImplOptions list={list} />
         </select>
       </div>
       <ParamForm
@@ -323,6 +324,164 @@ function ModuleSlot({
       />
     </div>
   )
+}
+
+// ---- 费率 ----
+//
+// 费率不能只给一个填路径的文本框。它是 A 股策略的主要亏损来源之一 ——
+// 实测 macd_cross 的摩擦占初始资金 **20.45%**（费用 11.56% + 滑点 8.89%），
+// 而它此前藏在一个用户从没打开过的 JSON 文件里。
+//
+// 这里做三件事：选文件、**看见实际生效的规则**、改佣金。
+// 只开放佣金是因为它是券商定的（各家万 0.85 到万 3）；
+// 印花税与过户费是监管费率且按生效日期分段，
+// 做成可随手填的数字等于邀请用户拿 2023 年的税率去算 2007 年的回测。
+
+function FeeSlot({
+  cat, value, onChange,
+}: {
+  cat: ModuleCatalog
+  value: ModuleValue
+  onChange: (v: ModuleValue) => void
+}) {
+  const [files, setFiles] = useState<FeeFile[]>([])
+  const [open, setOpen] = useState(false)
+  useEffect(() => { runApi.fees().then((d) => setFiles(d.files), () => {}) }, [])
+
+  const params = (value.params ?? {}) as Record<string, any>
+  const cur = files.find((f) => f.path === params.path)
+  const isConfig = value.impl === 'config'
+
+  const setP = (k: string, v: unknown) =>
+    onChange({ ...value, params: { ...params, [k]: v } })
+
+  return (
+    <div>
+      <div className="filters">
+        <span className="k" style={{ minWidth: 68 }}>费率</span>
+        <select value={value.impl}
+          onChange={(e) => onChange(switchImpl(cat.fee, value, e.target.value))}>
+          <ImplOptions list={cat.fee} />
+        </select>
+        {isConfig && (
+          <select value={String(params.path ?? '')}
+            onChange={(e) => setP('path', e.target.value)} style={{ minWidth: 220 }}>
+            {!files.some((f) => f.path === params.path) && (
+              <option value={String(params.path ?? '')}>
+                {String(params.path ?? '（未选）')}
+              </option>
+            )}
+            {files.map((f) => (
+              <option key={f.path} value={f.path}>
+                {f.name || f.path}{f.err ? '（读不了）' : ''}
+              </option>
+            ))}
+          </select>
+        )}
+        {isConfig && cur && (
+          <button onClick={() => setOpen((v) => !v)}>
+            {open ? '收起费率明细' : `看费率明细（${cur.rules.length} 条）`}
+          </button>
+        )}
+      </div>
+
+      {isConfig && cur?.err && <div className="error">{cur.err}</div>}
+      {isConfig && cur?.description && (
+        <p className="note" style={{ marginTop: 6 }}>{cur.description}</p>
+      )}
+
+      {isConfig && (
+        <div className="filters" style={{ marginTop: 6 }}>
+          <ParamField spec={specsOf(cat.fee, 'config').find((x) => x.name === 'commission_ppm')!}>
+            <input type="number" step={0.5} min={0}
+              value={String(params.commission_ppm ?? 0)}
+              onChange={(e) => setP('commission_ppm', Number(e.target.value || 0))}
+              style={{ width: 110 }} />
+          </ParamField>
+          <ParamField
+            spec={specsOf(cat.fee, 'config').find((x) => x.name === 'commission_min_yuan')!}>
+            <input type="number" step={1} min={-1}
+              value={String(params.commission_min_yuan ?? -1)}
+              onChange={(e) => setP('commission_min_yuan', Number(e.target.value))}
+              style={{ width: 110 }} />
+          </ParamField>
+          <div className="field" style={{ maxWidth: 300 }}>
+            <label>&nbsp;</label>
+            <div className="muted" style={{ fontSize: 11, lineHeight: 1.5 }}>
+              只开放<strong>佣金</strong>：它是券商定的，各家万 0.85 到万 3 都有。
+              印花税与过户费是监管费率、按生效日期分段（2005/2007/2008/2023
+              各调过一次，2008-09-19 还从双边改成单边），要改请直接改文件。
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isConfig && open && cur && <FeeRules rules={cur.rules} params={params} />}
+      {!isConfig && (
+        <ParamForm specs={specsOf(cat.fee, value.impl)} value={params}
+          onChange={(p) => onChange({ ...value, params: p })} />
+      )}
+    </div>
+  )
+}
+
+function FeeRules({
+  rules, params,
+}: {
+  rules: FeeRule[]
+  params: Record<string, any>
+}) {
+  const ovPPM = Number(params.commission_ppm ?? 0)
+  const ovMin = Number(params.commission_min_yuan ?? -1)
+  return (
+    <div className="tablewrap" style={{ marginTop: 8 }}>
+      <table>
+        <thead>
+          <tr>
+            <th>费用</th><th>适用</th><th>方向</th><th>生效区间</th>
+            <th className="num">费率</th><th className="num">每笔最低</th><th>说明</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rules.map((r, i) => {
+            const isComm = r.kind === 'commission'
+            const ppm = isComm && ovPPM > 0 ? ovPPM : (r.ratePpm ?? 0)
+            const min = isComm && ovMin >= 0 ? ovMin * 100 : (r.minCents ?? 0)
+            const overridden = isComm && (ovPPM > 0 || ovMin >= 0)
+            return (
+              <tr key={i}>
+                <td>
+                  {kindLabel(r.kind)}
+                  {overridden && <span className="tag warn" style={{ marginLeft: 4 }}>已覆盖</span>}
+                </td>
+                <td>{(r.instrumentTypes ?? []).join('/') || '全部'}</td>
+                <td>{sideLabel(r.side)}</td>
+                <td className="mono">{rangeLabel(r.from, r.to)}</td>
+                <td className="num mono">{ppm ? `${(ppm / 10000).toFixed(3)}%` : '—'}</td>
+                <td className="num mono">{min ? `${(min / 100).toFixed(2)} 元` : '无'}</td>
+                <td className="muted" style={{ fontSize: 11, maxWidth: 380 }}>{r.note}</td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+const KINDS: Record<string, string> = {
+  commission: '佣金', stamp_duty: '印花税', transfer_fee: '过户费',
+  trading_fee: '交易费', funding: '资金费率',
+}
+function kindLabel(k: string): string { return KINDS[k] ? `${KINDS[k]}（${k}）` : k }
+function sideLabel(s: string): string {
+  return s === 'buy' ? '买入' : s === 'sell' ? '卖出' : '双边'
+}
+function rangeLabel(from?: number, to?: number): string {
+  if (!from && !to) return '始终'
+  const f = from ? String(from) : '—'
+  const t = to ? String(to) : '至今'
+  return `${f} ~ ${t}`
 }
 
 // ---- 风控链 ----
@@ -349,7 +508,7 @@ function RiskChain({
             <select value={r.impl}
               onChange={(e) => onChange(value.map((x, j) =>
                 j === i ? switchImpl(list, x, e.target.value) : x))}>
-              {list.map((m) => <option key={m.name} value={m.name}>{m.name}</option>)}
+              <ImplOptions list={list} />
             </select>
             <button disabled={i === 0}
               onClick={() => onChange(swap(value, i, i - 1))}>↑</button>
@@ -391,7 +550,7 @@ function ParamForm({
   return (
     <div className="filters" style={{ marginTop: 6 }}>
       {specs.map((s) => (
-        <Field key={s.name} label={s.name} hint={rangeHint(s)} desc={s.desc}>
+        <ParamField key={s.name} spec={s}>
           {s.kind === 'bool' ? (
             <input type="checkbox"
               checked={boolOf(value[s.name], s.default !== 0)}
@@ -423,7 +582,7 @@ function ParamForm({
               style={{ width: 110 }}
             />
           )}
-        </Field>
+        </ParamField>
       ))}
     </div>
   )
@@ -471,10 +630,79 @@ function Field({
   )
 }
 
+/**
+ * ParamField 参数的标签用**中文说明**做主标题，英文名做副标。
+ *
+ * 此前 desc 只塞进了 title 属性（要悬停才看得到），标签是
+ * `slots` / `pct` / `bps` 这样的英文标识符 —— 没读过源码的人无从判断
+ * 该填什么。desc 在引擎里早就写好了，只是没显示出来。
+ */
+function ParamField({ spec: sp, children }: { spec: ParamSpec; children: React.ReactNode }) {
+  const range = rangeHint(sp)
+  return (
+    <div className="field" style={{ maxWidth: 260 }}>
+      <label style={{ lineHeight: 1.5 }}>
+        <strong style={{ color: 'var(--text)' }}>{shortDesc(sp)}</strong>
+        <br />
+        <code className="muted">{sp.name}</code>
+        {range && <span className="muted"> {range}</span>}
+      </label>
+      {children}
+      {longDesc(sp) && (
+        <div className="muted" style={{ fontSize: 11, lineHeight: 1.45 }}>
+          {longDesc(sp)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// 说明的第一句做标题，其余做补充。引擎里的 desc 有长有短 ——
+// 「快线周期」四个字就够当标题，而「把资金等分成多少份，同时也是
+// 最多持有的标的数」显然该拆开。用第一个逗号/句号切
+function splitDesc(d: string): [string, string] {
+  // **括号内不断句**：「佣金费率覆盖（百万分之一；万 2.5 填 250）」
+  // 在分号处切开会留下一个不闭合的括号
+  let depth = 0
+  for (let i = 0; i < d.length; i++) {
+    const c = d[i]
+    if (c === '（' || c === '(') depth++
+    else if (c === '）' || c === ')') depth--
+    else if (depth === 0 && '，。：；'.includes(c)) {
+      return i > 16 ? [d, ''] : [d.slice(0, i), d.slice(i + 1)]
+    }
+  }
+  return [d, '']
+}
+function shortDesc(s: ParamSpec): string {
+  return s.desc ? splitDesc(s.desc)[0] : s.name
+}
+function longDesc(s: ParamSpec): string {
+  return s.desc ? splitDesc(s.desc)[1] : ''
+}
+
 // ---- 纯函数 ----
 
 function specsOf(list: ModuleSpec[], impl: string): ParamSpec[] {
   return list.find((m) => m.name === impl)?.specs ?? []
+}
+
+/**
+ * ImplOptions 把下拉项渲染成「英文名（中文说明）」。
+ *
+ * 英文名要留着 —— 它是配置 JSON 里真正写的东西，也是文档与报错里
+ * 出现的名字。只显示中文会让用户在 JSON 里对不上号。
+ */
+function ImplOptions({ list }: { list: ModuleSpec[] }) {
+  return (
+    <>
+      {list.map((m) => (
+        <option key={m.name} value={m.name}>
+          {m.name}{m.desc ? `（${m.desc}）` : ''}
+        </option>
+      ))}
+    </>
+  )
 }
 
 /** defaults 由 ParamSpec 生成一份默认参数。 */

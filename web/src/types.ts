@@ -406,6 +406,8 @@ export interface ParamSpec {
 
 export interface ModuleSpec {
   name: string
+  /** 一句话中文说明，来自引擎的注册表 */
+  desc: string
   specs: ParamSpec[]
 }
 
@@ -427,4 +429,28 @@ export interface ModuleValue {
   /** 仅 strategy.impl === 'composite' 时有意义 */
   sources?: ModuleValue[]
   mode?: string
+}
+
+// ---- 费率 ----
+
+export interface FeeRule {
+  kind: string
+  instrumentTypes?: string[]
+  boards?: string[]
+  side: string
+  from?: number
+  to?: number
+  ratePpm?: number
+  perShareCents?: number
+  flatCents?: number
+  minCents?: number
+  note?: string
+}
+
+export interface FeeFile {
+  path: string
+  name: string
+  description?: string
+  rules: FeeRule[]
+  err?: string
 }

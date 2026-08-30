@@ -67,6 +67,7 @@ func main() {
 	mux.HandleFunc("POST /api/universe", store.handleUniverse)
 	// 模块目录：前端据此自动生成表单。**前端不得自己维护一份清单**
 	mux.HandleFunc("GET /api/modules", store.handleModules)
+	mux.HandleFunc("GET /api/fees", store.handleFees)
 
 	// 单步调试会话（v0.4）。纯 HTTP，不用 WebSocket ——
 	// 步进是用户驱动的请求/响应，没有服务端主动产生的事件。理由见 session.go

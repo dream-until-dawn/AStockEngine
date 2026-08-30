@@ -133,6 +133,31 @@ func LoadFee(path string) (*ConfigFee, error) {
 	return f, nil
 }
 
+// OverrideCommission 覆盖佣金费率与每笔最低。
+//
+// ratePPM <= 0 或 minYuan < 0 表示该项不覆盖，沿用文件里的值。
+// 只作用于 Kind == "commission" 的规则 —— 印花税与过户费是监管费率
+// 且按生效日期分段，不开放覆盖（理由见 modules.go 的 configFeeSpecs）。
+//
+// **每笔最低 0 是合法值**（部分券商已取消 5 元最低），所以「不覆盖」
+// 的哨兵只能是负数，不能是 0。
+func (f *ConfigFee) OverrideCommission(ratePPM int64, minYuan float64) {
+	if ratePPM <= 0 && minYuan < 0 {
+		return
+	}
+	for i := range f.cfg.Rules {
+		if f.cfg.Rules[i].Kind != "commission" {
+			continue
+		}
+		if ratePPM > 0 {
+			f.cfg.Rules[i].RatePPM = ratePPM
+		}
+		if minYuan >= 0 {
+			f.cfg.Rules[i].MinCents = int64(minYuan * 100)
+		}
+	}
+}
+
 // NewFee 由内存中的配置构造，便于测试。
 func NewFee(cfg FeeConfig) (*ConfigFee, error) {
 	f := &ConfigFee{cfg: cfg}
@@ -145,7 +170,15 @@ func NewFee(cfg FeeConfig) (*ConfigFee, error) {
 func (f *ConfigFee) Name() string { return f.cfg.Name }
 
 // Config 返回配置的只读副本，供展示与快照指纹使用。
-func (f *ConfigFee) Config() FeeConfig { return f.cfg }
+//
+// **Rules 要拷一份**：直接返回会让调用方拿到引擎内部那个切片，
+// 改一条规则就改到了正在跑的费率。以前只有快照在用、看不出问题，
+// 现在 Web 也要读它。
+func (f *ConfigFee) Config() FeeConfig {
+	out := f.cfg
+	out.Rules = append([]FeeRule(nil), f.cfg.Rules...)
+	return out
+}
 
 // validate 拒绝会导致同一 kind 在同一情形下匹配到多条规则的配置。
 //
