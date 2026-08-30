@@ -1,0 +1,159 @@
+{
+  "name": "A 股多标的（主板在市个股）· 规则树 · 带有效判断 · 带止损无止盈 · 本金 20 万（10 份 × 2 万，刚好压住 5 元最低佣金）。有效性树把 RSI 已经过热的买点滤成虚拟持仓，逐轮交易里能与实仓并排比。",
+  "data": {
+    "root": "../../data",
+    "market": "ashare",
+    "freq": "1d",
+    "from": 20150101,
+    "to": 0,
+    "universe": {
+      "market": [
+        "ashare"
+      ],
+      "type": "stock",
+      "board": [
+        "main"
+      ],
+      "status": "listed"
+    }
+  },
+  "market": {
+    "impl": "ashare"
+  },
+  "fee": {
+    "impl": "config",
+    "params": {
+      "path": "../fee/ashare_default.json"
+    }
+  },
+  "slippage": {
+    "impl": "fixed_bps",
+    "params": {
+      "bps": 5
+    }
+  },
+  "portfolio": {
+    "initial_cash_cents": 20000000,
+    "ledger": "spot"
+  },
+  "broker": {
+    "volume_cap_ppm": 100000,
+    "allow_partial_fill": true
+  },
+  "metrics": {
+    "benchmark": "510300",
+    "risk_free_ppm": 0
+  },
+  "recorder": {
+    "level": "summary"
+  },
+  "strategy": {
+    "impl": "rule_tree",
+    "params": {
+      "indicators": [
+        {
+          "name": "macd",
+          "kind": "macd",
+          "params": {
+            "short": 12,
+            "long": 26,
+            "signal": 9
+          }
+        },
+        {
+          "name": "rsi",
+          "kind": "rsi",
+          "params": {
+            "period": 14
+          }
+        },
+        {
+          "name": "ma60",
+          "kind": "sma",
+          "params": {
+            "period": 60
+          }
+        }
+      ],
+      "direction": "long",
+      "buy": {
+        "op": "and",
+        "children": [
+          {
+            "left": {
+              "kind": "ind",
+              "ind": "macd",
+              "field": "DIF"
+            },
+            "cmp": "cross_above",
+            "right": {
+              "kind": "ind",
+              "ind": "macd",
+              "field": "DEA"
+            }
+          },
+          {
+            "left": {
+              "kind": "bar",
+              "field": "close"
+            },
+            "cmp": "gt",
+            "right": {
+              "kind": "ind",
+              "ind": "ma60",
+              "field": "MA"
+            }
+          }
+        ]
+      },
+      "sell": {
+        "left": {
+          "kind": "bar",
+          "field": "close"
+        },
+        "cmp": "lt",
+        "right": {
+          "kind": "ind",
+          "ind": "ma60",
+          "field": "MA"
+        }
+      },
+      "valid": {
+        "left": {
+          "kind": "ind",
+          "ind": "rsi",
+          "field": "RSI"
+        },
+        "cmp": "lt",
+        "right": {
+          "kind": "value",
+          "value": 70
+        }
+      }
+    }
+  },
+  "sizer": {
+    "impl": "equal_weight",
+    "params": {
+      "slots": 10,
+      "base": "cost",
+      "order_by": "amount"
+    }
+  },
+  "risk": [
+    {
+      "impl": "min_turnover",
+      "params": {
+        "amount_wan": 500
+      }
+    }
+  ],
+  "exit": [
+    {
+      "impl": "stop_loss",
+      "params": {
+        "pct": 15
+      }
+    }
+  ]
+}

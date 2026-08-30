@@ -1,26 +1,24 @@
 {
-  "name": "加密永续 · BTC/ETH · MACD 金叉（逐仓双向）",
+  "name": "A 股单标的（600036）· 规则树 · 默认有效 · 带止盈无止损。单标的的基准就是它自己 —— 超额收益说的是「选时比一直持有强多少」。",
   "data": {
     "root": "../../data",
-    "market": "crypto",
+    "market": "ashare",
     "freq": "1d",
-    "from": 20200101,
+    "from": 20150101,
     "to": 0,
     "universe": {
-      "market": [
-        "crypto"
-      ],
-      "type": "all",
-      "status": "all"
+      "symbols": [
+        "600036"
+      ]
     }
   },
   "market": {
-    "impl": "crypto"
+    "impl": "ashare"
   },
   "fee": {
     "impl": "config",
     "params": {
-      "path": "../fee/crypto_okx.json"
+      "path": "../fee/ashare_default.json"
     }
   },
   "slippage": {
@@ -29,29 +27,20 @@
       "bps": 5
     }
   },
-  "sizer": {
-    "impl": "equal_weight",
-    "params": {
-      "slots": 2,
-      "base": "initial"
-    }
+  "portfolio": {
+    "initial_cash_cents": 2000000,
+    "ledger": "spot"
   },
-  "risk": [],
-  "exit": [],
   "broker": {
     "volume_cap_ppm": 100000,
     "allow_partial_fill": true
   },
-  "portfolio": {
-    "initial_cash_cents": 100000,
-    "dividend_tax_ppm": 0,
-    "ledger": "margin",
-    "leverage": 1,
-    "maint_margin_ppm": 5000
+  "metrics": {
+    "benchmark": "600036",
+    "risk_free_ppm": 0
   },
-  "engine": {
-    "indicator_adj": "none",
-    "imply_split_from_factor": false
+  "recorder": {
+    "level": "summary"
   },
   "strategy": {
     "impl": "rule_tree",
@@ -64,13 +53,6 @@
             "short": 12,
             "long": 26,
             "signal": 9
-          }
-        },
-        {
-          "name": "rsi",
-          "kind": "rsi",
-          "params": {
-            "period": 14
           }
         }
       ],
@@ -88,18 +70,6 @@
           "field": "DEA"
         }
       },
-      "valid": {
-        "left": {
-          "kind": "ind",
-          "ind": "rsi",
-          "field": "RSI"
-        },
-        "cmp": "lt",
-        "right": {
-          "kind": "value",
-          "value": 70
-        }
-      },
       "sell": {
         "left": {
           "kind": "ind",
@@ -115,11 +85,21 @@
       }
     }
   },
-  "metrics": {
-    "benchmark": "BTC-USDT-SWAP",
-    "risk_free_ppm": 0
+  "sizer": {
+    "impl": "pct_equity",
+    "params": {
+      "pct": 95,
+      "base": "cost",
+      "max_positions": 1
+    }
   },
-  "recorder": {
-    "level": "summary"
-  }
+  "risk": [],
+  "exit": [
+    {
+      "impl": "take_profit",
+      "params": {
+        "pct": 20
+      }
+    }
+  ]
 }

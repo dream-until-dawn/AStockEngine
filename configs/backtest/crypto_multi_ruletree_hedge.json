@@ -1,5 +1,5 @@
 {
-  "name": "加密永续 · 双向（MACD 金叉做多 / 死叉做空）· 逐仓 3 倍",
+  "name": "加密多标的 · 规则树双向（一多一空两棵树 union）· 带有效判断 · 峰值回撤 15% 熔断并清仓、冷静期 20 根。冷静期期满会从当下权益重新起算回撤 —— 不重算的话清仓后权益不再变动，熔断一到期就再次触发，从此再也不交易。",
   "data": {
     "root": "../../data",
     "market": "crypto",
@@ -9,9 +9,7 @@
     "universe": {
       "market": [
         "crypto"
-      ],
-      "type": "all",
-      "status": "all"
+      ]
     }
   },
   "market": {
@@ -29,29 +27,22 @@
       "bps": 5
     }
   },
-  "sizer": {
-    "impl": "equal_weight",
-    "params": {
-      "slots": 4,
-      "base": "initial"
-    }
+  "portfolio": {
+    "initial_cash_cents": 100000,
+    "ledger": "margin",
+    "leverage": 2,
+    "maint_margin_ppm": 5000
   },
-  "risk": [],
-  "exit": [],
   "broker": {
     "volume_cap_ppm": 100000,
     "allow_partial_fill": true
   },
-  "portfolio": {
-    "initial_cash_cents": 100000,
-    "dividend_tax_ppm": 0,
-    "ledger": "margin",
-    "leverage": 3,
-    "maint_margin_ppm": 5000
+  "metrics": {
+    "benchmark": "BTC-USDT-SWAP",
+    "risk_free_ppm": 0
   },
-  "engine": {
-    "indicator_adj": "none",
-    "imply_split_from_factor": false
+  "recorder": {
+    "level": "summary"
   },
   "strategy": {
     "impl": "composite",
@@ -68,6 +59,13 @@
                 "short": 12,
                 "long": 26,
                 "signal": 9
+              }
+            },
+            {
+              "name": "rsi",
+              "kind": "rsi",
+              "params": {
+                "period": 14
               }
             }
           ],
@@ -97,6 +95,18 @@
               "ind": "macd",
               "field": "DEA"
             }
+          },
+          "valid": {
+            "left": {
+              "kind": "ind",
+              "ind": "rsi",
+              "field": "RSI"
+            },
+            "cmp": "lt",
+            "right": {
+              "kind": "value",
+              "value": 75
+            }
           }
         }
       },
@@ -111,6 +121,13 @@
                 "short": 12,
                 "long": 26,
                 "signal": 9
+              }
+            },
+            {
+              "name": "rsi",
+              "kind": "rsi",
+              "params": {
+                "period": 14
               }
             }
           ],
@@ -140,16 +157,40 @@
               "ind": "macd",
               "field": "DEA"
             }
+          },
+          "valid": {
+            "left": {
+              "kind": "ind",
+              "ind": "rsi",
+              "field": "RSI"
+            },
+            "cmp": "gt",
+            "right": {
+              "kind": "value",
+              "value": 25
+            }
           }
         }
       }
     ]
   },
-  "metrics": {
-    "benchmark": "BTC-USDT-SWAP",
-    "risk_free_ppm": 0
+  "sizer": {
+    "impl": "equal_weight",
+    "params": {
+      "slots": 4,
+      "base": "cost",
+      "order_by": "amount"
+    }
   },
-  "recorder": {
-    "level": "summary"
-  }
+  "risk": [
+    {
+      "impl": "drawdown_halt",
+      "params": {
+        "pct": 15,
+        "cooldown_bars": 20,
+        "flatten": true
+      }
+    }
+  ],
+  "exit": []
 }

@@ -383,3 +383,34 @@ func TestBaseCostIgnoresLeverage(t *testing.T) {
 		}
 	}
 }
+
+// TestEnterSellIsFullExitInSpot 单向市场里 `Enter + 卖` 一律是**全平**。
+//
+// dispatch 在 Sizer 之前就把它拦下走 exitOrder，而 exitOrder 卖的是
+// 全部可卖 —— Strength 根本没机会参与。
+//
+// 网格从前就是靠这条路表达「减仓 N 格」的，注释还写着「由 Sizer 决定卖多少」，
+// 实际却是全平；而它把档位记成 want（非零），于是**仓位空了、档位却还
+// 记着 2 格**，价格再跌一格也不加仓。现在网格改成退回即全平、档位归零。
+//
+// 这条规则本身仍然成立，钉住它 —— 免得改别处时悄悄变了。
+func TestEnterSellIsFullExitInSpot(t *testing.T) {
+	ctx := newCtx(1, 1_000_000)
+	seedPosition(ctx.pf, 1, 1000)
+	ctx.avail[1] = 1000
+
+	// 「卖掉两格」，每格 20% → Strength 0.4
+	sigs := []Signal{{
+		Instrument: 1, Kind: SignalEnter, Side: SideSell, Strength: 0.4,
+	}}
+	got := mustSizer(t, "strength_weighted", `{"total_pct":100}`).Size(sigs, ctx)
+	if len(got) != 1 {
+		t.Fatalf("应当出一笔，得到 %d 笔", len(got))
+	}
+	if got[0].Qty != 1000 {
+		t.Errorf("当前行为是全平 1000 股，得到 %d 股 —— 行为变了就更新这个测试", got[0].Qty)
+	}
+	if !got[0].Reduce {
+		t.Errorf("卖出应当标成平仓")
+	}
+}
