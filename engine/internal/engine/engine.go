@@ -31,6 +31,15 @@ type Config struct {
 	// 完全不处理会让这些日期出现「价格跳变但账户没变」的失真。
 	// 这是有损近似，Portfolio 会逐条留痕。
 	ImplySplitFromFactor bool
+	// TradeFrom 这一天之前只喂指标不交易（YYYYMMDD，0 表示不设限）。
+	//
+	// 为 Walk-Forward 而加：窗口切开后每段开头的指标是**未预热**的
+	// （MACD(26) 要 26 根 bar 才就绪），不处理的话每个窗口的头一个月
+	// 被系统性地削掉信号 —— 那在 18 个窗口上是一致的**偏差**，不是噪声。
+	//
+	// 于是子集多裁一段预热前缀，前缀期内照常喂指标、处理公司行动、
+	// 撮合在途单，只是不产生新的信号与订单。
+	TradeFrom int32
 }
 
 // Engine 是回测的核心状态机。
@@ -45,11 +54,12 @@ type Engine struct {
 	corp     *mktdata.CorpActions
 	broker   *trading.Broker
 	market   trading.Market
-	pf       *trading.Portfolio
+	led      trading.Ledger
 	strategy Strategy
 	sizer    trading.Sizer
 	risk     trading.RiskChain
 	rec      record.Recorder
+	exits    trading.ExitChain
 	cfg      Config
 
 	factories  map[string]IndicatorFactory
@@ -76,6 +86,9 @@ type Engine struct {
 	signals []trading.Signal
 	// sized 本步 Sizer 折算出的订单（风控之前）
 	sized []trading.Order
+	// liquidations 累计强平。现货账本永远为空 —— 留着是因为强平
+	// **必须能被记录与展示**：权益突然掉一截却查不到原因是最糟的失真
+	liquidations []trading.Liquidation
 
 	// resultHash 逐笔成交的滚动哈希（C5）。在引擎内算，
 	// 这样它不受 recorder.level 影响 —— 记录多少是给人看的事，
@@ -85,17 +98,24 @@ type Engine struct {
 
 // Deps 是引擎依赖的数据与模块。
 type Deps struct {
-	Columns   *mktdata.Columns
-	Universe  *mktdata.Universe
-	Adjuster  *mktdata.Adjuster
-	CorpAct   *mktdata.CorpActions
-	Market    trading.Market
-	Broker    *trading.Broker
-	Portfolio *trading.Portfolio
+	Columns  *mktdata.Columns
+	Universe *mktdata.Universe
+	Adjuster *mktdata.Adjuster
+	CorpAct  *mktdata.CorpActions
+	Market   trading.Market
+	Broker   *trading.Broker
+	// Ledger 账本。缺省为现货账本（A 股）；保证金账本换实现即可，
+	// 引擎不需要知道两者的区别
+	Ledger trading.Ledger
 	// Sizer 缺省为 equal_weight{slots:10, base:initial}
 	Sizer trading.Sizer
 	// Risk 缺省为空链（不拦截）
 	Risk trading.RiskChain
+	// Exits 离场规则链（止损 / 止盈 / 移动止损）。缺省为空链。
+	//
+	// 它是**第三类决策来源**，与策略并列而非从属：策略产生 alpha，
+	// 离场规则做风险管理。排在策略之前，且信号会覆盖策略在同一标的上的判断
+	Exits trading.ExitChain
 	// Recorder 缺省为 summary 级内存记录器。
 	//
 	// **记录由引擎发起而不是由驱动方发起**：单步驱动、批量海选、实盘增量
@@ -115,8 +135,8 @@ func New(d Deps, s Strategy, cfg Config) (*Engine, error) {
 		d.Broker = trading.NewBroker(d.Market, trading.ZeroFee{}, nil,
 			trading.DefaultBrokerConfig())
 	}
-	if d.Portfolio == nil {
-		d.Portfolio = trading.NewPortfolio(cfg.InitialCashCents)
+	if d.Ledger == nil {
+		d.Ledger = trading.NewPortfolio(cfg.InitialCashCents)
 	}
 	if d.Sizer == nil {
 		sz, err := trading.Sizers.Build("equal_weight", nil)
@@ -131,7 +151,7 @@ func New(d Deps, s Strategy, cfg Config) (*Engine, error) {
 	e := &Engine{
 		col: d.Columns, cur: mktdata.NewCursor(d.Columns), adj: d.Adjuster,
 		uni: d.Universe, corp: d.CorpAct, broker: d.Broker, market: d.Market,
-		pf: d.Portfolio, strategy: s, sizer: d.Sizer, risk: d.Risk,
+		led: d.Ledger, strategy: s, sizer: d.Sizer, risk: d.Risk, exits: d.Exits,
 		rec: d.Recorder, cfg: cfg,
 		factories:  make(map[string]IndicatorFactory),
 		indicators: make(map[string]map[mktdata.InstrumentID]indicator.Indicator),
@@ -141,11 +161,48 @@ func New(d Deps, s Strategy, cfg Config) (*Engine, error) {
 	if e.cfg.Params == nil {
 		e.cfg.Params = Params{}
 	}
+	// 账本按市价重估持仓时要知道标的的 scale 与合约乘数。
+	// **不注入的话会退回 A 股口径**，在加密上差十几个数量级
+	if pf, ok := d.Ledger.(*trading.Portfolio); ok {
+		pf.SetValuer(func(id mktdata.InstrumentID, price, qty int64) int64 {
+			return trading.NotionalCents(d.Universe.Get(id), price, qty)
+		})
+	}
 	e.ctx = &stepCtx{e: e}
 	if err := s.Init(e); err != nil {
 		return nil, fmt.Errorf("策略 %s 初始化失败: %w", s.Name(), err)
 	}
+	if err := checkShortSupport(s, e.market); err != nil {
+		return nil, err
+	}
 	return e, nil
+}
+
+// checkShortSupport 做空的策略只能配在允许做空的市场上。
+//
+// **调用点必须在 Init 之后**，而它曾经在 Init 之前。
+// 多数策略的「要不要做空」是从参数里读出来的（网格的 short 开关），
+// 而参数是 Init 时才写进策略的 —— 在那之前问 NeedsShort()，
+// 拿到的是字段的零值 false，守卫等于不存在。
+//
+// 实测那次静默失效：做空网格配在 A 股上，**信号 606 条、成交 0 笔、
+// 拒单 0 笔、总收益 +0.00%**，全程零报错。开空信号被 Sizer 当成减仓，
+// 而手上没有多头可减，订单就那么没了。
+//
+// 规则树当时没暴露，因为它走 ConfigurableStrategy.Configure ——
+// 那个在装配时就调了。**一个守卫对一半的策略有效，比没有守卫更危险**：
+// 它让人以为这件事被管住了。
+//
+// 抽成独立函数是为了能不造行情就测它 —— 整个测试套件不依赖 data/。
+func checkShortSupport(s Strategy, m trading.Market) error {
+	ss, ok := s.(ShortSeller)
+	if !ok || !ss.NeedsShort() || m == nil || m.AllowsShort() {
+		return nil
+	}
+	return fmt.Errorf(
+		"策略 %s 要开空，但市场规则 %q 不支持做空 —— "+
+			"「仅做空」与「双向持仓」只在支持做空的市场（如 crypto）可用",
+		s.Name(), m.Name())
 }
 
 // ---- InitContext ----
@@ -168,9 +225,33 @@ func (e *Engine) Use(key string, f IndicatorFactory) {
 
 // ---- 状态机 ----
 
-func (e *Engine) Done() bool                    { return e.cur.Done() }
-func (e *Engine) Steps() int                    { return e.steps }
-func (e *Engine) Portfolio() *trading.Portfolio { return e.pf }
+func (e *Engine) Done() bool             { return e.cur.Done() }
+func (e *Engine) Steps() int             { return e.steps }
+func (e *Engine) Ledger() trading.Ledger { return e.led }
+
+// Market 返回本次运行的市场规则实现。
+//
+// 报告侧需要它来问「一年有多少个交易日」—— 那个答案是**市场相关**的
+// （A 股 243、加密 365），以前写死成 mktdata.MarketAShare 去查日历，
+// 换了市场就会静默给出错的年化系数。
+func (e *Engine) Market() trading.Market { return e.market }
+
+// Failure 报告风控链是否已判定策略失败（如资金不足以再开仓）。
+//
+// **报告必须显示它**：破产之后净值走成一条直线，
+// 最大回撤定格在失败那天、年化波动被后面的零波动摊薄、夏普反而变好看 ——
+// 不说出来的话，一个已经死掉的策略会显示成一个低波动策略。
+func (e *Engine) Failure() (bool, int32, string) { return e.risk.Failure() }
+
+// VirtualTrips 策略产生的虚拟轮次（被有效性判断过滤掉的机会）。
+// 策略不支持这个概念时返回 nil。
+func (e *Engine) VirtualTrips() []VirtualTrip {
+	vr, ok := e.strategy.(VirtualReporter)
+	if !ok {
+		return nil
+	}
+	return vr.VirtualTrips()
+}
 
 // Step 前进一个事件时点。
 //
@@ -225,6 +306,13 @@ func (e *Engine) Step() (mktdata.TimePoint, error) {
 	// 4. 撮合到期订单
 	e.matchPending(tp)
 
+	// 4.5 账本重估。保证金账本在这里判断强平 —— **必须先于策略**：
+	//     强平是市场施加的，不是策略的决定。现货账本什么也不做
+	if liq := e.led.Mark(e.marks(), tp); len(liq) > 0 {
+		e.liquidations = append(e.liquidations, liq...)
+		e.recordLiquidationFills(liq, tp)
+	}
+
 	// 5. 权益快照与峰值。放在撮合之后、策略之前：
 	//    策略、Sizer、Risk 看到的是同一个已结算的账户状态
 	e.ctxFor(tp, updated)
@@ -233,49 +321,78 @@ func (e *Engine) Step() (mktdata.TimePoint, error) {
 		e.peakEquity = e.stepEquity
 	}
 
-	// 6. 策略 —— 只出信号
-	sigs, err := e.strategy.OnBar(e.ctx)
-	if err != nil {
-		return tp, fmt.Errorf("策略在 %d 报错: %w", tp.TradingDay, err)
+	// 5.5~8 只在 TradeFrom 之后执行。预热期照常走完 2~5
+	// （指标、公司行动、撮合、重估）—— 撮合也要走，否则预热期跨过来的
+	// 在途单会永远挂着
+	if e.cfg.TradeFrom == 0 || tp.TradingDay >= e.cfg.TradeFrom {
+		// 5.5 离场规则 —— **在策略之前**。
+		//
+		// 止损必须压过策略的判断：策略说「继续持有」时止损也要能平掉。
+		// 靠合并顺序来保证优先级太脆弱，所以直接排在前面，
+		// 并在下面显式覆盖策略在同一标的上的信号
+		exitSigs := e.exits.OnStep(e.ctx)
+
+		// 6. 策略 —— 只出信号
+		sigs, err := e.strategy.OnBar(e.ctx)
+		if err != nil {
+			return tp, fmt.Errorf("策略在 %d 报错: %w", tp.TradingDay, err)
+		}
+		sigs = mergeExits(exitSigs, sigs)
+		e.signals = append(e.signals, sigs...)
+
+		// 7. Sizer 折算数量
+		orders := e.sizer.Size(sigs, e.ctx)
+		e.sized = append(e.sized, orders...)
+
+		// 8. Risk 把关、定价入队；可在本时点成交的立即撮合
+		e.enqueue(orders, tp)
 	}
-	e.signals = append(e.signals, sigs...)
-
-	// 7. Sizer 折算数量
-	orders := e.sizer.Size(sigs, e.ctx)
-	e.sized = append(e.sized, orders...)
-
-	// 8. Risk 把关、定价入队；可在本时点成交的立即撮合
-	e.enqueue(orders, tp)
 
 	// 9. 记录。**放在最后** —— 盘后定价的单会在第 8 步就成交，
 	//    提前记会漏掉它们
 	e.rec.OnStep(record.Step{
-		Time: tp, EquityCents: e.stepEquity, CashCents: e.pf.Cash,
-		Positions:  countPositions(e.pf),
+		Time: tp, EquityCents: e.stepEquity, CashCents: e.led.CashCents(),
+		Positions:  e.led.NumPositions(),
 		NumSignals: len(e.signals), NumFills: len(e.fills), NumRejects: len(e.rejects),
 		Signals: e.signals, Sized: e.sized, Fills: e.fills, Rejections: e.rejects,
 	})
 	return tp, nil
 }
 
-func countPositions(pf *trading.Portfolio) int {
-	n := 0
-	for _, p := range pf.Positions {
-		if p.Total > 0 {
-			n++
-		}
+// mergeExits 把离场信号排在前面，并**丢掉策略在同一标的上的信号**。
+//
+// 不丢的话会出现两种荒唐情形：策略当天要加仓、止损当天要清仓，
+// 两张单一起进 Sizer；或者策略也发了卖出，于是同一只标的被下两次卖单，
+// 第二张必然因无券可卖被拒。
+//
+// **离场赢**。这就是把它排在策略之前的全部意义。
+func mergeExits(exits, sigs []Signal) []Signal {
+	if len(exits) == 0 {
+		return sigs
 	}
-	return n
+	blocked := make(map[mktdata.InstrumentID]bool, len(exits))
+	for _, s := range exits {
+		blocked[s.Instrument] = true
+	}
+	out := make([]Signal, 0, len(exits)+len(sigs))
+	out = append(out, exits...)
+	for _, s := range sigs {
+		if blocked[s.Instrument] {
+			continue
+		}
+		out = append(out, s)
+	}
+	return out
 }
 
 // applyCorporateActions 处理当日的分红送配。
 func (e *Engine) applyCorporateActions(tp mktdata.TimePoint, updated []mktdata.InstrumentID) {
 	if e.corp != nil {
 		for _, a := range e.corp.OnDay(tp.TradingDay) {
-			if e.pf.Position(a.Instrument) == nil {
+			if e.led.Exposure(a.Instrument).IsEmpty() {
 				continue // 未持仓则无需入账
 			}
-			e.pf.ApplyCorporateAction(trading.CorporateAction{
+			e.led.ApplyCorporateAction(trading.CorporateAction{
 				Instrument: a.Instrument, ExDate: a.ExDate,
 				CashBeforeTax: a.CashBeforeTax,
 				StockDividend: a.StockDividend, StockTransfer: a.StockTransfer,
@@ -289,19 +406,17 @@ func (e *Engine) applyCorporateActions(tp mktdata.TimePoint, updated []mktdata.I
 	if !e.cfg.ImplySplitFromFactor || e.adj == nil {
 		return
 	}
-	for id, p := range e.pf.Positions {
-		if p.Total <= 0 {
-			continue
-		}
+	e.led.EachExposure(func(id mktdata.InstrumentID, _ trading.Exposure) bool {
 		ratio, isEvent := e.adj.EventRatio(id, tp.TradingDay)
 		if !isEvent || ratio <= 1.0 {
-			continue
+			return true
 		}
 		if e.corp != nil && e.corp.Has(id, tp.TradingDay) {
-			continue // 已有记录，按记录处理即可
+			return true // 已有记录，按记录处理即可
 		}
-		e.pf.ApplyImpliedSplit(id, tp.TradingDay, ratio, tp.TsClose)
-	}
+		e.led.ApplyImpliedSplit(id, tp.TradingDay, ratio, tp.TsClose)
+		return true
+	})
 }
 
 // matchPending 撮合已到期的订单，并淘汰过期的。
@@ -349,13 +464,13 @@ func (e *Engine) tryMatch(po *trading.PendingOrder, tp mktdata.TimePoint) bool {
 	if !ok {
 		return false // 该时点无 bar，留待下次
 	}
-	fill, rej, ok := e.broker.Match(po, inst, bar, tp, e.pf)
+	fill, rej, ok := e.broker.Match(po, inst, bar, tp, e.led)
 	if !ok {
 		e.rejects = append(e.rejects, rej)
 		return false
 	}
 	sellable := e.market.SellableFrom(inst, tp)
-	if err := e.pf.ApplyFill(fill, sellable); err != nil {
+	if err := e.led.ApplyFill(fill, sellable); err != nil {
 		// 撮合已校验过资金与持仓，走到这里说明有内部不一致，必须留痕
 		e.rejects = append(e.rejects, trading.Rejection{
 			Order: po.Order, At: tp, Reason: trading.RejectInsufficientCash,
@@ -366,6 +481,45 @@ func (e *Engine) tryMatch(po *trading.PendingOrder, tp mktdata.TimePoint) bool {
 	e.fills = append(e.fills, fill)
 	fillDigest(e.resultHash, fill)
 	return true
+}
+
+// recordLiquidationFills 把强平补成一笔**成交记录**。
+//
+// # 为什么必须补
+//
+// 强平是账本自己动手平的仓，不走撮合器，所以从前一笔成交都不产生。
+// 后果是逐轮配对里那个仓位**永远配不上平仓**，一直挂在「未平仓」里 ——
+// 实测：336 笔开仓对 333 笔平仓，差的 3 笔中有 1 笔就是被强平的，
+// 而报告只说「未平仓 2 只」，看不出有一个仓位是爆掉的。
+//
+// 强平在事实上就是一笔交易：交易所按市价替你平了仓。
+// 它该计入成交额、该产生一轮完整的盈亏、该在逐轮里标出来。
+//
+// # 为什么不调 ApplyFill
+//
+// **账已经记过了**（Mark 里扣的保证金）。再记一次就是重复扣。
+// 这里只补「成交记录」这一面，不碰账本 —— 两者本来就是两件事，
+// 只是平时由 fillOne 一起做了。
+func (e *Engine) recordLiquidationFills(liq []trading.Liquidation, tp mktdata.TimePoint) {
+	for _, l := range liq {
+		// 平多要卖、平空要买 —— 与 exitOrder 同一张表
+		side := trading.SideSell
+		if l.Side == trading.SideSell {
+			side = trading.SideBuy
+		}
+		f := trading.Fill{
+			Order: trading.Order{
+				Instrument: l.Instrument, Side: side, Qty: l.Qty,
+				Reduce: true, Tag: trading.TagLiquidation,
+			},
+			At: tp, Price: l.Price, Qty: l.Qty,
+			AmountCents: l.NotionalCents,
+		}
+		e.fills = append(e.fills, f)
+		// **进指纹**：强平改变了持仓，是结果的一部分。
+		// 不进的话，两次运行只要强平不同、指纹却相同，C5 就漏了一块
+		fillDigest(e.resultHash, f)
+	}
 }
 
 // enqueue 给新订单定价并入队；可在本时点成交的立即撮合。
@@ -436,15 +590,13 @@ func (e *Engine) EquityCents() int64 {
 	for id := range e.prices {
 		delete(e.prices, id)
 	}
-	for id, p := range e.pf.Positions {
-		if p.Total <= 0 {
-			continue
-		}
+	e.led.EachExposure(func(id mktdata.InstrumentID, _ trading.Exposure) bool {
 		if b, ok := e.cur.Bar(id); ok {
 			e.prices[id] = b.Close
 		}
-	}
-	return e.pf.EquityCents(e.prices)
+		return true
+	})
+	return e.led.EquityCents(e.prices)
 }
 
 // ---- 快照（C6）----
@@ -455,11 +607,18 @@ type snapshot struct {
 	PeakEquity int64                                 `json:"peakEquity"`
 	Cursor     mktdata.CursorState                   `json:"cursor"`
 	Indicators map[string]map[string]indicator.State `json:"indicators"`
-	Portfolio  trading.PortfolioState                `json:"portfolio"`
+	Ledger     []byte                                `json:"ledger"`
 	// Pending 必须进快照 —— 否则实盘恢复后，昨日挂出的未成交单会凭空消失
 	Pending []trading.PendingOrder `json:"pending"`
 	// Strategy 策略自身的跨步状态。实现 StatefulStrategy 的策略才有。
 	Strategy []byte `json:"strategy,omitempty"`
+	// Exits 离场规则链的跨步状态。移动止损的峰值在这里 ——
+	// 不存的话，从快照恢复后峰值归零，移动止损**静默失效**：
+	// 不报错、不异常，只是再也不会触发
+	Exits []byte `json:"exits,omitempty"`
+	// Risks 风控链的跨步状态。熔断的冷静期倒计时在这里 ——
+	// 不存的话，从快照恢复的那一步冷静期归零，**熔断静默解除**
+	Risks []byte `json:"risks,omitempty"`
 	// ResultHash 输出指纹的滚动哈希状态。
 	//
 	// 不存的话，从快照恢复后继续跑出来的指纹会缺掉快照之前的全部成交 ——
@@ -473,11 +632,15 @@ func (e *Engine) Snapshot() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("序列化输出指纹状态失败: %w", err)
 	}
+	ledSnap, err := e.led.SnapshotLedger()
+	if err != nil {
+		return nil, fmt.Errorf("序列化账本失败: %w", err)
+	}
 	s := snapshot{
 		Steps: e.steps, PeakEquity: e.peakEquity, ResultHash: rh,
 		Cursor:     e.cur.Snapshot(),
 		Indicators: make(map[string]map[string]indicator.State, len(e.keys)),
-		Portfolio:  e.pf.Snapshot(),
+		Ledger:     ledSnap,
 		Pending:    append([]trading.PendingOrder(nil), e.pending...),
 	}
 	if ss, ok := e.strategy.(StatefulStrategy); ok {
@@ -486,6 +649,20 @@ func (e *Engine) Snapshot() ([]byte, error) {
 			return nil, fmt.Errorf("策略状态快照失败: %w", err)
 		}
 		s.Strategy = b
+	}
+	if len(e.exits) > 0 {
+		b, err := e.exits.SnapshotState()
+		if err != nil {
+			return nil, fmt.Errorf("离场规则状态快照失败: %w", err)
+		}
+		s.Exits = b
+	}
+	if len(e.risk) > 0 {
+		b, err := e.risk.SnapshotState()
+		if err != nil {
+			return nil, fmt.Errorf("风控规则状态快照失败: %w", err)
+		}
+		s.Risks = b
 	}
 	for _, key := range e.keys {
 		m := make(map[string]indicator.State, len(e.indicators[key]))
@@ -524,7 +701,9 @@ func (e *Engine) Restore(data []byte) error {
 		}
 		e.indicators[key] = m
 	}
-	e.pf.Restore(s.Portfolio)
+	if err := e.led.RestoreLedger(s.Ledger); err != nil {
+		return err
+	}
 	e.pending = append([]trading.PendingOrder(nil), s.Pending...)
 	e.steps = s.Steps
 	e.peakEquity = s.PeakEquity
@@ -540,6 +719,16 @@ func (e *Engine) Restore(data []byte) error {
 		}
 		if err := ss.RestoreState(s.Strategy); err != nil {
 			return fmt.Errorf("恢复策略状态失败: %w", err)
+		}
+	}
+	if len(e.exits) > 0 {
+		if err := e.exits.RestoreState(s.Exits); err != nil {
+			return fmt.Errorf("恢复离场规则状态失败: %w", err)
+		}
+	}
+	if len(e.risk) > 0 {
+		if err := e.risk.RestoreState(s.Risks); err != nil {
+			return fmt.Errorf("恢复风控规则状态失败: %w", err)
 		}
 	}
 	return nil
@@ -567,7 +756,7 @@ func (c *stepCtx) Bar(id mktdata.InstrumentID) (mktdata.Bar, bool) { return c.e.
 func (c *stepCtx) Instrument(id mktdata.InstrumentID) *mktdata.Instrument {
 	return c.e.uni.Get(id)
 }
-func (c *stepCtx) Portfolio() *trading.Portfolio   { return c.e.pf }
+func (c *stepCtx) Ledger() trading.Ledger          { return c.e.led }
 func (c *stepCtx) Pending() []trading.PendingOrder { return c.e.pending }
 func (c *stepCtx) Fills() []trading.Fill           { return c.e.fills }
 func (c *stepCtx) Rejections() []trading.Rejection { return c.e.rejects }
@@ -584,8 +773,22 @@ func (c *stepCtx) InitialCashCents() int64 { return c.e.cfg.InitialCashCents }
 func (c *stepCtx) PeakEquityCents() int64  { return c.e.peakEquity }
 func (c *stepCtx) Market() trading.Market  { return c.e.market }
 
+// FrictionCents 用**与真正撮合同一套** Fee/Slippage 估这笔成交的摩擦。
+//
+// Sizer 定量时要先把这笔钱留出来 —— 不留的话算出的数量刚好花光资金，
+// 撮合必然因为那点手续费整单被拒。
+func (c *stepCtx) FrictionCents(
+	inst *mktdata.Instrument, side trading.Side, qty, amountCents int64,
+) int64 {
+	bar, ok := c.e.cur.Bar(inst.ID)
+	if !ok {
+		return 0
+	}
+	return c.e.broker.FrictionCents(inst, side, c.time.TradingDay, qty, amountCents, bar)
+}
+
 func (c *stepCtx) Available(id mktdata.InstrumentID) int64 {
-	return c.e.pf.Available(id, c.time.TsClose)
+	return c.e.led.Available(id, c.time.TsClose)
 }
 
 func (c *stepCtx) Indicator(id mktdata.InstrumentID, key string) (indicator.Indicator, bool) {
@@ -595,6 +798,25 @@ func (c *stepCtx) Indicator(id mktdata.InstrumentID, key string) (indicator.Indi
 	}
 	ind, ok := m[id]
 	return ind, ok
+}
+
+// AdjBar 返回复权后的整根 bar。
+//
+// 与 AdjClose 同源，但条件表达式要用到 open / high / low，
+// 只给收盘价不够。前复权同样被拒 —— 理由见 AdjClose。
+func (c *stepCtx) AdjBar(id mktdata.InstrumentID, mode mktdata.AdjMode) (mktdata.Bar, bool) {
+	bar, ok := c.e.cur.Bar(id)
+	if !ok {
+		return mktdata.Bar{}, false
+	}
+	if mode == mktdata.AdjNone || c.e.adj == nil {
+		return bar, true
+	}
+	if mode == mktdata.AdjQFQ {
+		// 前复权锚定末日，用于决策即构成未来函数（C1）且不可复现（C5）
+		return mktdata.Bar{}, false
+	}
+	return c.e.adj.AdjustBar(id, bar, mode), true
 }
 
 func (c *stepCtx) AdjClose(id mktdata.InstrumentID, back int, mode mktdata.AdjMode) (int64, bool) {
@@ -636,6 +858,7 @@ var (
 	_ StepContext         = (*stepCtx)(nil)
 	_ trading.SizeContext = (*stepCtx)(nil)
 	_ trading.RiskContext = (*stepCtx)(nil)
+	_ trading.ExitContext = (*stepCtx)(nil)
 )
 
 // ---- 本步中间产物 ----
@@ -658,5 +881,127 @@ func (e *Engine) Sizer() trading.Sizer { return e.sizer }
 // Risk 返回装配的风控链。
 func (e *Engine) Risk() trading.RiskChain { return e.risk }
 
+// Exits 返回装配的离场规则链。
+func (e *Engine) Exits() trading.ExitChain { return e.exits }
+
+// WarmupReporter 供**能报出预热情况**的策略实现。
+//
+// 预热是逐标的的：MACD(12,26,9) 要 35 根、MA200 要 200 根，
+// 而每只标的从自己上市那天起算。Ready() 已经保证了未就绪的不参与决策，
+// 但此前**没有任何地方把它显示出来** —— 用户只看到「信号少」，
+// 看不出是条件不满足还是指标还没算出来。
+type WarmupReporter interface {
+	Warmup() (evaluated, notReady int)
+}
+
+// Warmup 返回上一步进入决策集合与仍在预热的标的数。
+// ok 为 false 表示当前策略不报这个。
+func (e *Engine) Warmup() (evaluated, notReady int, ok bool) {
+	w, is := e.strategy.(WarmupReporter)
+	if !is {
+		return 0, 0, false
+	}
+	ev, nr := w.Warmup()
+	return ev, nr, true
+}
+
 // Recorder 返回装配的记录器。
 func (e *Engine) Recorder() record.Recorder { return e.rec }
+
+// marks 收集当前时点各持仓标的的最新价，供账本重估使用。
+//
+// 只取**有敞口的**标的：无敞口的标的重估它没有意义，
+// 而全市场取价在大标的池下是每步几千次查表。
+func (e *Engine) marks() map[mktdata.InstrumentID]int64 {
+	for id := range e.prices {
+		delete(e.prices, id)
+	}
+	e.led.EachExposure(func(id mktdata.InstrumentID, _ trading.Exposure) bool {
+		if b, ok := e.cur.Bar(id); ok {
+			e.prices[id] = b.Close
+		}
+		return true
+	})
+	return e.prices
+}
+
+// Liquidations 返回累计的强平记录。现货账本下恒为空。
+func (e *Engine) Liquidations() []trading.Liquidation { return e.liquidations }
+
+// ---- 单步调试的只读入口（v0.4）----
+//
+// 这一组存在的理由只有一个：**回答「这一天为什么是这个决定」**。
+//
+// 批量回测只需要知道「发生了什么」，单步调试要知道「为什么」，
+// 而「为什么」不在成交记录里 —— 它在指标值、在途队列、可卖数量里。
+// 这些量此前只经 StepContext 给策略看，策略之外拿不到，
+// 于是「今天 MACD 是多少」这种最基本的问题只能靠加日志。
+
+// Pending 返回当前尚未成交的订单队列。
+//
+// **单步调试最常问的问题是「为什么今天没买」**，而最常见的答案是
+// 「单还在队列里等着」—— T+1 的卖单、次日开盘执行的买单都在这里。
+// 看不到这个队列，就只能得出「策略没发信号」这个错误结论。
+func (e *Engine) Pending() []trading.PendingOrder { return e.pending }
+
+// NumSteps 返回本次运行总共有多少个时点。
+func (e *Engine) NumSteps() int { return e.col.NumSteps() }
+
+// Now 返回当前所处的时点。尚未开始时 ok 为 false。
+func (e *Engine) Now() (mktdata.TimePoint, bool) {
+	if e.steps <= 0 || e.steps > e.col.NumSteps() {
+		return mktdata.TimePoint{}, false
+	}
+	return e.col.StepAt(e.steps - 1), true
+}
+
+// PeekAt 返回第 i 个时点（0 起）。用于「跑到某日」前先算出目标步数。
+func (e *Engine) PeekAt(i int) (mktdata.TimePoint, bool) {
+	if i < 0 || i >= e.col.NumSteps() {
+		return mktdata.TimePoint{}, false
+	}
+	return e.col.StepAt(i), true
+}
+
+// IndicatorKeys 返回本次装配声明了哪些指标（策略在 Init 里 Use 的那些）。
+func (e *Engine) IndicatorKeys() []string {
+	out := make([]string, len(e.keys))
+	copy(out, e.keys)
+	return out
+}
+
+// IndicatorAt 取某标的在当前时点的指标值。
+//
+// ready 为 false 时值是**垃圾**（预热未完成），调用方必须原样传给界面 ——
+// 把未就绪的指标画成 0 会让人以为「指标是 0 所以没信号」，
+// 而真相是「指标还没算出来」。这两件事在调试时天差地别。
+func (e *Engine) IndicatorAt(id mktdata.InstrumentID, key string) (
+	names []string, values []float64, ready, ok bool,
+) {
+	m, exists := e.indicators[key]
+	if !exists {
+		return nil, nil, false, false
+	}
+	ind, exists := m[id]
+	if !exists {
+		return nil, nil, false, false
+	}
+	v := ind.Values()
+	cp := make([]float64, len(v))
+	copy(cp, v) // Values 返回内部切片的视图，下一步会被改写
+	return ind.Names(), cp, ind.Ready(), true
+}
+
+// BarAt 取某标的在当前时点的 bar（**原始价**，与撮合口径一致）。
+func (e *Engine) BarAt(id mktdata.InstrumentID) (mktdata.Bar, bool) {
+	return e.cur.Bar(id)
+}
+
+// AvailableAt 取某标的当前可卖数量（已考虑 T+1）。
+func (e *Engine) AvailableAt(id mktdata.InstrumentID) int64 {
+	tp, ok := e.Now()
+	if !ok {
+		return 0
+	}
+	return e.led.Available(id, tp.TsClose)
+}

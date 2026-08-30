@@ -64,6 +64,27 @@ func main() {
 	mux.HandleFunc("GET /api/kline/{id}", store.handleKline)
 	mux.HandleFunc("GET /api/configs", store.handleConfigs)
 	mux.HandleFunc("POST /api/backtest", store.handleBacktest)
+	mux.HandleFunc("POST /api/universe", store.handleUniverse)
+	// 模块目录：前端据此自动生成表单。**前端不得自己维护一份清单**
+	// 海选：只读跑完的结果。跑由 cmd/sweep 负责 ——
+	// 一次几秒到几分钟且吃满 CPU，塞进 HTTP 请求一刷新就能顶住
+	mux.HandleFunc("GET /api/sweeps", store.handleSweepList)
+	mux.HandleFunc("GET /api/sweeps/{id}", store.handleSweepDetail)
+
+	mux.HandleFunc("GET /api/modules", store.handleModules)
+	mux.HandleFunc("GET /api/fees", store.handleFees)
+
+	// 单步调试会话（v0.4）。纯 HTTP，不用 WebSocket ——
+	// 步进是用户驱动的请求/响应，没有服务端主动产生的事件。理由见 session.go
+	mux.HandleFunc("GET /api/session", store.handleSessionList)
+	mux.HandleFunc("POST /api/session", store.handleSessionCreate)
+	mux.HandleFunc("GET /api/session/{id}", store.handleSessionGet)
+	mux.HandleFunc("DELETE /api/session/{id}", store.handleSessionDelete)
+	mux.HandleFunc("POST /api/session/{id}/step", store.handleSessionStep)
+	mux.HandleFunc("POST /api/session/{id}/reset", store.handleSessionReset)
+	mux.HandleFunc("GET /api/session/{id}/inspect", store.handleSessionInspect)
+	mux.HandleFunc("GET /api/session/{id}/snapshot", store.handleSessionSnapshot)
+	mux.HandleFunc("POST /api/session/{id}/restore", store.handleSessionRestore)
 
 	// 前端产物存在就一并伺服，这样 `go run` 一条命令即可用；
 	// 开发时走 Vite（它把 /api 代理到这里），不依赖本分支。
@@ -176,6 +197,7 @@ const apiIndex = `AStockEngine 数据核对服务
   GET /api/corp-actions            全市场分红送配 ?from=&to=&q=&hasEffect=
   GET /api/configs                 列出回测配置（含解析结果，供前端改参数）
   POST /api/backtest               跑一次回测，返回绩效 / 净值 / 成交 / 拒单 / 逐轮
+  POST /api/universe               预览标的池：命中多少只、都是些什么
   GET /api/kline/{id}              K 线 + 引擎算出的指标
       ?adj=none|qfq|hfq            复权模式，K 线与指标同基准（默认 none）
       &from=&to=&macd=12,26,9&kdj=9,3,3&ma=5,10,20,60

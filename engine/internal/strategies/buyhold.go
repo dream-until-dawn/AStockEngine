@@ -60,11 +60,10 @@ func (s *BuyAndHold) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 // 策略再存一份必然在快照恢复时不一致 —— 这是端到端回测暴露过的真实缺陷。
 func holdingSet(ctx eng.StepContext) (held, inFlight map[mktdata.InstrumentID]bool) {
 	held = make(map[mktdata.InstrumentID]bool, 32)
-	for id, p := range ctx.Portfolio().Positions {
-		if p.Total > 0 {
-			held[id] = true
-		}
-	}
+	ctx.Ledger().EachExposure(func(id mktdata.InstrumentID, _ trading.Exposure) bool {
+		held[id] = true
+		return true
+	})
 	pending := ctx.Pending()
 	inFlight = make(map[mktdata.InstrumentID]bool, len(pending))
 	for _, po := range pending {

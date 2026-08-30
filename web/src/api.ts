@@ -1,4 +1,7 @@
-import type { Instrument, InstrumentDetail, Kline, Meta, Paged } from './types'
+import type {
+  Inspect, Instrument, InstrumentDetail, Kline, Meta, Paged,
+  SessionBrief, SessionState, StepReq, StepResult,
+} from './types'
 
 export class ApiError extends Error {}
 
@@ -85,24 +88,64 @@ export function labelOf(items: { code: number; label: string }[] | undefined, co
 
 // ---- 回测 ----
 
+async function post<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`/api${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+  })
+  const text = await res.text()
+  if (!res.ok) {
+    try {
+      throw new ApiError(JSON.parse(text).error ?? text)
+    } catch (e) {
+      if (e instanceof ApiError) throw e
+      throw new ApiError(`HTTP ${res.status}: ${text.slice(0, 400)}`)
+    }
+  }
+  return JSON.parse(text) as T
+}
+
 export const runApi = {
   configs: () =>
     get<{ dir: string; configs: import('./types').ConfigItem[] }>('/configs'),
-  backtest: async (cfg: unknown): Promise<import('./types').RunResult> => {
-    const res = await fetch('/api/backtest', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: typeof cfg === 'string' ? cfg : JSON.stringify(cfg),
-    })
-    const text = await res.text()
-    if (!res.ok) {
-      try {
-        throw new ApiError(JSON.parse(text).error ?? text)
-      } catch (e) {
-        if (e instanceof ApiError) throw e
-        throw new ApiError(`HTTP ${res.status}: ${text.slice(0, 400)}`)
-      }
-    }
-    return JSON.parse(text)
-  },
+  universe: (u: import('./types').UniverseSpec) =>
+    post<import('./types').UniversePreview>('/universe', u),
+  backtest: (cfg: unknown) => post<import('./types').RunResult>('/backtest', cfg),
+  // 模块目录 —— 引擎 registry 里的同一份 ParamSpec，前端不另存一份
+  modules: () => get<import('./types').ModuleCatalog>('/modules'),
+  // 海选只读跑完的结果 —— 跑由 cmd/sweep 负责，
+  // 一次几秒到几分钟且吃满 CPU，塞进 HTTP 请求一刷新就能顶住
+  sweeps: () => get<{ sweeps: import('./types').SweepBrief[] }>('/sweeps'),
+  sweep: (id: string) => get<import('./types').SweepDetail>('/sweeps/' + id),
+  // 费率文件与它们**实际生效的规则** —— 费率是 A 股策略的主要亏损来源
+  // 之一（实测摩擦占初始资金 20.45%），不能只给一个填路径的文本框
+  fees: () => get<{ dir: string; files: import('./types').FeeFile[] }>('/fees'),
+}
+
+// ---- 单步调试会话（v0.4）----
+//
+// 纯 HTTP，没有 WebSocket：步进是**用户驱动的请求/响应**，
+// 点一下走一步，等的就是这一步的结果。服务端这里没有主动产生的事件，
+// 换成 WS 只会多一套连接生命周期与断线对齐。理由详见服务端 session.go。
+
+export const dbgApi = {
+  list: () => get<{ sessions: SessionBrief[]; max: number }>('/session'),
+  create: (cfg: unknown) => post<{ state: SessionState }>('/session', cfg),
+  get: (id: string) => get<{ state: SessionState }>(`/session/${id}`),
+  step: (id: string, req: StepReq) => post<StepResult>(`/session/${id}/step`, req),
+  reset: (id: string) => post<{ state: SessionState }>(`/session/${id}/reset`, {}),
+  inspect: (id: string, instrument: string) =>
+    get<Inspect>(`/session/${id}/inspect`, { instrument }),
+  restore: (id: string, snap: string) =>
+    post<{ state: SessionState }>(`/session/${id}/restore`, snap),
+  drop: (id: string) => del<{ ok: boolean }>(`/session/${id}`),
+  snapshotURL: (id: string) => `/api/session/${id}/snapshot`,
+}
+
+async function del<T>(path: string): Promise<T> {
+  const res = await fetch(`/api${path}`, { method: 'DELETE' })
+  const text = await res.text()
+  if (!res.ok) throw new ApiError(JSON.parse(text).error ?? text)
+  return JSON.parse(text) as T
 }

@@ -1,0 +1,67 @@
+{
+  "name": "加密单标的（ETH-USDT-SWAP）· 网格 · 仅开空 · 5 层 11 线 · 0 线持半仓 · 止损在满仓格下 2 格（做空的满仓格在上方）。做空网格只在允许做空的市场可用；配到 A 股上会在装配时直接报错，而不是安静地跑成零成交。",
+  "data": {
+    "root": "../../data",
+    "market": "crypto",
+    "freq": "1d",
+    "from": 20200101,
+    "to": 0,
+    "universe": {
+      "symbols": [
+        "ETH-USDT-SWAP"
+      ]
+    }
+  },
+  "market": {
+    "impl": "crypto"
+  },
+  "fee": {
+    "impl": "config",
+    "params": {
+      "path": "../fee/crypto_okx.json"
+    }
+  },
+  "slippage": {
+    "impl": "fixed_bps",
+    "params": {
+      "bps": 5
+    }
+  },
+  "portfolio": {
+    "initial_cash_cents": 100000,
+    "ledger": "margin",
+    "leverage": 2,
+    "maint_margin_ppm": 5000
+  },
+  "broker": {
+    "volume_cap_ppm": 100000,
+    "allow_partial_fill": true
+  },
+  "metrics": {
+    "benchmark": "ETH-USDT-SWAP",
+    "risk_free_ppm": 0
+  },
+  "recorder": {
+    "level": "summary"
+  },
+  "strategy": {
+    "impl": "grid",
+    "params": {
+      "levels": 5,
+      "step_pct": 5,
+      "stop_levels": 2,
+      "short": 1,
+      "long": 0
+    }
+  },
+  "sizer": {
+    "impl": "pct_equity",
+    "params": {
+      "pct": 80,
+      "base": "cost",
+      "max_positions": 1
+    }
+  },
+  "risk": [],
+  "exit": []
+}

@@ -11,6 +11,7 @@ import (
 	eng "github.com/dream-until-dawn/AStockEngine/engine/internal/engine"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/record"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/spec"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 )
 
@@ -28,9 +29,17 @@ type DataSet struct {
 	Stats    mktdata.LoadStats
 	Root     string
 
-	// BenchmarkID 基准标的。它在 Columns 里但**不在标的池里**
+	// BenchmarkID 基准标的。它**不在标的池里** —— 否则策略会把它当成
+	// 可交易标的，超额收益就成了自己跟自己比
 	BenchmarkID  mktdata.InstrumentID
 	HasBenchmark bool
+	// BenchDays / BenchEquity 基准的后复权净值序列，**在裁子集之前算好**。
+	//
+	// 不能等到用的时候再从 Columns 取：调用方可能已经把 Columns 裁成
+	// 不含基准的子集了（服务端为了复用就是这么做的），那时再取只会取到空 ——
+	// 而「基准区块整个消失」这种失败是静悄悄的，报告里只是少了一段。
+	BenchDays   []int32
+	BenchEquity []int64
 }
 
 // LoadDataSet 按配置载入数据。
@@ -96,33 +105,44 @@ func LoadDataSet(c *Config) (*DataSet, error) {
 		Columns: col, Universe: uni, Adjuster: adj, CorpAct: corp,
 		Calendar: cal, Stats: st, Root: root,
 	}
-	if hasBench {
-		ds.BenchmarkID, ds.HasBenchmark = benchID, true
+	if hasBench && !ds.SetBenchmark(col, benchID) {
+		return nil, fmt.Errorf("metrics.benchmark: %q 在该区间内没有行情",
+			c.Metrics.Benchmark)
 	}
 	return ds, nil
 }
 
-// BenchmarkCurve 抽出基准的净值序列，**用后复权收盘价**。
+// BenchmarkCurve 返回基准的净值序列。
+func (ds *DataSet) BenchmarkCurve() (days []int32, equity []int64, ok bool) {
+	if !ds.HasBenchmark || len(ds.BenchDays) == 0 {
+		return nil, nil, false
+	}
+	return ds.BenchDays, ds.BenchEquity, true
+}
+
+// SetBenchmark 记下基准标的并**立刻**算出它的后复权净值序列。
 //
 // 后复权而非原始价：基准的总回报要含分红再投，否则会系统性低估基准、
 // 让策略的超额收益虚高。
 //
+// 必须在把 Columns 裁成子集**之前**调用 —— 基准不在标的池里，
+// 裁完就取不到了。
+//
 // 覆盖不到的交易日直接缺席，由 metrics 按交集处理 ——
 // 数据里没有指数（C10 纯技术面，ETL 没拉指数行情），只能用 ETF 代理，
 // 而宽基 ETF 最早到 2012（510300 / 159919 都是 2012-05-28 起）。
-func (ds *DataSet) BenchmarkCurve() (days []int32, equity []int64, ok bool) {
-	if !ds.HasBenchmark {
-		return nil, nil, false
-	}
-	days, closes, ok := ds.Columns.Series(ds.BenchmarkID)
+func (ds *DataSet) SetBenchmark(col *mktdata.Columns, id mktdata.InstrumentID) bool {
+	days, closes, ok := col.Series(id)
 	if !ok {
-		return nil, nil, false
+		return false
 	}
-	equity = make([]int64, len(closes))
+	equity := make([]int64, len(closes))
 	for i, c := range closes {
-		equity[i] = ds.Adjuster.Adjust(ds.BenchmarkID, days[i], c, mktdata.AdjHFQ)
+		equity[i] = ds.Adjuster.Adjust(id, days[i], c, mktdata.AdjHFQ)
 	}
-	return days, equity, true
+	ds.BenchmarkID, ds.HasBenchmark = id, true
+	ds.BenchDays, ds.BenchEquity = days, equity
+	return true
 }
 
 // ResolveUniverse 把配置里的过滤条件解析成一组标的 ID。
@@ -163,9 +183,16 @@ func (c *Config) ResolveUniverse(
 	if err != nil {
 		return nil, err
 	}
+	wantMarket, err := parseMarkets(u.Market)
+	if err != nil {
+		return nil, err
+	}
 
 	picked := make([]mktdata.InstrumentID, 0, 1024)
 	for _, in := range uni.All() {
+		if wantMarket != nil && !wantMarket[in.Market] {
+			continue
+		}
 		if wantType >= 0 && in.Type != mktdata.InstrumentType(wantType) {
 			continue
 		}
@@ -208,6 +235,9 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 		return nil, err
 	}
 
+	if err := checkMarketRules(ds.Universe, ids, c.Market.Impl); err != nil {
+		return nil, err
+	}
 	market, err := trading.Markets.Build(c.Market.Impl, c.Market.Params)
 	if err != nil {
 		return nil, err
@@ -225,22 +255,47 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 		return nil, err
 	}
 	chain := make(trading.RiskChain, 0, len(c.Risk))
+	// riskExits 是风控规则里**同时也是离场规则**的那些。
+	//
+	// 回撤熔断勾选「触发时清仓」后，它既要拦开仓（Risk），
+	// 又要发平仓信号（ExitRule）—— 两件事必须由**同一个实例**做，
+	// 否则两份冷静期状态各走各的。
+	//
+	// 用接口判断而不是认名字：认名字的话，将来改个名就静默失效
+	var riskExits trading.ExitChain
 	for i, r := range c.Risk {
 		rr, err := trading.Risks.Build(r.Impl, r.Params)
 		if err != nil {
 			return nil, fmt.Errorf("risk[%d]: %w", i, err)
 		}
 		chain = append(chain, rr)
+		if er, ok := rr.(trading.ExitRule); ok {
+			riskExits = append(riskExits, er)
+		}
 	}
-	strat, err := eng.Strategies.Build(c.Strategy.Impl, nil)
+	// 风控出的离场信号排在**用户配的离场规则之前** ——
+	// 熔断清仓要压过止盈：ExitChain 按标的去重，靠前的赢
+	exits := make(trading.ExitChain, 0, len(riskExits)+len(c.Exit))
+	exits = append(exits, riskExits...)
+	for i, r := range c.Exit {
+		er, err := trading.Exits.Build(r.Impl, r.Params)
+		if err != nil {
+			return nil, fmt.Errorf("exit[%d]: %w", i, err)
+		}
+		exits = append(exits, er)
+	}
+	led, err := c.buildLedger(ds.Universe)
 	if err != nil {
 		return nil, err
 	}
-	specs, _ := eng.Strategies.Specs(c.Strategy.Impl)
-	params, err := decodeStrategyParams(specs, c.Strategy.Params)
+	strat, params, err := buildStrategy(c.Strategy, market.AllowsShort())
 	if err != nil {
-		return nil, fmt.Errorf("strategy.params: %w", err)
+		return nil, err
 	}
+	// 「做空策略不能配在不许做空的市场上」这条守卫**在 eng.New 里**，
+	// 不在这里。这里查过一次，而它是错的：网格这类策略的 short 开关是
+	// Init 时才写进去的，在装配阶段问 NeedsShort() 只能拿到零值 false。
+	// 实测那次静默失效见 engine.go 里那段注释。
 
 	allowPartial := true
 	if c.Broker.AllowPartialFill != nil {
@@ -262,15 +317,17 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 		Broker: trading.NewBroker(market, fee, slip, trading.BrokerConfig{
 			VolumeCapPPM: c.Broker.VolumeCapPPM, AllowPartialFill: allowPartial,
 		}),
-		Portfolio: trading.NewPortfolio(c.Portfolio.InitialCashCents),
-		Sizer:     sizer,
-		Risk:      chain,
+		Ledger: led,
+		Sizer:  sizer,
+		Risk:   chain,
+		Exits:  exits,
 	}, strat, eng.Config{
 		Params:               params,
 		IndicatorAdjMode:     adjMode,
 		InitialCashCents:     c.Portfolio.InitialCashCents,
 		DividendTaxPPM:       c.Portfolio.DividendTaxPPM,
 		ImplySplitFromFactor: implySplit,
+		TradeFrom:            c.Engine.TradeFrom,
 	})
 }
 
@@ -281,8 +338,19 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 func (c *Config) narrow(
 	col *mktdata.Columns, ids []mktdata.InstrumentID,
 ) (*mktdata.Columns, error) {
+	// 判据是**「col 里的标的都在 ids 里」而不是「两者相等」**。
+	//
+	// 相等这个条件在含退市股的标的池上永远不成立：ResolveUniverse 按
+	// instruments 表返回 3,485 只主板个股，而在 2020 年之后真有行情的
+	// 只有 3,375 只 —— 差着 110 只从没进过这段区间的退市股。
+	// 于是每次 Assemble 都重新 Subset 一份，实测**每次 358 MB**。
+	// 海选 8 个 worker 就是 2.8 GB 的纯重复拷贝（cmd/enginebench 可复现）。
+	//
+	// 放宽成子集关系是安全的：ids 里没有行情的标的，Subset 本来也会丢掉，
+	// 拷完的结果与 col 逐位相同。反过来 col 里有 ids 之外的标的
+	// （典型是基准标的）时仍然必须拷 —— 基准不能进标的池。
 	have := col.Instruments()
-	sameSet := len(have) == len(ids)
+	sameSet := len(have) <= len(ids)
 	if sameSet {
 		want := make(map[mktdata.InstrumentID]bool, len(ids))
 		for _, id := range ids {
@@ -314,6 +382,11 @@ func (c *Config) narrow(
 }
 
 // feeParams 把 fee.params.path 解成相对配置文件的路径后再交给 registry。
+//
+// **只改 path，其余参数原样带过去。** 早先这里是直接重建一个
+// `{"path": ...}` 交出去的 —— 那会把同一段里的其他参数
+// （如 commission_ppm 佣金覆盖）**整个丢掉**，而且不报错：
+// 引擎照常跑，只是覆盖没生效，费用还是文件里的默认值。
 func (c *Config) feeParams() []byte {
 	if c.Fee.Impl != "config" {
 		return c.Fee.Params
@@ -322,8 +395,25 @@ func (c *Config) feeParams() []byte {
 	if err != nil || path == "" {
 		return c.Fee.Params
 	}
-	resolved := c.resolvePath(path)
-	return []byte(fmt.Sprintf(`{"path":%q}`, resolved))
+	var m map[string]json.RawMessage
+	if len(c.Fee.Params) > 0 {
+		if err := json.Unmarshal(c.Fee.Params, &m); err != nil {
+			return c.Fee.Params
+		}
+	}
+	if m == nil {
+		m = map[string]json.RawMessage{}
+	}
+	resolved, err := json.Marshal(c.resolvePath(path))
+	if err != nil {
+		return c.Fee.Params
+	}
+	m["path"] = resolved
+	out, err := json.Marshal(m)
+	if err != nil {
+		return c.Fee.Params
+	}
+	return out
 }
 
 func decodeFeePath(raw []byte) (string, error) {
@@ -363,6 +453,90 @@ func parseStatus(s string) (int, error) {
 		return int(mktdata.StatusDelisted), nil
 	}
 	return 0, fmt.Errorf("未知的 universe.status %q，可选：all / listed / delisted", s)
+}
+
+// checkMarketRules 拦下「市场规则与标的对不上」。
+//
+// 数据层是市场无关的（C9），交易规则层不是。A 股规则带着 T+1、涨跌停、
+// 印花税、243 日年化；加密规则是 T+0、无涨跌停、365 日年化。
+// 套错了**不会报任何错**，只会静默给出一份看着很正常的假结果 ——
+// 这比崩溃危险得多。
+//
+// CryptoMarket 落地后这里不再一刀切拒绝，而是**按标的所属市场查表**：
+// 规则实现与标的池里的市场对不上才拒。
+func checkMarketRules(uni *mktdata.Universe, ids []mktdata.InstrumentID, impl string) error {
+	want := map[string]mktdata.Market{
+		"ashare": mktdata.MarketAShare,
+		"crypto": mktdata.MarketCrypto,
+	}[strings.ToLower(strings.TrimSpace(impl))]
+	if want == mktdata.MarketUnknown {
+		return nil // 未知的规则实现由 registry 报错，不在这里重复
+	}
+	counts := make(map[mktdata.Market]int, 2)
+	var sample string
+	for _, id := range ids {
+		in := uni.Get(id)
+		if in == nil || in.Market == want {
+			continue
+		}
+		if counts[in.Market] == 0 {
+			sample = in.Symbol
+		}
+		counts[in.Market]++
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	parts := make([]string, 0, len(counts))
+	for m, n := range counts {
+		parts = append(parts, fmt.Sprintf("%s %d 个", m, n))
+	}
+	sort.Strings(parts)
+	return fmt.Errorf("market.impl=%q 但标的池里有别的市场的标的（%s，如 %s）—— "+
+		"交易规则（T+1 / 涨跌停 / 年化系数）套错市场会静默给出错误结果。"+
+		"请用 universe.market 限定市场，并把 market.impl 改成对应的实现",
+		impl, strings.Join(parts, "、"), sample)
+}
+
+// buildLedger 按配置选账本。
+//
+// **A 股用现货、加密用逐仓双向**，默认值在 config.defaultLedger 里。
+// 两者都实现 Ledger，引擎不知道区别 —— 这正是 v0.3.2 把账本抽成接口的目的。
+func (c *Config) buildLedger(uni *mktdata.Universe) (trading.Ledger, error) {
+	valuer := func(id mktdata.InstrumentID, price, qty int64) int64 {
+		return trading.NotionalCents(uni.Get(id), price, qty)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Portfolio.Ledger)) {
+	case "", "spot":
+		pf := trading.NewPortfolio(c.Portfolio.InitialCashCents)
+		pf.SetValuer(valuer)
+		return pf, nil
+	case "margin":
+		ml := trading.NewMarginLedger(c.Portfolio.InitialCashCents,
+			c.Portfolio.Leverage, c.Portfolio.MaintMarginPPM)
+		ml.SetValuer(valuer)
+		return ml, nil
+	}
+	return nil, fmt.Errorf("未知的 portfolio.ledger %q，可选：spot / margin",
+		c.Portfolio.Ledger)
+}
+
+func parseMarkets(ss []string) (map[mktdata.Market]bool, error) {
+	if len(ss) == 0 {
+		return nil, nil
+	}
+	m := make(map[mktdata.Market]bool, len(ss))
+	for _, s := range ss {
+		switch strings.ToLower(s) {
+		case "ashare", "a", "cn":
+			m[mktdata.MarketAShare] = true
+		case "crypto", "okx":
+			m[mktdata.MarketCrypto] = true
+		default:
+			return nil, fmt.Errorf("未知的 universe.market %q，可选：ashare / crypto", s)
+		}
+	}
+	return m, nil
 }
 
 func parseBoards(ss []string) (map[mktdata.Board]bool, error) {
@@ -417,6 +591,11 @@ func (c *Config) Describe(e *eng.Engine, ds *DataSet, load time.Duration) []stri
 	if len(risks) > 0 {
 		riskStr = strings.Join(risks, " → ")
 	}
+	exits := e.Exits().Names()
+	exitStr := "无"
+	if len(exits) > 0 {
+		exitStr = strings.Join(exits, " → ")
+	}
 	name := c.Name
 	if name == "" {
 		name = "(未命名)"
@@ -431,6 +610,7 @@ func (c *Config) Describe(e *eng.Engine, ds *DataSet, load time.Duration) []stri
 		fmt.Sprintf("策略    %s %s", c.Strategy.Impl, rawOrEmpty(c.Strategy.Params)),
 		fmt.Sprintf("仓位    %s %s", c.Sizer.Impl, rawOrEmpty(c.Sizer.Params)),
 		fmt.Sprintf("风控    %s", riskStr),
+		fmt.Sprintf("离场    %s", exitStr),
 		fmt.Sprintf("市场    %s   费率 %s   滑点 %s %s",
 			c.Market.Impl, c.Fee.Impl, c.Slippage.Impl, rawOrEmpty(c.Slippage.Params)),
 		fmt.Sprintf("撮合    成交量上限 %.2f%%  部分成交 %v",
@@ -447,4 +627,67 @@ func rawOrEmpty(raw []byte) string {
 		return "(默认参数)"
 	}
 	return string(raw)
+}
+
+// buildStrategy 装配策略，组合策略走另一条路。
+//
+// 返回的 Params 是**引擎级**的那一份：普通策略就是它自己的参数；
+// 组合策略返回空 —— 各源的参数由 Composite 自己在 Init 时分发下去，
+// 因为一份 Params 装不下 N 个源的参数，硬装就得靠前缀，
+// 那会让源看到一个和自己声明不一样的参数名。
+func buildStrategy(m Module, hedge bool) (eng.Strategy, spec.Params, error) {
+	if m.Impl != compositeImpl {
+		s, err := eng.Strategies.Build(m.Impl, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		// 配置是**结构**（规则树）而不是标量的策略走这条路：
+		// 整段 JSON 交给它自己解析，并跳过标量参数校验 —— 它没有 ParamSpec
+		if cs, ok := s.(eng.ConfigurableStrategy); ok {
+			if err := cs.Configure(m.Params); err != nil {
+				return nil, nil, fmt.Errorf("strategy.params: %w", err)
+			}
+			return s, spec.Params{}, nil
+		}
+		specs, _ := eng.Strategies.Specs(m.Impl)
+		p, err := decodeStrategyParams(specs, m.Params)
+		if err != nil {
+			return nil, nil, fmt.Errorf("strategy.params: %w", err)
+		}
+		return s, p, nil
+	}
+
+	mode, err := eng.ParseCombineMode(m.Mode)
+	if err != nil {
+		return nil, nil, fmt.Errorf("strategy.mode: %w", err)
+	}
+	sources := make([]eng.Source, 0, len(m.Sources))
+	for i, src := range m.Sources {
+		s, err := eng.Strategies.Build(src.Impl, nil)
+		if err != nil {
+			return nil, nil, fmt.Errorf("strategy.sources[%d]: %w", i, err)
+		}
+		// 组合的源同样可以是结构化配置的策略（规则树）——
+		// 一多一空两棵树用 union 组起来，就是双向
+		if cs, ok := s.(eng.ConfigurableStrategy); ok {
+			if err := cs.Configure(src.Params); err != nil {
+				return nil, nil, fmt.Errorf("strategy.sources[%d].params: %w", i, err)
+			}
+			sources = append(sources, eng.Source{
+				Name: src.Impl, Strategy: s, Params: spec.Params{},
+			})
+			continue
+		}
+		specs, _ := eng.Strategies.Specs(src.Impl)
+		p, err := decodeStrategyParams(specs, src.Params)
+		if err != nil {
+			return nil, nil, fmt.Errorf("strategy.sources[%d].params: %w", i, err)
+		}
+		sources = append(sources, eng.Source{Name: src.Impl, Strategy: s, Params: p})
+	}
+	comp, err := eng.NewComposite(mode, sources, hedge)
+	if err != nil {
+		return nil, nil, fmt.Errorf("strategy: %w", err)
+	}
+	return comp, spec.Params{}, nil
 }

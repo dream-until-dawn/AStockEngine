@@ -156,6 +156,10 @@ func fill(day int32, id int, side trading.Side, price, qty, fee, slip int64) tra
 		Order: trading.Order{Instrument: mktdata.InstrumentID(id), Side: side, Qty: qty},
 		At:    mktdata.TimePoint{TradingDay: day},
 		Price: price, Qty: qty,
+		// 名义额在生产路径上由撮合器按标的的 scale 与合约乘数算好。
+		// 这里手工造 Fill，用 A 股口径补上 —— 漏填就是 0，
+		// 而 0 不报错，只会让这一笔从成交额与逐轮统计里安静地消失
+		AmountCents:   trading.AmountCents(price, qty),
 		Fee:           trading.FeeBreakdown{Items: map[string]int64{"commission": fee}, Total: fee},
 		SlippageCents: slip,
 	}
@@ -181,7 +185,7 @@ func TestRoundTripsHandChecked(t *testing.T) {
 		fill(20240111, 2, trading.SideSell, 18_000, 500, 0, 0),
 		fill(20240112, 3, trading.SideSell, 5_000, 2000, 0, 0),
 	}
-	trips, open := MatchRoundTrips(fills)
+	trips, open := MatchRoundTrips(fills, false)
 	if len(trips) != 3 {
 		t.Fatalf("期望 3 轮，得到 %d", len(trips))
 	}
@@ -196,7 +200,7 @@ func TestRoundTripsHandChecked(t *testing.T) {
 		}
 	}
 
-	st := computeTrades(fills)
+	st := computeTrades(fills, false)
 	if st.RoundTrips != 3 || st.Wins != 1 || st.Losses != 1 || st.Flat != 1 {
 		t.Errorf("轮次统计：期望 3/1赢/1输/1平，得到 %d/%d/%d/%d",
 			st.RoundTrips, st.Wins, st.Losses, st.Flat)
@@ -216,7 +220,7 @@ func TestRoundTripPartialFIFO(t *testing.T) {
 		fill(20240103, 1, trading.SideBuy, 20_000, 1000, 0, 0),  // 成本 2,000,000
 		fill(20240110, 1, trading.SideSell, 30_000, 1500, 0, 0), // 收入 4,500,000
 	}
-	trips, open := MatchRoundTrips(fills)
+	trips, open := MatchRoundTrips(fills, false)
 	if len(trips) != 2 {
 		t.Fatalf("1500 股跨两层，期望 2 轮，得到 %d", len(trips))
 	}
@@ -228,7 +232,7 @@ func TestRoundTripPartialFIFO(t *testing.T) {
 	if trips[1].PnLCents != 500_000 {
 		t.Errorf("第二层：期望 +500,000，得到 %d", trips[1].PnLCents)
 	}
-	if open[1] != 500 {
+	if open[1].LongQty != 500 {
 		t.Errorf("应余 500 股未平仓，得到 %d", open[1])
 	}
 }
@@ -242,7 +246,7 @@ func TestRoundTripBonusShares(t *testing.T) {
 		fill(20240102, 1, trading.SideBuy, 20_000, 1000, 0, 0),  // 成本 2,000,000
 		fill(20240110, 1, trading.SideSell, 10_000, 2000, 0, 0), // 收入 2,000,000
 	}
-	trips, open := MatchRoundTrips(fills)
+	trips, open := MatchRoundTrips(fills, false)
 	if len(trips) != 2 {
 		t.Fatalf("期望 2 轮（买入层 + 送股层），得到 %d", len(trips))
 	}
@@ -272,7 +276,7 @@ func TestOpenPositionsExcluded(t *testing.T) {
 		fill(20240102, 1, trading.SideBuy, 10_000, 1000, 0, 0),
 		fill(20240103, 2, trading.SideBuy, 10_000, 500, 0, 0),
 		fill(20240110, 1, trading.SideSell, 12_000, 1000, 0, 0),
-	})
+	}, false)
 	if st.RoundTrips != 1 || st.Wins != 1 {
 		t.Errorf("只有 1 轮平仓，期望 1 轮 1 赢，得到 %d 轮 %d 赢", st.RoundTrips, st.Wins)
 	}
@@ -322,7 +326,263 @@ func TestEmptyInputs(t *testing.T) {
 	if r := Compute(Input{}); r.Steps != 0 {
 		t.Error("空输入不该崩，也不该编出数字")
 	}
-	if trips, open := MatchRoundTrips(nil); len(trips) != 0 || len(open) != 0 {
+	if trips, open := MatchRoundTrips(nil, false); len(trips) != 0 || len(open) != 0 {
 		t.Error("空成交流应当给出空结果")
+	}
+}
+
+// ---- 双向（合约）配对 ----
+
+// hedgeFill 造一笔带开平标记的成交。
+func hedgeFill(day int32, id int, side trading.Side, reduce bool,
+	price, qty, fee int64) trading.Fill {
+
+	f := fill(day, id, side, price, qty, fee, 0)
+	f.Reduce = reduce
+	return f
+}
+
+// TestHedgeShortRoundTrip 做空一轮：高开低平算赢。
+//
+// 现货口径下这一对成交会被读成「卖掉一个不存在的多头，再买回来」，
+// 盈亏符号正好相反 —— 断言的就是符号。
+func TestHedgeShortRoundTrip(t *testing.T) {
+	fills := []trading.Fill{
+		hedgeFill(20240102, 1, trading.SideSell, false, 12_000, 1000, 100), // 开空
+		hedgeFill(20240110, 1, trading.SideBuy, true, 10_000, 1000, 100),   // 平空
+	}
+	trips, open := MatchRoundTrips(fills, true)
+	if len(trips) != 1 {
+		t.Fatalf("配出 %d 轮，想要 1 轮", len(trips))
+	}
+	tr := trips[0]
+	if !tr.Short {
+		t.Errorf("这一轮应标为做空")
+	}
+	// 开仓收 1,200,000 − 100 摩擦；平仓付 1,000,000 + 100 摩擦
+	if tr.ProceedCents != 1_200_000-100 || tr.CostCents != 1_000_000+100 {
+		t.Errorf("金额 = 收 %d / 付 %d，想要 1199900 / 1000100",
+			tr.ProceedCents, tr.CostCents)
+	}
+	if tr.PnLCents != 199_800 {
+		t.Errorf("做空下跌应盈利 199800，得到 %d", tr.PnLCents)
+	}
+	if tr.HoldDays != 8 {
+		t.Errorf("持有 %d 天，想要 8", tr.HoldDays)
+	}
+	if len(open) != 0 {
+		t.Errorf("平光了却报 %d 只未平仓", len(open))
+	}
+}
+
+// TestHedgeShortLosesWhenPriceRises 做空上涨算输 —— 符号的另一半。
+func TestHedgeShortLosesWhenPriceRises(t *testing.T) {
+	trips, _ := MatchRoundTrips([]trading.Fill{
+		hedgeFill(20240102, 1, trading.SideSell, false, 10_000, 1000, 0),
+		hedgeFill(20240110, 1, trading.SideBuy, true, 12_000, 1000, 0),
+	}, true)
+	if len(trips) != 1 || trips[0].PnLCents != -200_000 {
+		t.Fatalf("做空上涨应亏 200000，得到 %+v", trips)
+	}
+}
+
+// TestHedgeDoesNotCrossMatch 多空是两个独立队列，不许互相配对。
+//
+// **这是双向配对唯一真正的难点**。合用一个队列时，「开空」会去
+// 平掉手里的多头，于是一笔开仓凭空变成一轮平仓 ——
+// 实测中 336 笔成交配出了 314 轮（上限本是 168）。
+func TestHedgeDoesNotCrossMatch(t *testing.T) {
+	fills := []trading.Fill{
+		hedgeFill(20240102, 1, trading.SideBuy, false, 10_000, 1000, 0),  // 开多
+		hedgeFill(20240103, 1, trading.SideSell, false, 11_000, 1000, 0), // 开空，不是平多
+	}
+	trips, open := MatchRoundTrips(fills, true)
+	if len(trips) != 0 {
+		t.Fatalf("两笔都是开仓，不该配出任何轮次，得到 %d 轮：%+v", len(trips), trips)
+	}
+	leg := open[1]
+	if leg.LongQty != 1000 || leg.ShortQty != 1000 {
+		t.Fatalf("未平仓敞口 = 多 %d / 空 %d，想要各 1000", leg.LongQty, leg.ShortQty)
+	}
+	// 一个标的两个方向仍然只算一只
+	if len(open) != 1 {
+		t.Fatalf("未平仓标的数 = %d，想要 1", len(open))
+	}
+}
+
+// TestHedgeClosesMatchOwnSide 平多只吃多头队列，平空只吃空头队列。
+func TestHedgeClosesMatchOwnSide(t *testing.T) {
+	fills := []trading.Fill{
+		hedgeFill(20240102, 1, trading.SideBuy, false, 10_000, 1000, 0),  // 开多 @1.00
+		hedgeFill(20240103, 1, trading.SideSell, false, 20_000, 1000, 0), // 开空 @2.00
+		hedgeFill(20240104, 1, trading.SideSell, true, 15_000, 1000, 0),  // 平多 @1.50
+		hedgeFill(20240105, 1, trading.SideBuy, true, 15_000, 1000, 0),   // 平空 @1.50
+	}
+	trips, open := MatchRoundTrips(fills, true)
+	if len(trips) != 2 {
+		t.Fatalf("配出 %d 轮，想要 2 轮", len(trips))
+	}
+	if len(open) != 0 {
+		t.Fatalf("都平光了却报 %d 只未平仓", len(open))
+	}
+	var long, short *RoundTrip
+	for i := range trips {
+		if trips[i].Short {
+			short = &trips[i]
+		} else {
+			long = &trips[i]
+		}
+	}
+	if long == nil || short == nil {
+		t.Fatalf("应当一多一空，得到 %+v", trips)
+	}
+	// 多头 1.00 → 1.50 赚 500,000；空头 2.00 → 1.50 也赚 500,000
+	if long.PnLCents != 500_000 {
+		t.Errorf("多头轮盈亏 = %d，想要 500000", long.PnLCents)
+	}
+	if short.PnLCents != 500_000 {
+		t.Errorf("空头轮盈亏 = %d，想要 500000", short.PnLCents)
+	}
+	// 平仓日必须各归各的
+	if long.CloseDay != 20240104 || short.CloseDay != 20240105 {
+		t.Errorf("平仓日错配：多 %d 空 %d", long.CloseDay, short.CloseDay)
+	}
+}
+
+// TestSpotIgnoresReduce 现货口径不看 Reduce —— 买永远是开、卖永远是平。
+//
+// A 股的减仓卖出与清仓卖出都是平多，没有「卖出开仓」这回事。
+// 若现货也去读 Reduce，一笔没标 Reduce 的减仓就会被当成开空。
+func TestSpotIgnoresReduce(t *testing.T) {
+	for _, reduce := range []bool{false, true} {
+		trips, open := MatchRoundTrips([]trading.Fill{
+			hedgeFill(20240102, 1, trading.SideBuy, reduce, 10_000, 1000, 0),
+			hedgeFill(20240110, 1, trading.SideSell, reduce, 12_000, 1000, 0),
+		}, false)
+		if len(trips) != 1 || trips[0].Short || trips[0].PnLCents != 200_000 {
+			t.Fatalf("reduce=%v：现货应配出 1 轮做多 +200000，得到 %+v", reduce, trips)
+		}
+		if len(open) != 0 {
+			t.Fatalf("reduce=%v：不该有未平仓", reduce)
+		}
+	}
+}
+
+// TestHedgePartialClose 部分平空按比例分摊开仓所得。
+func TestHedgePartialClose(t *testing.T) {
+	trips, open := MatchRoundTrips([]trading.Fill{
+		hedgeFill(20240102, 1, trading.SideSell, false, 20_000, 1000, 0), // 开空 2,000,000
+		hedgeFill(20240110, 1, trading.SideBuy, true, 15_000, 400, 0),    // 平掉四成
+	}, true)
+	if len(trips) != 1 {
+		t.Fatalf("配出 %d 轮，想要 1 轮", len(trips))
+	}
+	// 开仓所得的四成 = 800,000；买回花费 = 1.50 × 400 = 600,000
+	if trips[0].ProceedCents != 800_000 || trips[0].CostCents != 600_000 {
+		t.Errorf("按比例分摊错了：收 %d / 付 %d，想要 800000 / 600000",
+			trips[0].ProceedCents, trips[0].CostCents)
+	}
+	if trips[0].PnLCents != 200_000 {
+		t.Errorf("盈亏 = %d，想要 200000", trips[0].PnLCents)
+	}
+	if open[1].ShortQty != 600 {
+		t.Errorf("应余 600 张空头，得到 %d", open[1].ShortQty)
+	}
+	// 剩下六成的开仓所得也要留在队列里
+	if open[1].CostCents != 1_200_000 {
+		t.Errorf("未平仓金额 = %d，想要 1200000", open[1].CostCents)
+	}
+}
+
+// TestOpenCostIsCrossInstrumentAddable 未平仓金额跨标的可加，数量不可加。
+func TestOpenCostIsCrossInstrumentAddable(t *testing.T) {
+	st := computeTrades([]trading.Fill{
+		fill(20240102, 1, trading.SideBuy, 10_000, 1000, 0, 0), // 1,000,000
+		fill(20240103, 2, trading.SideBuy, 20_000, 500, 0, 0),  //   1,000,000
+	}, false)
+	if st.OpenPositions != 2 {
+		t.Fatalf("未平仓标的数 = %d，想要 2", st.OpenPositions)
+	}
+	if st.OpenCostCents != 2_000_000 {
+		t.Errorf("未平仓金额 = %d，想要 2000000", st.OpenCostCents)
+	}
+}
+
+// ---- 离场原因 ----
+//
+// 没有 tag 的话，逐轮表里所有行长得一模一样：正常止盈平掉的、
+// 被止损砍掉的、被熔断清仓的、被强平爆掉的 —— 全都只是一行数字。
+// 而这几种结局对「策略行不行」的意义完全不同。
+
+func taggedFill(day int32, id int, side trading.Side, reduce bool,
+	price, qty int64, tag string) trading.Fill {
+
+	f := fill(day, id, side, price, qty, 0, 0)
+	f.Reduce = reduce
+	f.Tag = tag
+	return f
+}
+
+// TestRoundTripCarriesTags 开仓与平仓的 tag 都要带到轮次上。
+func TestRoundTripCarriesTags(t *testing.T) {
+	trips, _ := MatchRoundTrips([]trading.Fill{
+		taggedFill(20240102, 1, trading.SideBuy, false, 10_000, 1000, "tree_buy"),
+		taggedFill(20240110, 1, trading.SideSell, true, 9_000, 1000, "stop_loss"),
+	}, false)
+	if len(trips) != 1 {
+		t.Fatalf("配出 %d 轮，想要 1", len(trips))
+	}
+	if trips[0].OpenTag != "tree_buy" || trips[0].CloseTag != "stop_loss" {
+		t.Errorf("tag 没带过来：开 %q 平 %q", trips[0].OpenTag, trips[0].CloseTag)
+	}
+}
+
+// TestLiquidationClosesRoundTrip 强平必须能平掉一轮。
+//
+// **强平不走撮合器**，账本自己动手平仓，从前一笔成交都不产生 ——
+// 于是那个仓位永远配不上平仓，一直挂在「未平仓」里。
+// 实测：336 笔开仓对 333 笔平仓，差的 3 笔里有 1 笔就是被强平的，
+// 而报告只说「未平仓 2 只」，看不出有一个仓位是爆掉的。
+//
+// 引擎现在把强平补成一笔成交记录（不重复记账），配对因此能收口。
+func TestLiquidationClosesRoundTrip(t *testing.T) {
+	trips, open := MatchRoundTrips([]trading.Fill{
+		taggedFill(20240102, 1, trading.SideSell, false, 20_000, 1000, "tree_buy"),  // 开空
+		taggedFill(20240110, 1, trading.SideBuy, true, 30_000, 1000, "liquidation"), // 爆了
+	}, true)
+	if len(trips) != 1 {
+		t.Fatalf("强平应当平掉一轮，得到 %d 轮", len(trips))
+	}
+	if !trips[0].Short {
+		t.Error("被爆的是空头仓位")
+	}
+	if trips[0].CloseTag != "liquidation" {
+		t.Errorf("离场原因应是强平，得到 %q", trips[0].CloseTag)
+	}
+	// 空头 2.00 开、3.00 买回 → 亏 100 万分
+	if trips[0].PnLCents != -1_000_000 {
+		t.Errorf("盈亏 = %d，想要 -1000000", trips[0].PnLCents)
+	}
+	if len(open) != 0 {
+		t.Fatalf("被强平的仓位不该还挂在未平仓里：%+v", open)
+	}
+}
+
+// TestCloseByGroupsReasons 离场原因分组。
+func TestCloseByGroupsReasons(t *testing.T) {
+	st := computeTrades([]trading.Fill{
+		taggedFill(20240102, 1, trading.SideBuy, false, 10_000, 1000, "tree_buy"),
+		taggedFill(20240103, 2, trading.SideBuy, false, 10_000, 1000, "tree_buy"),
+		taggedFill(20240104, 3, trading.SideBuy, false, 10_000, 1000, "tree_buy"),
+		taggedFill(20240110, 1, trading.SideSell, true, 11_000, 1000, "take_profit"),
+		taggedFill(20240111, 2, trading.SideSell, true, 9_000, 1000, "stop_loss"),
+		taggedFill(20240112, 3, trading.SideSell, true, 9_500, 1000, "take_profit"),
+	}, false)
+
+	if st.RoundTrips != 3 {
+		t.Fatalf("应有 3 轮，得到 %d", st.RoundTrips)
+	}
+	if st.CloseBy["take_profit"] != 2 || st.CloseBy["stop_loss"] != 1 {
+		t.Errorf("离场原因分组错了：%v", st.CloseBy)
 	}
 }

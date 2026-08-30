@@ -1,0 +1,105 @@
+{
+  "name": "A 股单标的（601318）· 规则树 · 海选用",
+  "data": {
+    "root": "../../../data",
+    "market": "ashare",
+    "freq": "1d",
+    "from": 20150101,
+    "to": 0,
+    "universe": {
+      "symbols": [
+        "601318"
+      ]
+    }
+  },
+  "market": {
+    "impl": "ashare"
+  },
+  "fee": {
+    "impl": "config",
+    "params": {
+      "path": "../../fee/ashare_default.json"
+    }
+  },
+  "slippage": {
+    "impl": "fixed_bps",
+    "params": {
+      "bps": 5
+    }
+  },
+  "portfolio": {
+    "initial_cash_cents": 2000000,
+    "ledger": "spot"
+  },
+  "broker": {
+    "volume_cap_ppm": 100000,
+    "allow_partial_fill": true
+  },
+  "metrics": {
+    "benchmark": "601318",
+    "risk_free_ppm": 0
+  },
+  "recorder": {
+    "level": "summary"
+  },
+  "strategy": {
+    "impl": "rule_tree",
+    "params": {
+      "indicators": [
+        {
+          "name": "macd",
+          "kind": "macd",
+          "params": {
+            "short": 12,
+            "long": 26,
+            "signal": 9
+          }
+        }
+      ],
+      "direction": "long",
+      "buy": {
+        "left": {
+          "kind": "ind",
+          "ind": "macd",
+          "field": "DIF"
+        },
+        "cmp": "cross_above",
+        "right": {
+          "kind": "ind",
+          "ind": "macd",
+          "field": "DEA"
+        }
+      },
+      "sell": {
+        "left": {
+          "kind": "ind",
+          "ind": "macd",
+          "field": "DIF"
+        },
+        "cmp": "cross_below",
+        "right": {
+          "kind": "ind",
+          "ind": "macd",
+          "field": "DEA"
+        }
+      }
+    }
+  },
+  "sizer": {
+    "impl": "pct_equity",
+    "params": {
+      "pct": 95,
+      "base": "cost",
+      "max_positions": 1
+    }
+  },
+  "risk": [],
+  "exit": [
+    {
+      "impl": "take_profit",
+      "params": {
+        "pct": 20
+      }
+    }
+  ]
+}

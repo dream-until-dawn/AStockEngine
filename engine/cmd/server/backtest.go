@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -30,10 +32,16 @@ import (
 
 // maxUniverseForWeb 服务端回测的标的数上限。
 //
-// Assemble 会把全量列式数据 Subset 成配置要求的子集，那是一次拷贝。
-// 285 只约 30 MB 无所谓，全市场 7,175 只就是又一个 1.25 GB ——
-// 浏览器点一下把服务端撑爆不是个好体验，宁可直说。
-const maxUniverseForWeb = 3000
+// Assemble 会把全量列式数据 Subset 成配置要求的子集，那是一次拷贝：
+// 285 只约 30 MB，3,194 只（在市主板）约 550 MB，全市场就是又一个 1.25 GB。
+//
+// 6000 这个数是按「A 股所有现实池子都能跑」定的：全部个股 5,549 只、
+// 全部标的 7,200 只。取 6000 是让前者能跑、后者被挡住 ——
+// 「所有个股加所有 ETF 一起回测」不是一个有意义的池子，
+// 拦下来比让服务端吃满内存好。
+//
+// 命令行没有这个限制：LoadDataSet 只载入所需标的，压根不用 Subset。
+const maxUniverseForWeb = 6000
 
 // maxListedRejections 返回给前端的拒单条数上限。
 // 超出部分只给计数 —— 8,720 条拒单全塞进 JSON 对看没有帮助。
@@ -70,17 +78,29 @@ type curvePoint struct {
 }
 
 type fillDTO struct {
-	D        int32  `json:"d"`
-	ID       int32  `json:"id"`
-	Symbol   string `json:"symbol"`
-	Name     string `json:"name"`
-	Side     string `json:"side"`
+	D      int32  `json:"d"`
+	ID     int32  `json:"id"`
+	Symbol string `json:"symbol"`
+	Name   string `json:"name"`
+	Side   string `json:"side"`
+	// Reduce 平仓单。双向市场下「卖」有两个意思，没有它读不出是平多还是开空
+	Reduce bool `json:"reduce"`
+	// Leg 人读的开平方向：开多 / 平多 / 开空 / 平空。
+	// 单向市场下就是「买」「卖」
+	Leg      string `json:"leg"`
 	Price    int64  `json:"price"`
 	Qty      int64  `json:"qty"`
 	Amount   int64  `json:"amount"`
 	Fee      int64  `json:"fee"`
 	Slippage int64  `json:"slippage"`
 	Tag      string `json:"tag"`
+	// PriceScale / QtyScale 这一行自己的定点标度。
+	//
+	// **不能用全局 scale**：A 股统一 1000，而 BTC 的价格标度是 1e4、
+	// 数量标度 1e8。拿全局值去除，加密的成交价会差好几个数量级 ——
+	// 而且是个看上去很正常的数字
+	PriceScale int32 `json:"priceScale"`
+	QtyScale   int32 `json:"qtyScale"`
 }
 
 type rejectDTO struct {
@@ -96,32 +116,68 @@ type rejectDTO struct {
 }
 
 type tripDTO struct {
-	ID        int32  `json:"id"`
-	Symbol    string `json:"symbol"`
-	Name      string `json:"name"`
-	OpenDay   int32  `json:"openDay"`
-	CloseDay  int32  `json:"closeDay"`
-	Qty       int64  `json:"qty"`
-	Cost      int64  `json:"cost"`
-	Proceed   int64  `json:"proceed"`
-	PnL       int64  `json:"pnl"`
-	HoldDays  int    `json:"holdDays"`
+	ID       int32  `json:"id"`
+	Symbol   string `json:"symbol"`
+	Name     string `json:"name"`
+	OpenDay  int32  `json:"openDay"`
+	CloseDay int32  `json:"closeDay"`
+	Qty      int64  `json:"qty"`
+	// QtyScale 这一行自己的数量标度。加密是 1e8，A 股是 1
+	QtyScale int32 `json:"qtyScale"`
+	// Short 这是一轮做空。盈亏方向相反，前端要能标出来
+	Short   bool  `json:"short"`
+	Cost    int64 `json:"cost"`
+	Proceed int64 `json:"proceed"`
+	PnL     int64 `json:"pnl"`
+	// Ratio 收益率。真实轮次由金额算出；**虚拟轮次只有它** ——
+	// 虚拟持仓从未占用资金，编一个金额出来是假的
+	Ratio    float64 `json:"ratio"`
+	HoldDays int     `json:"holdDays"`
+	// Virtual 虚拟持仓：策略说该买、被自己的有效性判断挡下来的那一轮。
+	// 没有真实成交，也不计入胜率与盈亏
+	Virtual bool `json:"virtual"`
+	// OpenTag / CloseTag 这一轮**是怎么开的、又是怎么结束的**。
+	// 没有它，正常止盈的、被止损砍的、被熔断清仓的、被强平爆掉的，
+	// 在表里长得一模一样
+	OpenTag   string `json:"openTag,omitempty"`
+	CloseTag  string `json:"closeTag,omitempty"`
 	FromBonus bool   `json:"fromBonus"`
+}
+
+// marketInfo 本次回测所在市场的展示口径。
+//
+// **前端不能按市场名去查表**：查表漏了一个市场只会安静地印出「元」，
+// 而加密账户的余额不是元。由服务端从 Market 取，前端照抄。
+type marketInfo struct {
+	// Impl 市场规则实现名（ashare / crypto）
+	Impl string `json:"impl"`
+	// Money 计价单位，如「元」「USDT」
+	Money string `json:"money"`
+	// Qty 数量单位，如「股」「张」
+	Qty string `json:"qty"`
+	// Hedge 双向持仓。为真时成交要区分开多/开空/平多/平空
+	Hedge bool `json:"hedge"`
+	// AnnualDays 年化系数，报告里要标出来 —— A 股约 243、加密 365
+	AnnualDays float64 `json:"annualDays"`
 }
 
 type runResult struct {
 	Name        string          `json:"name"`
+	Market      marketInfo      `json:"market"`
 	Config      json.RawMessage `json:"config"`
 	Stats       runStats        `json:"stats"`
 	Fingerprint fingerprints    `json:"fingerprint"`
-	Metrics     metrics.Result  `json:"metrics"`
-	Curve       []curvePoint    `json:"curve"`
-	Fills       []fillDTO       `json:"fills"`
-	Rejections  []rejectDTO     `json:"rejections"`
-	RejectTotal int             `json:"rejectTotal"`
-	RejectBy    map[string]int  `json:"rejectBy"`
-	RoundTrips  []tripDTO       `json:"roundTrips"`
-	Warnings    []string        `json:"warnings,omitempty"`
+	// Disclosures 本次回测**已知未计入**的成本与机制。
+	// 前端必须显示 —— 漏算的成本不报错，只是让结果一致地偏乐观
+	Disclosures []string       `json:"disclosures"`
+	Metrics     metrics.Result `json:"metrics"`
+	Curve       []curvePoint   `json:"curve"`
+	Fills       []fillDTO      `json:"fills"`
+	Rejections  []rejectDTO    `json:"rejections"`
+	RejectTotal int            `json:"rejectTotal"`
+	RejectBy    map[string]int `json:"rejectBy"`
+	RoundTrips  []tripDTO      `json:"roundTrips"`
+	Warnings    []string       `json:"warnings,omitempty"`
 }
 
 // handleConfigs 列出 configs 目录下的配置，连同解析结果一起给前端。
@@ -183,37 +239,16 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 	// 服务端手里只有启动时载入的这一份
 	cfg.SetDataRoot(mustAbs(s.DataRoot))
 
-	ids, err := cfg.ResolveUniverse(s.Uni, s.Adj)
+	// 装配与单步会话走同一条路径（session.go: assembleFor）——
+	// 里面有一处「基准必须在裁子集之前取」的顺序，两处各写一遍迟早漏掉
+	e, ds, err := s.assembleFor(cfg)
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, "%v", err)
 		return
 	}
-	if len(ids) > maxUniverseForWeb {
-		writeErr(w, http.StatusBadRequest,
-			"标的池 %d 只，超过服务端回测上限 %d —— 装配时要把全量列式数据"+
-				"裁成子集，那是一次拷贝，太大会把服务端撑爆。"+
-				"请收窄 universe，或用命令行跑：go run ./cmd/backtest -config ...",
-			len(ids), maxUniverseForWeb)
-		return
-	}
-
-	ds := &config.DataSet{
-		Columns: s.Col, Universe: s.Uni, Adjuster: s.Adj, CorpAct: s.Corp,
-		Calendar: s.Cal, Root: mustAbs(s.DataRoot),
-	}
-	if cfg.Metrics.Benchmark != "" {
-		in := s.Uni.BySymbol(cfg.Metrics.Benchmark)
-		if in == nil {
-			writeErr(w, http.StatusBadRequest,
-				"metrics.benchmark: 未找到标的 %q", cfg.Metrics.Benchmark)
-			return
-		}
-		ds.BenchmarkID, ds.HasBenchmark = in.ID, true
-	}
-
-	e, err := cfg.Assemble(ds)
+	ids, err := cfg.ResolveUniverse(s.Uni, s.Adj)
 	if err != nil {
-		writeErr(w, http.StatusBadRequest, "装配失败: %v", err)
+		writeErr(w, http.StatusBadRequest, "%v", err)
 		return
 	}
 
@@ -254,7 +289,7 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 
 	rec, _ := e.Recorder().(*record.Memory)
 	res.Warnings = append(res.Warnings, rec.Warnings...)
-	if pfw := e.Portfolio().Warnings; len(pfw) > 0 {
+	if pfw := e.Ledger().Warnings(); len(pfw) > 0 {
 		res.Warnings = append(res.Warnings,
 			fmt.Sprintf("账本告警 %d 条，首条：%s", len(pfw), pfw[0]))
 	}
@@ -270,7 +305,8 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 		InitialCents:       cfg.Portfolio.InitialCashCents,
 		Fills:              rec.Fills(),
 		RiskFreePPM:        cfg.Metrics.RiskFreePPM,
-		TradingDaysPerYear: s.Cal.TradingDaysPerYear(mktdata.MarketAShare, from, to),
+		TradingDaysPerYear: e.Market().AnnualDays(s.Cal, from, to),
+		Hedge:              e.Market().AllowsShort(),
 	}
 	benchByDay := map[int32]int64{}
 	if bd, be, ok := ds.BenchmarkCurve(); ok {
@@ -279,6 +315,11 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 		benchByDay = normalizeBench(bd, be, days, cfg.Portfolio.InitialCashCents)
 	}
 	res.Metrics = metrics.Compute(in)
+	money, qtyUnit := e.Market().Units()
+	res.Market = marketInfo{
+		Impl: e.Market().Name(), Money: money, Qty: qtyUnit,
+		Hedge: e.Market().AllowsShort(), AnnualDays: in.TradingDaysPerYear,
+	}
 
 	// ---- 曲线 ----
 	res.Curve = make([]curvePoint, 0, len(rec.Steps()))
@@ -295,22 +336,50 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 	fills := rec.Fills()
 	res.Fills = make([]fillDTO, 0, len(fills))
 	for _, f := range fills {
-		res.Fills = append(res.Fills, s.fillDTO(f))
+		res.Fills = append(res.Fills, s.fillDTO(f, e.Market().AllowsShort()))
 	}
-	trips, _ := metrics.MatchRoundTrips(fills)
+	trips, _ := metrics.MatchRoundTrips(fills, e.Market().AllowsShort())
 	res.RoundTrips = make([]tripDTO, 0, len(trips))
 	for _, t := range trips {
 		in := s.Uni.Get(t.Instrument)
 		d := tripDTO{
 			ID: int32(t.Instrument), OpenDay: t.OpenDay, CloseDay: t.CloseDay,
-			Qty: t.Qty, Cost: t.CostCents, Proceed: t.ProceedCents,
+			Qty: t.Qty, QtyScale: 1, Short: t.Short,
+			Cost: t.CostCents, Proceed: t.ProceedCents,
 			PnL: t.PnLCents, HoldDays: t.HoldDays, FromBonus: t.FromBonus,
+			OpenTag: t.OpenTag, CloseTag: t.CloseTag,
+		}
+		if t.CostCents > 0 {
+			d.Ratio = float64(t.PnLCents) / float64(t.CostCents)
 		}
 		if in != nil {
+			d.Symbol, d.Name = in.Symbol, in.Name
+			if in.QtyScale > 0 {
+				d.QtyScale = in.QtyScale
+			}
+		}
+		res.RoundTrips = append(res.RoundTrips, d)
+	}
+	// 虚拟轮次与真实轮次放进**同一张表**，由前端按 virtual 标记区分 ——
+	// 它们要被一起看：「被过滤掉的那些后来怎么样了」只有和真实成交
+	// 并排才读得出来。
+	//
+	// 排序在下面统一做：**按开仓日**，两者交错。
+	// 全堆在表尾的话，「这一天策略做了什么决定」就得在两段之间来回翻，
+	// 而那正是虚拟轮次唯一的用处
+	for _, vt := range e.VirtualTrips() {
+		d := tripDTO{
+			ID: int32(vt.Instrument), OpenDay: vt.OpenDay, CloseDay: vt.CloseDay,
+			QtyScale: 1, Virtual: true, Ratio: vt.Ratio,
+			HoldDays: daysBetween(vt.OpenDay, vt.CloseDay),
+			OpenTag:  "tree_buy_invalid", CloseTag: "tree_sell",
+		}
+		if in := s.Uni.Get(vt.Instrument); in != nil {
 			d.Symbol, d.Name = in.Symbol, in.Name
 		}
 		res.RoundTrips = append(res.RoundTrips, d)
 	}
+	sortTripDTOs(res.RoundTrips)
 
 	// ---- 指纹 ----
 	dataFP, _, err := fingerprint.Data(mustAbs(s.DataRoot))
@@ -322,7 +391,51 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	res.Disclosures = cfg.Disclosures(s.Uni, ids)
 	writeJSON(w, res)
+
+	// 大池子的子集是一大块临时内存（3,194 只约 550 MB）。
+	// Go 的 GC 不会主动还给操作系统，本地工具没必要攥着它不放。
+	if len(ids) > 1000 {
+		go func() {
+			runtime.GC()
+			debug.FreeOSMemory()
+		}()
+	}
+}
+
+// narrowCached 把全量列式数据裁成本次要用的子集，并缓存最近一次的结果。
+//
+// **缓存的意义在于工作流**：调策略参数时会反复跑同一个标的池 ——
+// slots 从 10 改到 5 再跑，标的池没变，没有理由再拷贝一次 550 MB。
+// 只缓存一份：换池子就换掉，不做 LRU（多份缓存等于多份内存，
+// 而同时用两个大池子来回切不是常见用法）。
+//
+// 返回的 Columns 交给 Assemble，那边的 narrow 会认出「集合与区间都吻合」
+// 从而原样透传，不会再拷一次。
+func (s *Store) narrowCached(cfg *config.Config, ids []mktdata.InstrumentID) *mktdata.Columns {
+	// 键要含区间：同一批标的、不同起止日，切出来的是不同的子集
+	parts := make([]byte, 0, len(ids)*4+16)
+	parts = append(parts, byte(cfg.Data.From), byte(cfg.Data.From>>8),
+		byte(cfg.Data.To), byte(cfg.Data.To>>8))
+	for _, id := range ids {
+		parts = append(parts, byte(id), byte(id>>8), byte(id>>16), byte(id>>24))
+	}
+	key := fingerprint.Hex(parts)
+
+	s.uniMu.Lock()
+	defer s.uniMu.Unlock()
+	if s.uniKey == key && s.uniCols != nil {
+		return s.uniCols
+	}
+	sub, err := s.Col.Subset(ids, cfg.Data.From, cfg.Data.To)
+	if err != nil {
+		// 裁不出来就把全量交回去，让 Assemble 自己报错 ——
+		// 在这里吞掉错误会让失败原因指向一个和它无关的地方
+		return s.Col
+	}
+	s.uniKey, s.uniCols = key, sub
+	return sub
 }
 
 // normalizeBench 把基准价格序列归一化到初始资金，并只保留策略也有的交易日。
@@ -357,16 +470,45 @@ func normalizeBench(bd []int32, be []int64, days []int32, initial int64) map[int
 	return out
 }
 
-func (s *Store) fillDTO(f trading.Fill) fillDTO {
+func (s *Store) fillDTO(f trading.Fill, hedge bool) fillDTO {
 	d := fillDTO{
 		D: f.At.TradingDay, ID: int32(f.Instrument), Side: sideName(f.Side),
-		Price: f.Price, Qty: f.Qty, Amount: trading.AmountCents(f.Price, f.Qty),
+		Reduce: f.Reduce, Leg: legName(f.Side, f.Reduce, hedge),
+		Price: f.Price, Qty: f.Qty, Amount: f.AmountCents,
 		Fee: f.Fee.Total, Slippage: f.SlippageCents, Tag: f.Tag,
+		PriceScale: 1000, QtyScale: 1,
 	}
 	if in := s.Uni.Get(f.Instrument); in != nil {
 		d.Symbol, d.Name = in.Symbol, in.Name
+		if in.PriceScale > 0 {
+			d.PriceScale = in.PriceScale
+		}
+		if in.QtyScale > 0 {
+			d.QtyScale = in.QtyScale
+		}
 	}
 	return d
+}
+
+// legName 把「买卖 + 开平」译成人读的开多 / 平多 / 开空 / 平空。
+//
+// 单向市场只说「买」「卖」—— 那里没有第二种可能，
+// 多写一个「开多」只是噪音。
+func legName(side trading.Side, reduce, hedge bool) string {
+	if !hedge {
+		return sideName(side)
+	}
+	leg := trading.LegOf(side, reduce, true)
+	switch {
+	case leg.Opening && !leg.Short:
+		return "开多"
+	case !leg.Opening && !leg.Short:
+		return "平多"
+	case leg.Opening && leg.Short:
+		return "开空"
+	default:
+		return "平空"
+	}
 }
 
 func (s *Store) rejectDTO(r trading.Rejection) rejectDTO {
@@ -414,4 +556,139 @@ func readAll(r *http.Request) ([]byte, error) {
 			return b, nil // io.EOF 之外的错误交给上层的 JSON 解析报
 		}
 	}
+}
+
+// handleUniverse 解析一份 universe 规格，返回命中的标的数与样例。
+//
+// 存在的理由：选池子时得先知道选中了多少、都是些什么，
+// 否则只能靠「跑一次看报错」——而超过上限的池子根本跑不起来。
+//
+// 请求体就是一段 universe JSON，与配置里 data.universe 的形状一致。
+func (s *Store) handleUniverse(w http.ResponseWriter, r *http.Request) {
+	body, err := readAll(r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "读取请求体失败: %v", err)
+		return
+	}
+	// 套一层最小配置壳，复用同一套解析与校验 ——
+	// 预览和真跑必须走同一条路径，否则预览说 3193 只、真跑却是别的数
+	var u config.Universe
+	if err := json.Unmarshal(body, &u); err != nil {
+		writeErr(w, http.StatusBadRequest, "universe 不是合法 JSON: %v", err)
+		return
+	}
+	cfg := &config.Config{}
+	cfg.Data.Univers = u
+	ids, err := cfg.ResolveUniverse(s.Uni, s.Adj)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "%v", err)
+		return
+	}
+
+	type row struct {
+		ID     int32  `json:"id"`
+		Symbol string `json:"symbol"`
+		Name   string `json:"name"`
+		Type   int8   `json:"type"`
+		Board  int8   `json:"board"`
+		Bars   int    `json:"bars"`
+		First  int32  `json:"firstDay"`
+		Last   int32  `json:"lastDay"`
+	}
+	// 只回样例：3000 只标的的完整列表对「选池子」没有帮助，
+	// 而两端各看几只就能判断选对没有
+	const sampleN = 12
+	sample := make([]row, 0, sampleN*2)
+	add := func(id mktdata.InstrumentID) {
+		in := s.Uni.Get(id)
+		if in == nil {
+			return
+		}
+		st := s.Stat(id)
+		sample = append(sample, row{
+			ID: int32(id), Symbol: in.Symbol, Name: in.Name,
+			Type: int8(in.Type), Board: int8(in.Board),
+			Bars: st.Bars, First: st.FirstDay, Last: st.LastDay,
+		})
+	}
+	head := ids
+	if len(head) > sampleN {
+		head = head[:sampleN]
+	}
+	for _, id := range head {
+		add(id)
+	}
+	truncated := 0
+	if len(ids) > sampleN*2 {
+		truncated = len(ids) - sampleN*2
+		for _, id := range ids[len(ids)-sampleN:] {
+			add(id)
+		}
+	} else if len(ids) > sampleN {
+		for _, id := range ids[sampleN:] {
+			add(id)
+		}
+	}
+
+	// 有多少只在所选区间内**真的有行情** —— 过滤命中数不等于能跑的数
+	withBars := 0
+	for _, id := range ids {
+		if s.Stat(id).Bars > 0 {
+			withBars++
+		}
+	}
+	writeJSON(w, map[string]any{
+		"count": len(ids), "withBars": withBars,
+		"limit": maxUniverseForWeb, "overLimit": len(ids) > maxUniverseForWeb,
+		"sample": sample, "truncated": truncated,
+	})
+}
+
+// daysBetween 由两个 YYYYMMDD 估算相隔的自然日数。
+//
+// 与 metrics.dayDiff 同一套算法。虚拟轮次不走 metrics 那条路
+// （它们没有成交），持有天数只能在这里算。
+func daysBetween(from, to int32) int {
+	if from == 0 || to == 0 {
+		return 0
+	}
+	return int(julianDay(to) - julianDay(from))
+}
+
+func julianDay(d int32) int32 {
+	y, m, day := d/10000, d/100%100, d%100
+	if m <= 2 {
+		y -= 1
+		m += 12
+	}
+	a := y / 100
+	b := 2 - a + a/4
+	return int32(365.25*float64(y+4716)) + int32(30.6001*float64(m+1)) + day + b - 1524
+}
+
+// sortTripDTOs 按**开仓日**排逐轮明细，实仓与虚拟交错。
+//
+// 不按平仓日排：这张表读的是「策略在哪一天做了什么决定、后来怎么样」，
+// 开仓日才是决定发生的时刻。按平仓日排会把同一天开的几笔拆散到表的各处。
+//
+// 后面几级都是为了**定序**：同一天可能有多笔，而虚拟轮次来自策略、
+// 真实轮次来自成交配对，两边的原始顺序不同源 ——
+// 不排死的话同一份配置两次跑出的表不一样。
+func sortTripDTOs(rows []tripDTO) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		a, b := rows[i], rows[j]
+		if a.OpenDay != b.OpenDay {
+			return a.OpenDay < b.OpenDay
+		}
+		if a.CloseDay != b.CloseDay {
+			return a.CloseDay < b.CloseDay
+		}
+		if a.ID != b.ID {
+			return a.ID < b.ID
+		}
+		if a.Short != b.Short {
+			return !a.Short // 多在前
+		}
+		return !a.Virtual && b.Virtual // 同一天同一只，实仓排在虚拟之前
+	})
 }

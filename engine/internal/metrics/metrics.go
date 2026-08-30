@@ -44,6 +44,10 @@ type Input struct {
 	Benchmark *Curve
 	// BenchmarkName 基准标的代码，供报告标注
 	BenchmarkName string
+	// Hedge 该市场是否双向持仓。**决定一笔卖出是「平多」还是「开空」**，
+	// 判错会把每一次开空都配成一轮凭空的多头轮次。
+	// 由 Market.AllowsShort() 给出
+	Hedge bool
 }
 
 // Drawdown 一次回撤。
@@ -73,11 +77,41 @@ type TradeStats struct {
 	GrossWinCents int64   `json:"gross_win_cents"`
 	GrossLossCent int64   `json:"gross_loss_cents"`
 	AvgHoldDays   float64 `json:"avg_hold_days"`
+	// AvgReturnRatio 每轮「盈亏 ÷ 成本」的平均值。
+	//
+	// **与总盈亏除以总成本不是一回事**：后者被大额轮次主导。
+	// 这里要的是「平均一笔做得怎么样」，好与虚拟轮次的
+	// 「（平仓价 − 开仓价）÷ 开仓价」逐笔口径对得上 ——
+	// 两者不同口径的话，「有效性树过滤得对不对」就无从比起
+	AvgReturnRatio float64 `json:"avg_return_ratio"`
 	// BonusTrips 建仓份额来自送股/转增的轮次数，已计入上面的统计但单独报出
 	BonusTrips int `json:"bonus_trips"`
-	// OpenPositions 回测结束时仍持有的标的数与份额，**不计入胜率**
-	OpenPositions int   `json:"open_positions"`
-	OpenQty       int64 `json:"open_qty"`
+	// OpenPositions 回测结束时仍持有的标的数，**不计入胜率**
+	OpenPositions int `json:"open_positions"`
+	// OpenQty 未平仓的定点数量之和。
+	//
+	// **跨标的相加只在同一 scale 下有意义**：A 股全都是 1 股 = 1，
+	// 加起来就是股数；加密的 qty_scale 是 1e8，加起来是个没有单位的数。
+	// 报告要报的是 OpenCostCents
+	OpenQty int64 `json:"open_qty"`
+	// OpenCostCents 未平仓位的开仓金额（分）。跨标的可加，
+	// 也就是「还有多少钱没结算」的答案
+	OpenCostCents int64 `json:"open_cost_cents"`
+	// CloseBy 按离场原因分组的轮次数（成交 tag → 轮次数）。
+	//
+	// **正常卖出、止损、止盈、熔断清仓、强平**，四五种结局对
+	// 「策略行不行」的意义完全不同，只报一个胜率是看不出来的。
+	// 尤其是强平：它不是策略的决定，是市场施加的
+	CloseBy map[string]int `json:"close_by,omitempty"`
+
+	// FillsByLeg 按开平方向分组的**成交笔数**（开多 / 平多 / 开空 / 平空）。
+	//
+	// **「一笔空头都没开」在收益曲线上看不出来。** 这个会话里踩过一次：
+	// 所有 Sizer 都硬编码 SideBuy，做空网格跑出来
+	// 开多 170 / 平多 0 / 开空 0 / 平空 166 —— 报告一切正常，
+	// 而策略实际跑的根本不是它写的那个东西。
+	// 数一遍腿是唯一能一眼看破这件事的量
+	FillsByLeg map[string]int `json:"fills_by_leg,omitempty"`
 }
 
 // BenchmarkStats 是相对基准的统计。
@@ -195,7 +229,7 @@ func Compute(in Input) Result {
 
 	// 成交统计
 	for _, f := range in.Fills {
-		r.TurnoverCents += trading.AmountCents(f.Price, f.Qty)
+		r.TurnoverCents += f.AmountCents
 		r.FeeCents += f.Fee.Total
 		r.SlippageCents += f.SlippageCents
 	}
@@ -203,19 +237,26 @@ func Compute(in Input) Result {
 		r.Turnover = float64(r.TurnoverCents) / avg / r.Years
 	}
 
-	r.Trades = computeTrades(in.Fills)
+	r.Trades = computeTrades(in.Fills, in.Hedge)
 	if in.Benchmark != nil && in.Benchmark.Len() > 0 {
 		r.Bench = computeBenchmark(in, tpy)
 	}
 	return r
 }
 
-func computeTrades(fills []trading.Fill) TradeStats {
-	trips, open := MatchRoundTrips(fills)
+func computeTrades(fills []trading.Fill, hedge bool) TradeStats {
+	trips, open := MatchRoundTrips(fills, hedge)
 	var st TradeStats
 	st.RoundTrips = len(trips)
-	var holdSum float64
+	st.CloseBy = make(map[string]int, 4)
+	st.FillsByLeg = make(map[string]int, 4)
+	for _, f := range fills {
+		st.FillsByLeg[trading.LegOf(f.Side, f.Reduce, hedge).String()]++
+	}
+	var holdSum, retSum float64
+	var retN int
 	for _, t := range trips {
+		st.CloseBy[t.CloseTag]++
 		switch {
 		case t.PnLCents > 0:
 			st.Wins++
@@ -230,10 +271,17 @@ func computeTrades(fills []trading.Fill) TradeStats {
 			st.BonusTrips++
 		}
 		holdSum += float64(t.HoldDays)
+		if t.CostCents > 0 {
+			retSum += float64(t.PnLCents) / float64(t.CostCents)
+			retN++
+		}
 	}
 	if st.RoundTrips > 0 {
 		st.WinRate = float64(st.Wins) / float64(st.RoundTrips)
 		st.AvgHoldDays = holdSum / float64(st.RoundTrips)
+	}
+	if retN > 0 {
+		st.AvgReturnRatio = retSum / float64(retN)
 	}
 	if st.Wins > 0 {
 		st.AvgWinCents = st.GrossWinCents / int64(st.Wins)
@@ -247,8 +295,9 @@ func computeTrades(fills []trading.Fill) TradeStats {
 		st.ProfitFactor = math.Inf(1) // 从未亏过
 	}
 	st.OpenPositions = len(open)
-	for _, q := range open {
-		st.OpenQty += q
+	for _, leg := range open {
+		st.OpenQty += leg.LongQty + leg.ShortQty
+		st.OpenCostCents += leg.CostCents
 	}
 	return st
 }

@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useState } from 'react'
 import { fmtCompact, fmtDay, fmtNum, runApi } from '../api'
 import EquityChart from '../components/EquityChart'
+import ConfigBuilder from '../components/ConfigBuilder'
 import { DataTable, ErrBox, Loading, downloadCSV, type Col } from '../components/ui'
 import { getRun, setRun } from '../runStore'
-import type { ConfigItem, Meta, RoundTrip, RunFill, RunReject, RunResult } from '../types'
+import type {
+  ConfigItem, Meta, RoundTrip, RunFill, RunReject, RunResult,
+} from '../types'
 
 // 回测结果视图。**只看跑完的结果，不做单步** —— 单步驱动、会话、
 // WebSocket 是 v0.4 的事。这里回答的是「跑完是什么样」。
@@ -18,6 +21,7 @@ export default function Backtest({ meta }: { meta: Meta }) {
   const [picked, setPicked] = useState('')
   const [text, setText] = useState('')
   const [editing, setEditing] = useState(false)
+  const [pickUni, setPickUni] = useState(true)
   const [run, setRunState] = useState<RunResult | null>(getRun())
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState('')
@@ -59,6 +63,18 @@ export default function Backtest({ meta }: { meta: Meta }) {
 
   const current = configs.find((c) => c.name === picked)
 
+  // 配置的原始 JSON 是**唯一真相**，选择器只是它的一个视图：
+  // 读出 data.universe 给选择器，选完写回去。两边各存一份状态必然会不同步。
+  let parsed: Record<string, any> | null = null
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    parsed = null
+  }
+  // 装配器与 JSON 编辑器是同一份数据的两个视图：
+  // 装配器改完，整份写回 text；text 是唯一真相
+  const setCfg = (next: Record<string, any>) => setText(JSON.stringify(next, null, 2))
+
   return (
     <>
       <h2>回测</h2>
@@ -82,10 +98,29 @@ export default function Backtest({ meta }: { meta: Meta }) {
           <button className="primary" onClick={go} disabled={busy || !text}>
             {busy ? '跑着…' : '跑'}
           </button>
+          <button onClick={() => setPickUni(!pickUni)}>
+            {pickUni ? '收起装配' : '装配 / 改参数'}
+          </button>
           <button onClick={() => setEditing(!editing)}>
-            {editing ? '收起配置' : '改参数'}
+            {editing ? '收起 JSON' : '看 JSON'}
           </button>
         </div>
+
+        {pickUni && (
+          <div style={{ marginTop: 12, borderTop: '1px solid var(--border)', paddingTop: 12 }}>
+            {parsed ? (
+              <ConfigBuilder cfg={parsed} onChange={setCfg} meta={meta} />
+            ) : (
+              <div className="muted">配置 JSON 当前不合法，改好之后装配器才能用</div>
+            )}
+            <p className="note">
+              标的池决定结论。同一个 <code>macd_cross</code>，
+              在「按 ID 前 300 只」上跑输基准 15 个点，
+              换成「在市主板全部个股」就跑赢 5.6 个点 ——
+              <strong>换池子换的是结论，不是精度</strong>。
+            </p>
+          </div>
+        )}
         {current?.error && <div className="error" style={{ marginTop: 8 }}>{current.error}</div>}
         {editing && (
           <>
@@ -124,6 +159,9 @@ function Result({
   setTab: (t: 'trips' | 'fills' | 'rejects') => void
 }) {
   const m = run.metrics
+  // 计价单位由服务端从 Market 取。加密账户的余额不是「元」，
+  // 而单位错的数字看上去完全正常 —— 前端不自己按市场名查表
+  const cur = run.market?.money ?? '元'
   const friction = m.fee_cents + m.slippage_cents
   const cards = [
     { k: '总收益', v: pct(m.total_return), cls: m.total_return >= 0 ? 'up' : 'down' },
@@ -138,8 +176,17 @@ function Result({
       n: `${m.trades.wins} 赢 / ${m.trades.losses} 输` },
     { k: '盈亏比', v: num(m.trades.profit_factor) },
     { k: '年化换手', v: `${m.turnover.toFixed(1)} 倍` },
+    // 离场原因：正常卖出、止损、止盈、熔断清仓、被强平 ——
+    // 几种结局对「策略行不行」的意义完全不同，只看胜率是看不出来的。
+    // 强平尤其要显眼：那不是策略的决定，是市场施加的
+    ...(closeTop(m.trades.close_by) ? [{
+      k: '离场原因',
+      v: closeTop(m.trades.close_by),
+      n: closeBreakdown(m.trades.close_by),
+      cls: (m.trades.close_by?.liquidation ?? 0) > 0 ? 'down' : undefined,
+    }] : []),
     { k: '摩擦成本', v: `${(friction / m.initial_cents * 100).toFixed(2)}%`,
-      n: `费用 ${fmtCompact(yuan(m.fee_cents))} + 滑点 ${fmtCompact(yuan(m.slippage_cents))} 元` },
+      n: `费用 ${fmtCompact(yuan(m.fee_cents))} + 滑点 ${fmtCompact(yuan(m.slippage_cents))} ${cur}` },
   ]
 
   return (
@@ -175,6 +222,18 @@ function Result({
         ))}
       </div>
 
+      {!!run.disclosures?.length && (
+        <div className="panel">
+          {/* 报告里的每个数字都在说「发生了什么」，这一块说的是「什么没算」。
+              漏算的成本不报错、不异常，只是让结果一致地偏乐观 —— 所以它
+              必须和绩效放在同一屏，而不是藏在文档里 */}
+          <h3>本次回测未计入</h3>
+          <ul className="note" style={{ margin: 0, paddingLeft: 18 }}>
+            {run.disclosures.map((d, i) => <li key={i}>{d}</li>)}
+          </ul>
+        </div>
+      )}
+
       <div className="panel">
         <h3>指纹（C5）</h3>
         <table style={{ width: 'auto' }}>
@@ -204,8 +263,8 @@ function Result({
             </span>
           ))}
         </div>
-        {tab === 'trips' && <TripTable rows={run.roundTrips} meta={meta} />}
-        {tab === 'fills' && <FillTable rows={run.fills} meta={meta} />}
+        {tab === 'trips' && <TripTable rows={run.roundTrips} meta={meta} cur={cur} />}
+        {tab === 'fills' && <FillTable rows={run.fills} cur={cur} />}
         {tab === 'rejects' && <RejectTable run={run} />}
       </div>
     </>
@@ -253,29 +312,95 @@ function Pager({ page, pages, setPage }: { page: number; pages: number; setPage:
   )
 }
 
-function TripTable({ rows, meta }: { rows: RoundTrip[]; meta: Meta }) {
+// CLOSE_LABEL 把成交 tag 译成人读的离场原因。
+//
+// **认不出来的 tag 原样显示**，不归到「其他」—— 策略可以自定 tag，
+// 把它们混成一堆就等于把归因扔了（A 股的 macd_death / ma_death 就是这样）。
+const CLOSE_LABEL: Record<string, string> = {
+  liquidation: '强平',
+  stop_loss: '止损',
+  take_profit: '止盈',
+  trailing_stop: '移动止损',
+  drawdown_halt: '熔断清仓',
+  tree_sell: '卖出信号',
+  tree_buy_invalid: '虚拟买入',
+}
+/** 需要显眼标出来的离场原因 —— 它们不是策略自己的决定。 */
+const CLOSE_ALERT = new Set(['liquidation', 'drawdown_halt', 'stop_loss'])
+
+function closeLabel(tag?: string): string {
+  if (!tag) return '未标注'
+  return CLOSE_LABEL[tag] ?? tag
+}
+
+type TripFilter = 'all' | 'real' | 'virtual'
+
+function TripTable({ rows, meta, cur }: { rows: RoundTrip[]; meta: Meta; cur: string }) {
   const [sortPnl, setSortPnl] = useState(false)
-  const sorted = useMemo(
-    () => (sortPnl ? [...rows].sort((a, b) => a.pnl - b.pnl) : rows),
-    [rows, sortPnl],
-  )
+  const [kind, setKind] = useState<TripFilter>('all')
+  const nVirtual = useMemo(() => rows.filter((r) => r.virtual).length, [rows])
+  const sorted = useMemo(() => {
+    const kept = kind === 'all' ? rows : rows.filter((r) => (kind === 'virtual') === !!r.virtual)
+    // 虚拟轮次没有金额，按盈亏排时用收益率
+    return sortPnl
+      ? [...kept].sort((a, b) => (a.virtual ? a.ratio : a.pnl / 1e9) - (b.virtual ? b.ratio : b.pnl / 1e9))
+      : kept
+  }, [rows, sortPnl, kind])
   const { page, pages, slice, setPage } = useLocalPage(sorted, 40)
   const cols: Col<RoundTrip>[] = [
+    {
+      key: 'kind', title: '仓位',
+      render: (r) => r.virtual
+        ? <span className="tag" title="策略说该买，但被「有效性」树挡下来了：没有真实成交、不占资金、不计入胜率">虚拟</span>
+        : <span className="muted">实仓</span>,
+    },
     { key: 'sym', title: '代码', render: (r) => <span className="mono">{r.symbol}</span> },
     { key: 'name', title: '名称', render: (r) => r.name },
     { key: 'open', title: '开仓', render: (r) => fmtDay(r.openDay) },
     { key: 'close', title: '平仓', render: (r) => fmtDay(r.closeDay) },
     { key: 'hold', title: '持有', num: true, render: (r) => `${r.holdDays} 天` },
-    { key: 'qty', title: '数量', num: true, render: (r) => fmtNum(r.qty) },
-    { key: 'cost', title: '成本', num: true, render: (r) => yuan(r.cost).toFixed(2) },
-    { key: 'proceed', title: '收入', num: true, render: (r) => yuan(r.proceed).toFixed(2) },
     {
-      key: 'pnl', title: '盈亏', num: true, sort: 'pnl',
+      key: 'dir', title: '方向', render: (r) =>
+        r.short ? <span className="down">空</span> : <span className="up">多</span>,
+    },
+    {
+      key: 'why', title: '离场原因',
       render: (r) => (
-        <span className={r.pnl > 0 ? 'up' : r.pnl < 0 ? 'down' : 'muted'}>
-          {r.pnl > 0 ? '+' : ''}{yuan(r.pnl).toFixed(2)}
+        <span className={CLOSE_ALERT.has(r.closeTag ?? '') ? 'down' : ''}>
+          {closeLabel(r.closeTag)}
         </span>
       ),
+    },
+    {
+      key: 'qty', title: '数量', num: true,
+      render: (r) => (r.virtual ? <span className="muted">—</span> : fmtNum(r.qty / (r.qtyScale || 1))),
+    },
+    {
+      key: 'cost', title: `成本(${cur})`, num: true,
+      render: (r) => (r.virtual ? <span className="muted">—</span> : yuan(r.cost).toFixed(2)),
+    },
+    {
+      key: 'proceed', title: `收入(${cur})`, num: true,
+      render: (r) => (r.virtual ? <span className="muted">—</span> : yuan(r.proceed).toFixed(2)),
+    },
+    {
+      key: 'pnl', title: `盈亏(${cur})`, num: true, sort: 'pnl',
+      render: (r) => {
+        // 虚拟持仓从未占用资金，编一个「本该赚多少钱」出来是假的 ——
+        // 收益率才是这笔决策唯一真实可算的东西
+        if (r.virtual) {
+          return (
+            <span className={r.ratio > 0 ? 'up' : r.ratio < 0 ? 'down' : 'muted'}>
+              {r.ratio > 0 ? '+' : ''}{(r.ratio * 100).toFixed(2)}%
+            </span>
+          )
+        }
+        return (
+          <span className={r.pnl > 0 ? 'up' : r.pnl < 0 ? 'down' : 'muted'}>
+            {r.pnl > 0 ? '+' : ''}{yuan(r.pnl).toFixed(2)}
+          </span>
+        )
+      },
     },
     {
       key: 'flag', title: '', render: (r) =>
@@ -285,20 +410,39 @@ function TripTable({ rows, meta }: { rows: RoundTrip[]; meta: Meta }) {
   return (
     <>
       <div className="filters" style={{ marginBottom: 8 }}>
+        {nVirtual > 0 && ([
+          ['all', `全部 ${rows.length}`],
+          ['real', `实仓 ${rows.length - nVirtual}`],
+          ['virtual', `虚拟 ${nVirtual}`],
+        ] as const).map(([k, label]) => (
+          <span key={k} className={`chip ${kind === k ? 'on' : ''}`}
+            onClick={() => { setKind(k); setPage(1) }}>{label}</span>
+        ))}
         <button onClick={() => setSortPnl(!sortPnl)}>
           {sortPnl ? '按平仓时间排' : '按盈亏排（找最惨的）'}
         </button>
         <button onClick={() => downloadCSV('round_trips.csv',
-          ['symbol', 'name', 'open_day', 'close_day', 'hold_days', 'qty',
-           'cost_cents', 'proceed_cents', 'pnl_cents', 'from_bonus'],
-          rows.map((r) => [r.symbol, r.name, r.openDay, r.closeDay, r.holdDays,
-            r.qty, r.cost, r.proceed, r.pnl, r.fromBonus ? 1 : 0]))}>
+          ['symbol', 'name', 'virtual', 'short', 'open_day', 'close_day', 'hold_days',
+           'close_tag', 'qty', 'cost_cents', 'proceed_cents', 'pnl_cents', 'ratio',
+           'from_bonus'],
+          rows.map((r) => [r.symbol, r.name, r.virtual ? 1 : 0, r.short ? 1 : 0,
+            r.openDay, r.closeDay, r.holdDays, r.closeTag ?? '',
+            r.qty, r.cost, r.proceed, r.pnl, r.ratio, r.fromBonus ? 1 : 0]))}>
           导出全部 CSV
         </button>
         <span className="muted" style={{ alignSelf: 'center', fontSize: 12 }}>
           点任意一行进该标的 K 线，成交点会叠在图上
         </span>
       </div>
+      {nVirtual > 0 && (
+        <p className="note">
+          <strong>虚拟</strong>=「买入树说买、有效性树说不算数」的那些机会：
+          没有真实成交、不占用资金、不计入胜率与盈亏。
+          它们只有<strong>收益率</strong>没有金额 —— 从未经过仓位定量，
+          编一个「本该赚多少钱」出来是假的。
+          把虚拟与实仓并排看，才判断得出那棵有效性树到底该不该过滤它们。
+        </p>
+      )}
       <DataTable cols={cols} rows={slice} onRowClick={(r) => { location.hash = `/kline/${r.id}` }}
         empty="本次回测没有完整的一轮交易" />
       <Pager page={page} pages={pages} setPage={setPage} />
@@ -312,23 +456,32 @@ function TripTable({ rows, meta }: { rows: RoundTrip[]; meta: Meta }) {
   )
 }
 
-function FillTable({ rows, meta }: { rows: RunFill[]; meta: Meta }) {
+function FillTable({ rows, cur }: { rows: RunFill[]; cur: string }) {
   const { page, pages, slice, setPage } = useLocalPage(rows, 40)
-  const ps = meta.scales.price
+  // 每行带着自己的 scale —— 全局 scale 是 A 股口径，
+  // 拿它去除 BTC 的成交价会差好几个数量级
   const cols: Col<RunFill>[] = [
     { key: 'd', title: '交易日', render: (r) => fmtDay(r.d) },
     { key: 'sym', title: '代码', render: (r) => <span className="mono">{r.symbol}</span> },
     { key: 'name', title: '名称', render: (r) => r.name },
     {
       key: 'side', title: '方向', render: (r) => (
-        <span className={r.side === 'buy' ? 'up' : 'down'}>{r.side === 'buy' ? '买' : '卖'}</span>
+        <span className={r.side === 'buy' ? 'up' : 'down'}>
+          {r.leg || (r.side === 'buy' ? '买' : '卖')}
+        </span>
       ),
     },
-    { key: 'price', title: '成交价', num: true, render: (r) => (r.price / ps).toFixed(3) },
-    { key: 'qty', title: '数量', num: true, render: (r) => fmtNum(r.qty) },
-    { key: 'amt', title: '成交额', num: true, render: (r) => fmtCompact(yuan(r.amount)) },
-    { key: 'fee', title: '费用', num: true, render: (r) => yuan(r.fee).toFixed(2) },
-    { key: 'slip', title: '滑点', num: true, render: (r) => yuan(r.slippage).toFixed(2) },
+    {
+      key: 'price', title: '成交价', num: true,
+      render: (r) => (r.price / (r.priceScale || 1000)).toFixed(3),
+    },
+    {
+      key: 'qty', title: '数量', num: true,
+      render: (r) => fmtNum(r.qty / (r.qtyScale || 1)),
+    },
+    { key: 'amt', title: `成交额(${cur})`, num: true, render: (r) => fmtCompact(yuan(r.amount)) },
+    { key: 'fee', title: `费用(${cur})`, num: true, render: (r) => yuan(r.fee).toFixed(2) },
+    { key: 'slip', title: `滑点(${cur})`, num: true, render: (r) => yuan(r.slippage).toFixed(2) },
     { key: 'tag', title: '来源', render: (r) => <span className="tag">{r.tag}</span> },
   ]
   return (
@@ -395,4 +548,23 @@ function RejectTable({ run }: { run: RunResult }) {
 
 function keyOf(r: RunReject): string {
   return r.rule ? `风控:${r.rule}` : r.reason
+}
+
+/** closeTop 占比最大的那个离场原因，用作卡片主数字。 */
+function closeTop(by?: Record<string, number>): string {
+  const entries = Object.entries(by ?? {})
+  if (!entries.length) return ''
+  // 强平优先显示 —— 哪怕只有一笔。它不是策略的决定，
+  // 被最常见的那个原因盖过去就等于没报
+  const liq = by?.liquidation ?? 0
+  if (liq > 0) return `强平 ${liq}`
+  const [tag, n] = entries.sort((a, b) => b[1] - a[1])[0]
+  return `${closeLabel(tag)} ${n}`
+}
+
+/** closeBreakdown 全部离场原因，按轮次数降序。 */
+function closeBreakdown(by?: Record<string, number>): string | undefined {
+  const entries = Object.entries(by ?? {}).sort((a, b) => b[1] - a[1])
+  if (!entries.length) return undefined
+  return entries.map(([tag, n]) => `${closeLabel(tag)} ${n}`).join(' · ')
 }

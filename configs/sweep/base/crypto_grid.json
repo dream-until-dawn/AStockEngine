@@ -1,0 +1,68 @@
+{
+  "name": "加密永续网格 · 海选基准配置",
+  "data": {
+    "root": "../../../data",
+    "market": "crypto",
+    "freq": "1d",
+    "from": 0,
+    "to": 0,
+    "universe": {
+      "symbols": [
+        "BTC-USDT-SWAP",
+        "ETH-USDT-SWAP"
+      ]
+    }
+  },
+  "market": {
+    "impl": "crypto"
+  },
+  "fee": {
+    "impl": "config",
+    "params": {
+      "path": "../../fee/crypto_okx.json"
+    }
+  },
+  "slippage": {
+    "impl": "fixed_bps",
+    "params": {
+      "bps": 5
+    }
+  },
+  "portfolio": {
+    "initial_cash_cents": 1000000,
+    "ledger": "margin",
+    "leverage": 1,
+    "maint_margin_ppm": 5000
+  },
+  "broker": {
+    "volume_cap_ppm": 100000,
+    "allow_partial_fill": true
+  },
+  "metrics": {
+    "benchmark": "BTC-USDT-SWAP",
+    "risk_free_ppm": 0
+  },
+  "recorder": {
+    "level": "summary"
+  },
+  "strategy": {
+    "impl": "grid",
+    "params": {
+      "levels": 5,
+      "step_pct": 5,
+      "stop_levels": 2,
+      "short": 1,
+      "long": 1
+    }
+  },
+  "sizer": {
+    "impl": "pct_equity",
+    "params": {
+      "pct": 80,
+      "base": "cost",
+      "max_positions": 1
+    }
+  },
+  "risk": [],
+  "exit": []
+}

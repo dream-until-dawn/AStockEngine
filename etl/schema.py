@@ -15,7 +15,7 @@ from typing import Iterable
 
 import pyarrow as pa
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"  # 1.1.0：加入加密货币永续合约
 
 # --- 枚举（0 一律保留为未知/无效） ------------------------------------------
 
@@ -23,7 +23,9 @@ SCHEMA_VERSION = "1.0.0"
 class Market(IntEnum):
     UNKNOWN = 0
     ASHARE = 1
-    # 远期：US = 2, HK = 3, FUTURES = 4, CRYPTO = 5
+    CRYPTO = 5
+    # 远期：US = 2, HK = 3, FUTURES = 4
+    # 取值一经使用不得改动 —— 它已经写进了 parquet
 
 
 class Exchange(IntEnum):
@@ -31,12 +33,14 @@ class Exchange(IntEnum):
     SSE = 1   # 上交所
     SZSE = 2  # 深交所
     BSE = 3   # 北交所
+    OKX = 10  # OKX（加密货币）；10 起留给非 A 股交易所
 
 
 class InstrumentType(IntEnum):
     UNKNOWN = 0
     STOCK = 1
     ETF = 2
+    SWAP = 10  # 永续合约。10 起留给衍生品，免得与现货类型挤在一起
 
 
 class Board(IntEnum):
@@ -45,11 +49,14 @@ class Board(IntEnum):
     CHINEXT = 2   # 创业板
     STAR = 3      # 科创板
     BSE = 4       # 北交所
+    # 加密货币没有板块概念 —— 一律 UNKNOWN，而不是硬塞进 MAIN。
+    # board 在引擎里决定涨跌停幅度，给个假的板块会让它按 A 股规则算
 
 
 class Currency(IntEnum):
     UNKNOWN = 0
     CNY = 1
+    USDT = 10  # 稳定币计价。10 起留给非法币
 
 
 class Status(IntEnum):
@@ -62,7 +69,39 @@ class Status(IntEnum):
 
 PRICE_SCALE_ASHARE = 1000       # 价格最小单位 0.001 元
 QTY_SCALE_ASHARE = 1            # 数量最小单位 1 股/份
+
+# --- 加密货币的定点精度 -------------------------------------------------------
+#
+# **「18 位精度」在 int64 里放不下，这不是取舍问题而是算术事实。**
+#
+#   int64 上限 9,223,372,036,854,775,807，约 19 位十进制
+#   固定 18 位小数 → 可表示的最大数是 9.22，连 10 都放不下
+#
+# 真正需要的是「有效数字够 + 小数点位置随标的可变」，而 schema 里
+# price_scale / qty_scale 本来就是**逐标的**的，正是为此。
+#
+# 下面三行的前两行是**实测值**（build_crypto.py 每次运行会打印当轮实测）：
+#
+#   标的            历史最高价   scale   定点值      到 int64 上限的余量
+#   BTC-USDT-SWAP   124,956.5   1e8     1.25e13     73.8 万倍
+#   日成交量（张）    1.25e9      1e8     1.25e17     74 倍
+#   SHIB 类         ~1e-5      1e8     1e3         有效数字只剩 4 位 → 该给 1e12
+#
+# 选 1e8 的理由：它是加密圈的惯例精度（satoshi 级），比 OKX 的
+# tickSz（BTC 0.1、ETH 0.01）细 7~9 个数量级，且留足余量。
+# 极低价标的将来单独给更大的 scale —— 这正是逐标的 scale 的意义。
+#
+# ⚠ **乘积会溢出**：实测 price_fp × qty_fp 最大 1.25e13 × 1.25e17 = 1.56e30，
+# 远超 int64 的 9.22e18。引擎侧算名义额必须走 mulDiv 拆分
+# （参照 mktdata/adjust.go 的 mulDivFactor）。单个值本身都安全，
+# 溢出只发生在相乘时。
+#
+# 数量的余量只有 74 倍，是三者里最紧的一项 —— 若将来接成交量更大的
+# 小币种，先看 build_crypto.py 打印的实测余量，别照抄 1e8。
+PRICE_SCALE_CRYPTO = 100_000_000   # 1e8，8 位小数
+QTY_SCALE_CRYPTO = 100_000_000     # 1e8，张数也到 8 位小数（OKX lotSz 0.01 张）
 AMOUNT_SCALE = 100              # 金额以分为单位
+FUNDING_RATE_SCALE = 1_000_000_000_000  # 资金费率 1e12，见 FUNDING_SCHEMA 的说明
 RATIO_SCALE = 1_000_000         # 比率（换手率等）固定 1e6
 FACTOR_SCALE = 1_000_000_000_000  # 复权因子 1e12
 PER_SHARE_SCALE = 1_000_000     # 每股分红/送转 1e6
@@ -110,6 +149,32 @@ def ymd_to_int(value) -> int:
 
 def int_to_date(ymd: int) -> date:
     return date(ymd // 10000, ymd // 100 % 100, ymd % 100)
+
+
+def ms_to_ymd_cst(ms) -> int:
+    """毫秒时间戳 → UTC+8 下的 YYYYMMDD。
+
+    加密的日界一律走这里，别在各处各写一遍 ——
+    时区折算写错一次就是整张表偏一天，而且不会报错。
+    """
+    if ms is None or ms == "":
+        return 0
+    return int(datetime.fromtimestamp(int(ms) / 1000, CST).strftime("%Y%m%d"))
+
+
+def crypto_session_ts(ymd: int) -> tuple[int, int]:
+    """加密货币日线的 (ts_open, ts_close)，UTC 毫秒。
+
+    **按 UTC+8 切日**（OKX 的 bar=1D 就是这个口径，1Dutc 才是 UTC 0 点）。
+    24×7 连续交易，故 ts_close = 次日 00:00 —— 与次日 bar 的 ts_open 相同，
+    这是事实而非错误：一根 bar 结束的瞬间就是下一根开始的瞬间。
+
+    引擎的游标只用 ts_close（该 bar 信息可得的时刻），所以 A 股的
+    15:00 与加密的次日 00:00 能排在同一条时间轴上，无需分支（C9）。
+    """
+    d = int_to_date(ymd)
+    o = datetime(d.year, d.month, d.day, 0, 0, tzinfo=CST)
+    return int(o.timestamp() * 1000), int(o.timestamp() * 1000) + 86_400_000
 
 
 def session_ts(ymd: int) -> tuple[int, int]:
@@ -256,12 +321,31 @@ CORPORATE_ACTION_SCHEMA = pa.schema([
     pa.field("rights_price", pa.int64(), nullable=False),   # 配股价格，定点
 ])
 
+FUNDING_SCHEMA = pa.schema([
+    pa.field("instrument_id", pa.int32(), nullable=False),
+    # 结算时刻，UTC 毫秒。**存原始 8h 记录，不预先聚合成日频** ——
+    # 聚合方式（按日求和？按持仓时段加权？）本身会影响结果，
+    # 这个选择必须留在引擎里，由持仓的实际起止时刻决定
+    pa.field("funding_time", pa.int64(), nullable=False),
+    # 结算时刻所属的自然日（UTC+8），供按日 join
+    pa.field("trading_day", pa.int32(), nullable=False),
+    # 费率，scale 1e12。**不是 1e6**：单次费率量级在 1e-5，
+    # 1e6 只剩 1 位有效数字，四舍五入的误差会与费率本身同量级。
+    # 取 1e12 而非 1e9 的额外理由：与 FACTOR_SCALE 一致，
+    # 引擎侧可直接复用 mktdata/adjust.go 的 mulDivFactor 做不溢出的乘除
+    pa.field("rate", pa.int64(), nullable=False),
+    # 原始字符串，与 adj_factor.hfq_factor_raw 同理 ——
+    # 定点换算若哪天被判定错了，还能从原值重算，不必重新拉一遍
+    pa.field("rate_raw", pa.string(), nullable=False),
+])
+
 TABLE_SCHEMAS = {
     "bar": BAR_SCHEMA,
     "instruments": INSTRUMENTS_SCHEMA,
     "calendar": CALENDAR_SCHEMA,
     "adj_factor": ADJ_FACTOR_SCHEMA,
     "corporate_action": CORPORATE_ACTION_SCHEMA,
+    "funding": FUNDING_SCHEMA,
 }
 
 # bar 表中适用 delta 编码的列（实测该组合为最优：18.30 字节/行）

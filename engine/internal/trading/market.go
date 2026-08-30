@@ -2,6 +2,7 @@ package trading
 
 import (
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
+	"math"
 )
 
 // PriceRef 指定成交价的基准。
@@ -56,6 +57,29 @@ type Market interface {
 	NormalizeQty(inst *mktdata.Instrument, qty int64, side Side, held int64) (int64, bool)
 	// Tradable 报告该标的当日是否可交易
 	Tradable(inst *mktdata.Instrument, b mktdata.Bar) bool
+	// AllowsShort 报告该市场是否允许做空。
+	//
+	// **它决定 `Enter + 卖` 的含义**：不允许做空时那是减仓
+	// （A 股的网格策略就这么用），允许时那是开空。
+	// 同一个信号在两个市场里意思不同，而策略不该为此分叉 ——
+	// 由市场规则来解释，正是 Market 这一层存在的理由。
+	AllowsShort() bool
+	// AnnualDays 返回该市场一年有多少个「步」，用于年化收益与波动。
+	//
+	// **放在 Market 而不是 Calendar 上**：A 股由日历实测（含节假日、
+	// 临时休市），而 24×7 市场压根没有日历表 —— 让 Calendar 去回答
+	// 「加密一年几天」只能得到兜底值 252，而正确值是 365。
+	// 45% 的偏差会直接改变「这个策略行不行」的结论。
+	//
+	// cal 可以为 nil（不依赖日历的市场直接返回常数）。
+	AnnualDays(cal *mktdata.Calendar, from, to int32) float64
+	// Units 返回该市场的计价单位与数量单位，如 ("元", "股") / ("USDT", "张")。
+	//
+	// **纯展示用，不参与任何计算**。放进接口而不是在报告里按市场名查表：
+	// 查表漏了一个市场只会安静地印出「元」，而加密账户的余额不是元 ——
+	// 一个看上去正常的错数字比报错难发现得多。放这里，
+	// 新市场不实现就编译不过。
+	Units() (money, qty string)
 }
 
 // ---- A 股实现 ----
@@ -103,6 +127,27 @@ func NewAShareMarket() *AShareMarket {
 
 func (m *AShareMarket) Name() string { return "ashare" }
 
+// Units A 股以人民币计价、以股为数量单位。
+func (m *AShareMarket) Units() (string, string) { return "元", "股" }
+
+// AllowsShort A 股普通账户不能做空。
+//
+// 融资融券确有做空，但本项目**明确不建模**（C8 / Disclosures），
+// 所以这里是 false —— 返回 true 会让策略以为能开空，
+// 而账本根本没有空头槽位。
+func (m *AShareMarket) AllowsShort() bool { return false }
+
+// AnnualDays 由交易日历实测，而不是用「252」这个约定俗成的数。
+//
+// 252 是美股的口径。A 股因春节、国庆等长假，实测年均交易日在 242~245，
+// 用 252 会让年化收益虚低约 3%、年化波动虚高约 2%。
+func (m *AShareMarket) AnnualDays(cal *mktdata.Calendar, from, to int32) float64 {
+	if cal == nil {
+		return 252
+	}
+	return cal.TradingDaysPerYear(mktdata.MarketAShare, from, to)
+}
+
 // limitPPM 返回该标的当日的涨跌幅限制（百万分之一）。
 //
 // 用 TrackedBoard 而非 Board：ETF 自身不属于任何板块，其涨跌停由跟踪的
@@ -137,10 +182,39 @@ func (m *AShareMarket) LimitPrices(inst *mktdata.Instrument, b mktdata.Bar) (int
 	if b.PreClose <= 0 {
 		return 0, 0, false
 	}
+	// 别的市场没有涨跌停这回事，返回 false 而不是算一个数出来。
+	//
+	// 这不只是语义问题，也是溢出问题：roundToCent 里 preclose × 1.3e6
+	// 在 A 股的价格量级（≤3e6 厘）上安全，而加密的定点价可到 1.25e13
+	// （scale 1e8），乘完 1.6e19 **超过 int64**，会静默回绕成负数。
+	// 见 SCHEMA.md 0.6。
+	//
+	// **market 未知时按 A 股处理**（走下面的量级兜底），而不是当成别的市场 ——
+	// 未知市场若直接放行「无涨跌停」，等于在数据有问题时把风控关掉，
+	// 回测结果会偏乐观。宁可用更严的规则，也不要静默放宽。
+	if inst != nil && inst.Market != mktdata.MarketAShare &&
+		inst.Market != mktdata.MarketUnknown {
+		return 0, 0, false
+	}
+	// 量级兜底：market 填错时也不至于算出一个负的涨停价。
+	// 上界由 roundToCent 的最坏情形反推（北交所 30% → factorPPM = 1.3e6）。
+	if b.PreClose > maxPreCloseForLimit {
+		return 0, 0, false
+	}
 	ppm := m.limitPPM(inst, b)
 	return roundToCent(b.PreClose, 1_000_000+ppm),
 		roundToCent(b.PreClose, 1_000_000-ppm), true
 }
+
+// maxPreCloseForLimit 是 roundToCent 不溢出的 preclose 上界。
+//
+// 最坏情形 factorPPM = 1e6 + 3e5（北交所 30%），再加上四舍五入的 5e6：
+//
+//	preclose × 1.3e6 + 5e6 ≤ 9.22e18   →   preclose ≤ 7.09e12
+//
+// A 股的价格上限约 3e6 厘，离这条线还有 200 万倍；
+// 它拦的是「scale 不是 1000 的标的被当成了 A 股」这种情况。
+const maxPreCloseForLimit = (math.MaxInt64 - 5_000_000) / 1_300_000
 
 // roundToCent 计算 preclose × factorPPM / 1e6，并**四舍五入到分**。
 //
@@ -148,7 +222,8 @@ func (m *AShareMarket) LimitPrices(inst *mktdata.Instrument, b mktdata.Bar) (int
 // 全程整数：preclose 上限约 3e6 厘，× 1.3e6 = 3.9e12，远在 int64 范围内。
 //
 // 校验：4.35 元 ×1.10 = 4.785 → 4.79（而非银行家舍入的 4.78）
-//       5.35 元 ×1.10 = 5.885 → 5.89（而非 5.88）
+//
+//	5.35 元 ×1.10 = 5.885 → 5.89（而非 5.88）
 func roundToCent(preclose, factorPPM int64) int64 {
 	n := preclose * factorPPM // 厘 × 1e6
 	// 除以 1e7 得到「分」，四舍五入；再乘 10 回到「厘」
@@ -248,4 +323,58 @@ func (m *AShareMarket) Tradable(inst *mktdata.Instrument, b mktdata.Bar) bool {
 		return false
 	}
 	return b.TradingDay >= inst.ListDate
+}
+
+// PosLeg 一笔买卖作用在哪个仓位槽、是开还是平。
+type PosLeg struct {
+	// Short 作用在空头槽
+	Short bool
+	// Opening 开仓（false 即平仓）
+	Opening bool
+}
+
+// String 人读的开平方向：开多 / 平多 / 开空 / 平空。
+//
+// 单向市场里 Short 恒为 false，于是它退化成「开多 / 平多」——
+// 那正是 A 股该看到的两个词。
+func (l PosLeg) String() string {
+	switch {
+	case l.Short && l.Opening:
+		return "开空"
+	case l.Short:
+		return "平空"
+	case l.Opening:
+		return "开多"
+	}
+	return "平多"
+}
+
+// LegOf 由「买卖方向 + 是否平仓 + 市场是否双向」推出仓位槽与开平。
+//
+// 双向：
+//
+//	买 + 开 = 开多      买 + 平 = 平空
+//	卖 + 开 = 开空      卖 + 平 = 平多
+//
+// 单向：买恒为开多，卖恒为平多 —— reduce 不看。
+// A 股的减仓卖出与清仓卖出都是平多，没有「卖出开仓」这回事。
+//
+// # 为什么要单独抽出来
+//
+// 这张表原先在四个地方各写了一遍：保证金账本记账、轮次配对、
+// 仓位模块定方向、组合策略去重。**每一处写错的表现都不一样，
+// 而且都不报错**：账本记错槽位、轮次凭空多出几百轮、
+// 开空变成开多、开空信号被平多信号顶掉。
+// 前三处各自被发现过一次，第四处是在前三处都修好之后
+// 才暴露出来的 —— 那时 336 笔成交里只有 2 笔是开空。
+//
+// 一张表，一个地方。
+func LegOf(side Side, reduce, hedge bool) PosLeg {
+	if !hedge {
+		return PosLeg{Short: false, Opening: side == SideBuy}
+	}
+	if reduce {
+		return PosLeg{Short: side == SideBuy, Opening: false}
+	}
+	return PosLeg{Short: side == SideSell, Opening: true}
 }

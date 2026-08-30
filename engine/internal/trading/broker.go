@@ -20,8 +20,17 @@ type Order struct {
 	Side       Side
 	Type       OrderType
 	Qty        int64
-	LimitPrice int64  // 仅限价单，定点
-	Tag        string // 策略自定，用于归因
+	LimitPrice int64 // 仅限价单，定点
+	// Reduce 平仓单。**双向持仓下缺了它就无法判断意图**：
+	//
+	//	买 + 开 = 开多      买 + 平 = 平空
+	//	卖 + 开 = 开空      卖 + 平 = 平多
+	//
+	// 现货账本忽略它（卖出永远是平多）。由 Sizer 从
+	// Signal.Kind == SignalExit 设置 —— 信号层本来就区分开平，
+	// 只是这个区分在折算成订单时被丢掉了。
+	Reduce bool
+	Tag    string // 策略自定，用于归因
 }
 
 // PendingOrder 是已定价、等待成交的订单。
@@ -96,7 +105,13 @@ type Fill struct {
 	// 也无法与行情数据核对。
 	Price int64 // 定点成交价
 	Qty   int64
-	Fee   FeeBreakdown
+	// AmountCents 名义额，计价币种的最小单位（A 股 = 分，加密 = 0.01 USDT）。
+	//
+	// **由撮合器算好放进来**，账本与绩效不再各算一遍。理由有两个：
+	// 一是换算要知道标的的 scale 与合约乘数，而账本手里没有标的表；
+	// 二是同一笔成交的金额在三处各算一次，迟早会有一处口径不同。
+	AmountCents int64
+	Fee         FeeBreakdown
 	// SlippageCents 执行摩擦（分）。它不是「费用」——
 	// 佣金印花税过户费是付给第三方的真金白银，滑点是执行质量的损耗，
 	// 两者分开记，费用合计才能与券商对账单对得上。
@@ -114,6 +129,16 @@ type Rejection struct {
 	// v0.4 的单步调试两个都要展示。
 	Rule   string
 	Detail string
+}
+
+// WithAmount 补上名义额，供**手工构造 Fill** 的地方使用（主要是测试）。
+//
+// 生产路径只有 Broker.Match 会造 Fill，它自己算好。但 AmountCents 漏填
+// 就是 0，而 0 不会报错 —— 账目会安静地少掉这一笔。
+// 与其靠每处记得填，不如给一个补齐的入口。
+func (f Fill) WithAmount(in *mktdata.Instrument) Fill {
+	f.AmountCents = NotionalCents(in, f.Price, f.Qty)
+	return f
 }
 
 // Slippage 滑点模型，可插拔。
@@ -141,7 +166,10 @@ type Slippage interface {
 	Name() string
 	// CostCents 返回这笔成交因滑点付出的额外成本（分，恒为非负）。
 	// 买入时加到成本上，卖出时从收入里扣掉。
-	CostCents(side Side, price int64, qty int64, b mktdata.Bar) int64
+	//
+	// **收的是名义额而不是 (价格, 数量)**：换算成金额要知道标的的
+	// scale 与合约乘数，滑点模型不该也去操心这个。
+	CostCents(side Side, amountCents int64, b mktdata.Bar) int64
 }
 
 // NoSlippage 无滑点，用于隔离测试。
@@ -149,19 +177,15 @@ type NoSlippage struct{}
 
 func (NoSlippage) Name() string { return "none" }
 
-func (NoSlippage) CostCents(Side, int64, int64, mktdata.Bar) int64 { return 0 }
+func (NoSlippage) CostCents(Side, int64, mktdata.Bar) int64 { return 0 }
 
 // BpsSlippage 固定基点滑点：按成交额的万分之 Bps/10 计成本。
 type BpsSlippage struct{ Bps int64 }
 
 func (s BpsSlippage) Name() string { return "fixed_bps" }
 
-func (s BpsSlippage) CostCents(_ Side, price, qty int64, _ mktdata.Bar) int64 {
-	if s.Bps <= 0 || qty <= 0 {
-		return 0
-	}
-	amount := AmountCents(price, qty)
-	if amount <= 0 {
+func (s BpsSlippage) CostCents(_ Side, amount int64, _ mktdata.Bar) int64 {
+	if s.Bps <= 0 || amount <= 0 {
 		return 0
 	}
 	// 四舍五入到分。这里的取整误差是 1 分对上万分，无关紧要 ——
@@ -200,6 +224,28 @@ type Broker struct {
 	Fee      Fee
 	Slippage Slippage
 	Cfg      BrokerConfig
+}
+
+// FrictionCents 估算一笔成交要付出的摩擦（费用 + 滑点）。
+//
+// **给 Sizer 用的**：定量时必须先把这笔钱留出来，否则算出的数量
+// 刚好花光可用资金，撮合时 `金额 + 费用 + 滑点 > 购买力`，
+// 整单被拒 —— 表现为「按 100% 权益下注反而一笔都开不出来」。
+//
+// 用的是与真正撮合**同一套** Fee/Slippage 实例，所以不是估算而是精算
+// （唯一的差别是撮合时的成交价可能与这里传的参考价不同）。
+func (br *Broker) FrictionCents(
+	inst *mktdata.Instrument, side Side, day int32,
+	qty, amountCents int64, b mktdata.Bar,
+) int64 {
+	if qty <= 0 || amountCents <= 0 {
+		return 0
+	}
+	fee := br.Fee.Calc(FeeRequest{
+		Instrument: inst, Side: side, Liquidity: LiquidityTaker,
+		Qty: qty, AmountCents: amountCents, TradingDay: day,
+	})
+	return fee.Total + br.Slippage.CostCents(side, amountCents, b)
 }
 
 // NewBroker 装配撮合器。
@@ -243,7 +289,7 @@ func refPrice(ref PriceRef, b mktdata.Bar) (int64, bool) {
 // 这样拒单原因总是指向最根本的那个障碍 ——
 // 停牌的股票不该报「现金不足」。
 func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Bar,
-	now mktdata.TimePoint, pf *Portfolio) (Fill, Rejection, bool) {
+	now mktdata.TimePoint, led Ledger) (Fill, Rejection, bool) {
 
 	rej := func(r RejectReason, detail string) (Fill, Rejection, bool) {
 		return Fill{}, Rejection{Order: po.Order, At: now, Reason: r, Detail: detail}, false
@@ -263,11 +309,11 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 	if hasLimit && b.High == b.Low {
 		if po.Side == SideBuy && b.High >= up {
 			return rej(RejectOneWordBoard,
-				fmt.Sprintf("一字涨停 %.3f，无法买入", float64(up)/1000))
+				fmt.Sprintf("一字涨停 %.4f，无法买入", priceOf(inst, up)))
 		}
 		if po.Side == SideSell && b.Low <= down {
 			return rej(RejectOneWordBoard,
-				fmt.Sprintf("一字跌停 %.3f，无法卖出", float64(down)/1000))
+				fmt.Sprintf("一字跌停 %.4f，无法卖出", priceOf(inst, down)))
 		}
 	}
 
@@ -280,11 +326,11 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 	if hasLimit {
 		if po.Side == SideBuy && ref >= up {
 			return rej(RejectLimitUpNoBuy,
-				fmt.Sprintf("参考价 %.3f 已达涨停 %.3f", float64(ref)/1000, float64(up)/1000))
+				fmt.Sprintf("参考价 %.4f 已达涨停 %.4f", priceOf(inst, ref), priceOf(inst, up)))
 		}
 		if po.Side == SideSell && ref <= down {
 			return rej(RejectLimitDownNoSell,
-				fmt.Sprintf("参考价 %.3f 已达跌停 %.3f", float64(ref)/1000, float64(down)/1000))
+				fmt.Sprintf("参考价 %.4f 已达跌停 %.4f", priceOf(inst, ref), priceOf(inst, down)))
 		}
 	}
 
@@ -295,13 +341,13 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 
 	// 限价单：买单要求成交价不高于限价，卖单不低于限价
 	if po.Type == OrderLimit {
+		px := func(v int64) float64 { return priceOf(inst, v) }
 		if po.Side == SideBuy && price > po.LimitPrice {
 			if b.Low <= po.LimitPrice {
 				price = po.LimitPrice // 当日曾跌到限价，按限价成交
 			} else {
 				return rej(RejectLimitPriceNotReached,
-					fmt.Sprintf("限价 %.3f，当日最低 %.3f",
-						float64(po.LimitPrice)/1000, float64(b.Low)/1000))
+					fmt.Sprintf("限价 %.4f，当日最低 %.4f", px(po.LimitPrice), px(b.Low)))
 			}
 		}
 		if po.Side == SideSell && price < po.LimitPrice {
@@ -309,26 +355,29 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 				price = po.LimitPrice
 			} else {
 				return rej(RejectLimitPriceNotReached,
-					fmt.Sprintf("限价 %.3f，当日最高 %.3f",
-						float64(po.LimitPrice)/1000, float64(b.High)/1000))
+					fmt.Sprintf("限价 %.4f，当日最高 %.4f", px(po.LimitPrice), px(b.High)))
 			}
 		}
 	}
 
 	// 数量合规
-	held := pf.Available(po.Instrument, now.TsClose)
+	held := led.Available(po.Instrument, now.TsClose)
 	qty, ok := br.Market.NormalizeQty(inst, po.Qty, po.Side, held)
 	if !ok {
 		if po.Side == SideSell && held <= 0 {
 			return rej(RejectInsufficientPosition,
-				fmt.Sprintf("可卖 0 股（持仓 %d，T+1 未解冻）", positionTotal(pf, po.Instrument)))
+				fmt.Sprintf("可减仓 0（敞口 %+d，尚未解冻）",
+					led.Exposure(po.Instrument).Net()))
 		}
 		return rej(RejectInvalidQty,
 			fmt.Sprintf("申报 %d，最小 %d，步长 %d", po.Qty, inst.MinOrderQty, inst.QtyStep))
 	}
 
 	// 成交量占比上限
-	cap := b.Volume * br.Cfg.VolumeCapPPM / 1_000_000
+	// 走 128 位：BTC 的日成交量定点值到 1.25e17，直接乘 100000 ppm
+	// 是 1.25e22，**回绕之后上限变成一个很小的数**，于是所有单子
+	// 都被判成「超出成交量占比上限」—— 实测踩过这一脚
+	cap := MulDiv(b.Volume, br.Cfg.VolumeCapPPM, 1_000_000)
 	if cap <= 0 {
 		return rej(RejectVolumeCap, "当日成交量为 0")
 	}
@@ -345,35 +394,39 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 	}
 
 	// 资金 / 持仓校验
-	amount := AmountCents(price, qty)
+	// 名义额按**标的自己的 scale 与合约乘数**算，且走 128 位中间结果 ——
+	// BTC 的 价格_fp × 数量_fp 实测到 1.25e21，直接相乘会静默回绕（SCHEMA 0.6）
+	amount := NotionalCents(inst, price, qty)
 	fee := br.Fee.Calc(FeeRequest{
 		Instrument: inst, Side: po.Side, Qty: qty,
 		AmountCents: amount, TradingDay: b.TradingDay,
 	})
-	slip := br.Slippage.CostCents(po.Side, price, qty, b)
-	if po.Side == SideBuy {
-		// 滑点与费用一样要占用现金 —— 漏掉它会让「买得起」的判断偏松，
-		// 成交之后账本才发现钱不够
-		need := amount + fee.Total + slip
-		if need > pf.Cash {
-			return rej(RejectInsufficientCash,
-				fmt.Sprintf("需 %.2f 元，可用 %.2f 元",
-					float64(need)/100, float64(pf.Cash)/100))
-		}
-	} else if qty > held {
-		return rej(RejectInsufficientPosition,
-			fmt.Sprintf("申报卖出 %d，可卖 %d", qty, held))
+	slip := br.Slippage.CostCents(po.Side, amount, b)
+	fill := Fill{
+		Order: po.Order, At: now, Price: price, Qty: qty,
+		AmountCents: amount, Fee: fee, SlippageCents: slip,
 	}
 
-	return Fill{
-		Order: po.Order, At: now, Price: price, Qty: qty,
-		Fee: fee, SlippageCents: slip,
-	}, Rejection{}, true
+	// **可行性由账本判断，不由撮合器判断。**
+	//
+	// 「买得起吗」的答案取决于账户类型：现货看现金，保证金账户看可用保证金；
+	// 「卖得出吗」同理 —— 现货不能卖超持仓，保证金账户那叫开空。
+	// 撮合器不该知道这个区别。滑点与费用一并计入需求额 ——
+	// 漏掉会让判断偏松，成交之后账本才发现钱不够。
+	if reason, detail, ok := led.CanFill(fill); !ok {
+		return rej(reason, detail)
+	}
+	return fill, Rejection{}, true
 }
 
-func positionTotal(pf *Portfolio, id mktdata.InstrumentID) int64 {
-	if p := pf.Position(id); p != nil {
-		return p.Total
+// priceOf 把定点价按标的自己的 price_scale 转成人读值。
+//
+// 只用于拼消息。**不要拿它去算钱** —— 浮点一进来，
+// 定点整数这条线就断了。
+func priceOf(inst *mktdata.Instrument, v int64) float64 {
+	scale := int64(1000)
+	if inst != nil && inst.PriceScale > 0 {
+		scale = int64(inst.PriceScale)
 	}
-	return 0
+	return float64(v) / float64(scale)
 }

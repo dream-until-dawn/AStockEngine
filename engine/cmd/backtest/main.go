@@ -20,8 +20,6 @@ import (
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/config"
 	eng "github.com/dream-until-dawn/AStockEngine/engine/internal/engine"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/fingerprint"
-	"github.com/dream-until-dawn/AStockEngine/engine/internal/metrics"
-	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/record"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 
@@ -67,6 +65,12 @@ func main() {
 		fatal(err)
 	}
 	loadDur := time.Since(t0)
+
+	uniIDs, err := cfg.ResolveUniverse(ds.Universe, ds.Adjuster)
+	if err != nil {
+		fatal(err)
+	}
+	discl := cfg.Disclosures(ds.Universe, uniIDs)
 
 	e, err := cfg.Assemble(ds)
 	if err != nil {
@@ -129,27 +133,36 @@ func main() {
 	dur := time.Since(t1)
 	rec := e.Recorder()
 
-	pf := e.Portfolio()
+	// 计价与数量单位由市场给出。加密账户的余额不是「元」，持仓也不是「股」——
+	// 单位印错的数字看上去完全正常，是最难被发现的一类错
+	money, qtyUnit = e.Market().Units()
+
+	led := e.Ledger()
 	final := e.EquityCents()
 	fmt.Println("=== 结果 ===")
 	fmt.Printf("  步数 %d  耗时 %v\n", e.Steps(), dur.Round(time.Millisecond))
 	fmt.Printf("  信号 %d 条  成交 %d 笔  拒单 %d 笔\n", signals, fills, rejects)
-	fmt.Printf("  初始 %.2f 元 → 权益 %.2f 元（%+.2f%%）\n",
-		cents(initial), cents(final), float64(final-initial)/float64(initial)*100)
-	fmt.Printf("  现金 %.2f 元  持仓 %d 只  已实现 %.2f 元\n",
-		cents(pf.Cash), countPositions(pf), cents(pf.RealizedCents))
-	fmt.Printf("  峰值权益 %.2f 元\n", cents(e.PeakEquityCents()))
-	fmt.Printf("  费用合计 %.2f 元（占初始 %.2f%%）",
-		cents(pf.TotalFeeCents()), float64(pf.TotalFeeCents())/float64(initial)*100)
-	for _, k := range sortedKeys(pf.FeeCents) {
-		fmt.Printf("  %s %.2f", k, cents(pf.FeeCents[k]))
+	fmt.Printf("  初始 %.2f %s → 权益 %.2f %s（%+.2f%%）\n",
+		cents(initial), money, cents(final), money,
+		float64(final-initial)/float64(initial)*100)
+	fmt.Printf("  现金 %.2f %s  持仓 %d 只  已实现 %.2f %s\n",
+		cents(led.CashCents()), money, led.NumPositions(),
+		cents(led.RealizedCents()), money)
+	fmt.Printf("  峰值权益 %.2f %s\n", cents(e.PeakEquityCents()), money)
+	fmt.Printf("  费用合计 %.2f %s（占初始 %.2f%%）",
+		cents(led.TotalFeeCents()), money,
+		float64(led.TotalFeeCents())/float64(initial)*100)
+	fees := led.FeeCents()
+	for _, k := range sortedKeys(fees) {
+		fmt.Printf("  %s %.2f", k, cents(fees[k]))
 	}
 	fmt.Println()
 	// 滑点单列。它以前藏在成交价里，报告只看得到佣金印花税，
 	// 看不到执行摩擦到底吃掉多少 —— 而它经常比佣金还大
-	fmt.Printf("  滑点合计 %.2f 元（占初始 %.2f%%）  摩擦合计 %.2f 元\n",
-		cents(pf.SlippageCents), float64(pf.SlippageCents)/float64(initial)*100,
-		cents(pf.TotalFeeCents()+pf.SlippageCents))
+	fmt.Printf("  滑点合计 %.2f %s（占初始 %.2f%%）  摩擦合计 %.2f %s\n",
+		cents(led.SlippageCents()), money,
+		float64(led.SlippageCents())/float64(initial)*100,
+		cents(led.TotalFeeCents()+led.SlippageCents()), money)
 
 	if len(rejectBy) > 0 {
 		fmt.Println("  拒单原因分布：")
@@ -157,8 +170,16 @@ func main() {
 			fmt.Printf("    %-24s %d\n", k, rejectBy[k])
 		}
 	}
-	if n := len(pf.Warnings); n > 0 {
-		fmt.Printf("  账本告警 %d 条，首条：%s\n", n, pf.Warnings[0])
+	if failed, day, why := e.Failure(); failed {
+		// 破产之后净值走成一条直线：最大回撤定格在这一天、
+		// 年化波动被后面的零波动摊薄、夏普反而变好看。
+		// **必须先说这一句**，否则底下每个指标都会被误读
+		fmt.Printf("  [!] 策略于 %d 判定失败：%s\n", day, why)
+		fmt.Println("      此后不再开新仓，净值为一条直线 —— " +
+			"下面的年化波动、夏普、最大回撤都因此失真，不要按常规解读。")
+	}
+	if w := led.Warnings(); len(w) > 0 {
+		fmt.Printf("  账本告警 %d 条，首条：%s\n", len(w), w[0])
 	}
 
 	if m, ok := rec.(*record.Memory); ok {
@@ -175,7 +196,16 @@ func main() {
 		fmt.Println("  海选内层用 none 省内存；要看指标请改成 summary。")
 		fmt.Println()
 	} else {
-		printReport(computeMetrics(cfg, ds, rec))
+		printReport(config.ComputeMetrics(cfg, ds, rec, e.Market()))
+	}
+
+	if ds := discl; len(ds) > 0 {
+		fmt.Println("=== 本次回测未计入 ===")
+		for _, d := range ds {
+			fmt.Printf("  · %s\n", d)
+		}
+		fmt.Println("  报告里的每个数字都在说「发生了什么」，这一段说的是「什么没算」。")
+		fmt.Println()
 	}
 
 	fmt.Println("=== 指纹（C5）===")
@@ -204,15 +234,16 @@ func main() {
 		if err := e2.RunAll(); err != nil {
 			fatal(err)
 		}
-		b := e2.Portfolio()
+		b := e2.Ledger()
 		fmt.Printf("  全程 现金 %.2f / 已实现 %.2f / 峰值 %.2f\n",
-			cents(pf.Cash), cents(pf.RealizedCents), cents(e.PeakEquityCents()))
+			cents(led.CashCents()), cents(led.RealizedCents()), cents(e.PeakEquityCents()))
 		fmt.Printf("  恢复 现金 %.2f / 已实现 %.2f / 峰值 %.2f\n",
-			cents(b.Cash), cents(b.RealizedCents), cents(e2.PeakEquityCents()))
+			cents(b.CashCents()), cents(b.RealizedCents()), cents(e2.PeakEquityCents()))
 		fpFull, fpRestored := e.ResultFingerprint(), e2.ResultFingerprint()
 		fmt.Printf("  全程 指纹 %s\n", fpFull)
 		fmt.Printf("  恢复 指纹 %s\n", fpRestored)
-		ok := pf.Cash == b.Cash && pf.RealizedCents == b.RealizedCents &&
+		ok := led.CashCents() == b.CashCents() &&
+			led.RealizedCents() == b.RealizedCents() &&
 			e.PeakEquityCents() == e2.PeakEquityCents()
 		if ok && fpFull == fpRestored {
 			// 指纹相同才是真的一致：账本三个数相同只说明结果相同，
@@ -244,7 +275,17 @@ func printModules() {
 	fmt.Printf("  slippage  %s\n", strings.Join(trading.Slippages.Names(), " / "))
 	fmt.Printf("  sizer     %s\n", strings.Join(trading.Sizers.Names(), " / "))
 	fmt.Printf("  risk      %s\n", strings.Join(trading.Risks.Names(), " / "))
-	fmt.Printf("  strategy  %s\n\n", strings.Join(eng.Strategies.Names(), " / "))
+	fmt.Printf("  strategy  %s\n", strings.Join(eng.Strategies.Names(), " / "))
+	// **离场规则也是一类模块。** 漏掉它的话，「-modules 列出全部可用模块」
+	// 这句话是假的 —— 而人会据此以为止损止盈根本没实现
+	fmt.Printf("  exit      %s\n", strings.Join(trading.Exits.Names(), " / "))
+	// composite 不在注册表里 —— 它由配置层直接装配（它要嵌套的 sources，
+	// 而注册表只认「一个名字 + 一段扁平参数」）。但读这份清单的人不知道
+	// 这个内情，看不见就会以为组合策略没实现，所以在这里点一句
+	fmt.Println("            另有 composite（组合策略，不在注册表里）：" +
+		"strategy.impl 填 composite，用 sources 列出各决策源，" +
+		"mode 取 union / confirm / veto")
+	fmt.Println()
 
 	show := func(kind string, names []string, get func(string) ([]eng.ParamSpec, bool)) {
 		for _, n := range names {
@@ -271,32 +312,7 @@ func printModules() {
 	show("slippage", trading.Slippages.Names(), trading.Slippages.Specs)
 	show("fee", trading.Fees.Names(), trading.Fees.Specs)
 	show("strategy", eng.Strategies.Names(), eng.Strategies.Specs)
-}
-
-// computeMetrics 把记录喂给绩效模块。
-//
-// 年化系数**由日历数出来**（按本次样本区间实测），不是 252 ——
-// 252 是美股惯例，A 股实测年均 242.90 天。
-func computeMetrics(cfg *config.Config, ds *config.DataSet, rec record.Recorder) metrics.Result {
-	m, _ := rec.(*record.Memory)
-	days, eq := m.Curve()
-	in := metrics.Input{
-		Curve:        metrics.Curve{Days: days, Equity: eq},
-		InitialCents: cfg.Portfolio.InitialCashCents,
-		Fills:        rec.Fills(),
-		RiskFreePPM:  cfg.Metrics.RiskFreePPM,
-	}
-	var from, to int32
-	if len(days) > 0 {
-		from, to = days[0], days[len(days)-1]
-	}
-	in.TradingDaysPerYear = ds.Calendar.TradingDaysPerYear(mktdata.MarketAShare, from, to)
-
-	if bd, be, ok := ds.BenchmarkCurve(); ok {
-		in.Benchmark = &metrics.Curve{Days: bd, Equity: be}
-		in.BenchmarkName = cfg.Metrics.Benchmark
-	}
-	return metrics.Compute(in)
+	show("exit", trading.Exits.Names(), trading.Exits.Specs)
 }
 
 func writeCurve(path string, curve []record.Step) error {
@@ -338,15 +354,13 @@ func writeCurve(path string, curve []record.Step) error {
 
 func cents(v int64) float64 { return float64(v) / 100 }
 
-func countPositions(pf *trading.Portfolio) int {
-	n := 0
-	for _, p := range pf.Positions {
-		if p.Total > 0 {
-			n++
-		}
-	}
-	return n
-}
+// money / qtyUnit 是本次回测所在市场的计价与数量单位，由 Market.Units() 给出，
+// 在装配完成后一次性设好。
+//
+// 包级变量在这里是够用的：backtest 是一次跑一份配置的命令行程序，
+// 一个进程内只有一个市场。写成参数要穿过七八个打印函数，
+// 而它们做的只是拼字符串。
+var money, qtyUnit = "元", "股"
 
 func sortedKeys(m map[string]int64) []string {
 	out := make([]string, 0, len(m))

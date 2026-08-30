@@ -16,43 +16,68 @@ import (
 // 因为 ctx 只给当前时点。故实现 StatefulStrategy，让它随引擎快照一并恢复。
 type crossState struct {
 	prevAbove map[mktdata.InstrumentID]bool
+	// seen 该标的是否已经被观察过至少一次。
+	//
+	// **没有它就会有一次假金叉**：prevAbove 的零值是 false（「在下方」），
+	// 于是预热完成的那一根，所有 DIF 已经在 DEA 之上的标的会**同时**
+	// 被判成金叉 —— 而那不是穿越，是状态检查。
+	// 实测在 285 只标的上，这一天会凭空多出一批买入信号，
+	// 而 slots=10 只能成交 10 笔，成交哪 10 笔近乎任意。
+	seen map[mktdata.InstrumentID]bool
 }
 
 func newCrossState() crossState {
-	return crossState{prevAbove: make(map[mktdata.InstrumentID]bool, 8192)}
+	return crossState{
+		prevAbove: make(map[mktdata.InstrumentID]bool, 8192),
+		seen:      make(map[mktdata.InstrumentID]bool, 8192),
+	}
 }
 
-// snapshot 只序列化取值为 true 的项 —— false 是零值，可省一半体积。
+// snapshot 存 1 / -1 两种取值。
+//
+// **不能只存 true 的项**：那样「见过且在下方」与「没见过」在快照里
+// 无法区分，恢复之后会重现那次假金叉 —— 而 C6 的实盘每天从快照恢复。
 func (c *crossState) snapshot() ([]byte, error) {
-	m := make(map[string]bool, len(c.prevAbove))
-	for id, v := range c.prevAbove {
-		if v {
-			m[fmt.Sprint(int32(id))] = true
+	m := make(map[string]int8, len(c.seen))
+	for id := range c.seen {
+		if c.prevAbove[id] {
+			m[fmt.Sprint(int32(id))] = 1
+		} else {
+			m[fmt.Sprint(int32(id))] = -1
 		}
 	}
 	return json.Marshal(m)
 }
 
 func (c *crossState) restore(b []byte) error {
-	var m map[string]bool
+	var m map[string]int8
 	if err := json.Unmarshal(b, &m); err != nil {
 		return err
 	}
 	c.prevAbove = make(map[mktdata.InstrumentID]bool, len(m))
+	c.seen = make(map[mktdata.InstrumentID]bool, len(m))
 	for k, v := range m {
 		var id int32
 		if _, err := fmt.Sscan(k, &id); err != nil {
 			return fmt.Errorf("快照中的标的 ID %q 无法解析: %w", k, err)
 		}
-		c.prevAbove[mktdata.InstrumentID(id)] = v
+		c.prevAbove[mktdata.InstrumentID(id)] = v > 0
+		c.seen[mktdata.InstrumentID(id)] = true
 	}
 	return nil
 }
 
 // cross 判定金叉与死叉，并更新记忆。
+//
+// **第一次见到该标的时两者都为假** —— 没有上一步就谈不上「穿过」。
+// 与指标预热同理：答不上来时不产生信号，而不是猜一个。
 func (c *crossState) cross(id mktdata.InstrumentID, above bool) (golden, death bool) {
-	prev := c.prevAbove[id]
+	prev, seen := c.prevAbove[id], c.seen[id]
 	c.prevAbove[id] = above
+	c.seen[id] = true
+	if !seen {
+		return false, false
+	}
 	return above && !prev, !above && prev
 }
 
@@ -215,9 +240,30 @@ func (s *MACDCross) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 // ---- 注册 ----
 
 func init() {
-	eng.RegisterStrategy("buy_and_hold", func() eng.Strategy { return NewBuyAndHold() })
-	eng.RegisterStrategy("ma_cross", func() eng.Strategy { return NewMACross() })
-	eng.RegisterStrategy("macd_cross", func() eng.Strategy { return NewMACDCross() })
+	eng.RegisterStrategy("buy_and_hold",
+		"买入持有：首个可交易日买入并一直持有，用作基准",
+		func() eng.Strategy { return NewBuyAndHold() })
+	eng.RegisterStrategy("ma_cross",
+		"双均线：快线上穿慢线买入、下穿卖出（趋势跟随）",
+		func() eng.Strategy { return NewMACross() })
+	eng.RegisterStrategy("macd_cross",
+		"MACD 金叉买入、死叉卖出（趋势跟随）",
+		func() eng.Strategy { return NewMACDCross() })
+	eng.RegisterStrategy("grid",
+		"网格：价格每跌一格加一份、涨回一格减一份（震荡市）",
+		func() eng.Strategy { return NewGrid() })
+	// 下面两个不是「再多两个策略」，是给海选补维度：
+	// ma_cross 与 macd_cross 都在赌趋势延续，只扫这两个得不出
+	// 关于「技术分析」的结论，只能得出关于「均线」的结论
+	eng.RegisterStrategy("rsi_reversion",
+		"RSI 均值回归：跌破超卖线买入、回落出超买区卖出（与趋势跟随相反）",
+		func() eng.Strategy { return NewRSIReversion() })
+	eng.RegisterStrategy("rule_tree",
+		"规则树：三棵决策树（买入 / 有效 / 卖出）+ 自选指标，在界面上拼",
+		func() eng.Strategy { return NewRuleTree() })
+	eng.RegisterStrategy("donchian_breakout",
+		"唐奇安通道突破：创 N 日新高买入、跌破 M 日新低卖出（突破）",
+		func() eng.Strategy { return NewDonchianBreakout() })
 }
 
 // Names 返回全部可用策略名，供 CLI 提示。

@@ -79,12 +79,12 @@ type enumItem struct {
 }
 
 var (
-	enumMarket   = []enumItem{{1, "A 股"}}
-	enumExchange = []enumItem{{1, "上交所"}, {2, "深交所"}, {3, "北交所"}, {0, "未知"}}
-	enumType     = []enumItem{{1, "个股"}, {2, "ETF"}, {0, "未知"}}
+	enumMarket   = []enumItem{{1, "A 股"}, {5, "加密货币"}}
+	enumExchange = []enumItem{{1, "上交所"}, {2, "深交所"}, {3, "北交所"}, {10, "OKX"}, {0, "未知"}}
+	enumType     = []enumItem{{1, "个股"}, {2, "ETF"}, {10, "永续合约"}, {0, "未知"}}
 	enumBoard    = []enumItem{{1, "主板"}, {2, "创业板"}, {3, "科创板"}, {4, "北交所"}, {0, "未知"}}
 	enumStatus   = []enumItem{{1, "在市"}, {2, "已退市"}, {0, "未知"}}
-	enumCurrency = []enumItem{{1, "CNY"}, {0, "未知"}}
+	enumCurrency = []enumItem{{1, "CNY"}, {10, "USDT"}, {0, "未知"}}
 )
 
 func (s *Store) handleMeta(w http.ResponseWriter, r *http.Request) {
@@ -102,6 +102,12 @@ func (s *Store) handleMeta(w http.ResponseWriter, r *http.Request) {
 		// 前端拿到 scale 才能把定点整数还原成人读的数值。
 		// 服务端一律传整数：JSON 里传浮点会在这一层就损失精度，
 		// 而「数据准不准」正是本工具要回答的问题。
+		//
+		// ⚠ 这里给的是 **A 股的 scale**。价格/数量的 scale 是**逐标的**的
+		// （加密为 1e8），凡是要还原具体标的价格的地方一律用
+		// `instrument.priceScale` / K 线响应里的 `engine.priceScale`，
+		// 不要用这一组。留着它是因为复权因子、分红比例这类
+		// A 股独有的表确实只有一个 scale。
 		"scales": map[string]int64{
 			"price": mktdata.PriceScale, "amount": mktdata.AmountScale,
 			"ratio": mktdata.RatioScale, "factor": mktdata.FactorScale,
@@ -128,8 +134,8 @@ func (s *Store) handleMeta(w http.ResponseWriter, r *http.Request) {
 		},
 		// 明示当前范围 —— ROADMAP「Web 端向用户明示」的落地点
 		"scope": map[string]any{
-			"market": "仅 A 股", "freq": "仅日线",
-			"types": "个股（含已退市）+ ETF", "factors": "纯技术面",
+			"market": s.MarketScope(), "freq": "仅日线",
+			"types": "个股（含已退市）+ ETF + 永续合约", "factors": "纯技术面",
 		},
 	})
 }
@@ -354,8 +360,8 @@ func (s *Store) handleInstrumentDetail(w http.ResponseWriter, r *http.Request) {
 	sort.Slice(corpOnly, func(i, j int) bool { return corpOnly[i] < corpOnly[j] })
 
 	writeJSON(w, map[string]any{
-		"instrument": s.dto(in),
-		"factors":    fRows,
+		"instrument":  s.dto(in),
+		"factors":     fRows,
 		"corpActions": cRows,
 		"reconcile": map[string]any{
 			"factorOnly": factorOnly, // 有因子跳变但表里没有分红送配记录
@@ -433,13 +439,13 @@ func (s *Store) handleFactorsAll(w http.ResponseWriter, r *http.Request) {
 	q := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("q")))
 
 	type row struct {
-		ID     int32   `json:"id"`
-		Symbol string  `json:"symbol"`
-		Name   string  `json:"name"`
-		ExDate int32   `json:"exDate"`
-		Factor int64   `json:"factor"`
-		Ratio  float64 `json:"ratio"`
-		HasCorp bool   `json:"hasCorp"`
+		ID      int32   `json:"id"`
+		Symbol  string  `json:"symbol"`
+		Name    string  `json:"name"`
+		ExDate  int32   `json:"exDate"`
+		Factor  int64   `json:"factor"`
+		Ratio   float64 `json:"ratio"`
+		HasCorp bool    `json:"hasCorp"`
 	}
 	rows := make([]row, 0, 1024)
 	for _, in := range s.Uni.All() {

@@ -26,6 +26,13 @@ import (
 type Module struct {
 	Impl   string          `json:"impl"`
 	Params json.RawMessage `json:"params,omitempty"`
+	// Sources 仅 strategy.impl == "composite" 时有意义：组合的各个决策源。
+	//
+	// 放在 Module 上而不是塞进 params：源本身也是 {impl, params}，
+	// 塞进 params 就得在 JSON 里嵌一层无类型的东西，校验也跟着失效。
+	Sources []Module `json:"sources,omitempty"`
+	// Mode 仅 composite 有意义：union / confirm / veto
+	Mode string `json:"mode,omitempty"`
 }
 
 // Universe 描述标的池。
@@ -38,8 +45,15 @@ type Module struct {
 // 也没有 point_in_time 开关：bar 表天生是 PIT 的（上市前无行、退市后无行），
 // C3 是结构保证而不是配置项。
 type Universe struct {
-	// Symbols 显式列表。给了就只用它，其余过滤条件忽略。
+	// Symbols 显式列表。给了就只用它，其余过滤条件忽略 ——
+	// 「就在这几只上跑」是最直接的意图，不该再被别的条件二次过滤掉。
 	Symbols []string `json:"symbols,omitempty"`
+	// Market ashare / us / jp / crypto，空表示不限。
+	//
+	// 当前只有 A 股，这个过滤器现在等于不过滤。留着是因为它属于**标的属性**，
+	// 与 data.market（选分区路径）不是一回事 —— 远期一份数据里同时有
+	// 多个市场时，两者会分开起作用（C9）。
+	Market []string `json:"market,omitempty"`
 	// Type stock / etf / all
 	Type string `json:"type,omitempty"`
 	// Board main / chinext / star / bse，空表示不限
@@ -73,8 +87,23 @@ type BrokerCfg struct {
 
 // PortfolioCfg 账户参数。
 type PortfolioCfg struct {
+	// InitialCashCents 初始资金，**计价币种的最小单位**。
+	//
+	// A 股 = 分（默认 20,000 元 = 2,000,000）
+	// 加密 = 0.01 USDT（默认 1,000 USDT = 100,000）
+	//
+	// 默认值随 data.market 变 —— 把 100 万元的默认值原样搬到
+	// 加密上就是 100 万 USDT，那不是一个散户的账户
 	InitialCashCents int64 `json:"initial_cash_cents"`
 	DividendTaxPPM   int64 `json:"dividend_tax_ppm"`
+	// Ledger 账本实现：spot（现货，仅多）/ margin（逐仓双向）。
+	// 空表示按市场选：A 股 spot，加密 margin
+	Ledger string `json:"ledger,omitempty"`
+	// Leverage 杠杆倍数，仅 margin 账本有意义。默认 1
+	Leverage int64 `json:"leverage,omitempty"`
+	// MaintMarginPPM 维持保证金率（百万分之一），仅 margin 有意义。
+	// 默认 5000（0.5%），与主流交易所 BTC 永续的量级一致
+	MaintMarginPPM int64 `json:"maint_margin_ppm,omitempty"`
 }
 
 // EngineCfg 引擎参数。
@@ -85,6 +114,9 @@ type EngineCfg struct {
 	// ImplySplitFromFactor 指针是为了区分「没写」与「显式写了 false」，
 	// 默认 true（约 6,770 个因子事件缺分红记录，不处理会失真）
 	ImplySplitFromFactor *bool `json:"imply_split_from_factor,omitempty"`
+	// TradeFrom 这一天之前只喂指标不交易（YYYYMMDD，0 表示不设限）。
+	// 供 Walk-Forward 的预热前缀使用，见 engine.Config.TradeFrom
+	TradeFrom int32 `json:"trade_from,omitempty"`
 }
 
 // MetricsCfg 绩效参数。
@@ -104,13 +136,19 @@ type RecorderCfg struct {
 
 // Config 是一次运行的完整描述。
 type Config struct {
-	Name      string       `json:"name,omitempty"`
-	Data      Data         `json:"data"`
-	Market    Module       `json:"market"`
-	Fee       Module       `json:"fee"`
-	Slippage  Module       `json:"slippage"`
-	Sizer     Module       `json:"sizer"`
-	Risk      []Module     `json:"risk,omitempty"`
+	Name     string   `json:"name,omitempty"`
+	Data     Data     `json:"data"`
+	Market   Module   `json:"market"`
+	Fee      Module   `json:"fee"`
+	Slippage Module   `json:"slippage"`
+	Sizer    Module   `json:"sizer"`
+	Risk     []Module `json:"risk,omitempty"`
+	// Exit 离场规则链：止损 / 止盈 / 移动止损。
+	//
+	// **与 risk 是两回事**：risk 过滤订单（只能拦截或缩量），
+	// exit 产生订单（平掉已有持仓）。止损塞不进 risk，
+	// 因为 Risk.Check 的形状是「订单进、订单出」
+	Exit      []Module     `json:"exit,omitempty"`
 	Broker    BrokerCfg    `json:"broker"`
 	Portfolio PortfolioCfg `json:"portfolio"`
 	Engine    EngineCfg    `json:"engine"`
@@ -175,8 +213,11 @@ func (c *Config) applyDefaults() {
 	if c.Data.Freq == "" {
 		c.Data.Freq = "1d"
 	}
+	// **默认值随市场变。** 把 A 股的默认原样搬到加密上，
+	// 得到的是「用 A 股规则跑 BTC」或「100 万 USDT 的账户」——
+	// 两者都不报错，只是结果没有意义
 	if c.Market.Impl == "" {
-		c.Market.Impl = "ashare"
+		c.Market.Impl = defaultMarketImpl(c.Data.Market)
 	}
 	if c.Fee.Impl == "" {
 		c.Fee.Impl = "zero"
@@ -191,7 +232,16 @@ func (c *Config) applyDefaults() {
 		c.Broker.VolumeCapPPM = 100_000
 	}
 	if c.Portfolio.InitialCashCents <= 0 {
-		c.Portfolio.InitialCashCents = 100_000_000 // 100 万元
+		c.Portfolio.InitialCashCents = defaultCashCents(c.Data.Market)
+	}
+	if c.Portfolio.Ledger == "" {
+		c.Portfolio.Ledger = defaultLedger(c.Data.Market)
+	}
+	if c.Portfolio.Leverage <= 0 {
+		c.Portfolio.Leverage = 1
+	}
+	if c.Portfolio.MaintMarginPPM <= 0 {
+		c.Portfolio.MaintMarginPPM = 5_000 // 0.5%
 	}
 	if c.Engine.IndicatorAdj == "" {
 		c.Engine.IndicatorAdj = "hfq"
@@ -216,6 +266,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("未知 market 实现 %q，可选：%s",
 			c.Market.Impl, strings.Join(trading.Markets.Names(), " / "))
 	}
+	if err := c.validateLeverage(); err != nil {
+		return err
+	}
 	if !trading.Fees.Has(c.Fee.Impl) {
 		return fmt.Errorf("未知 fee 实现 %q，可选：%s",
 			c.Fee.Impl, strings.Join(trading.Fees.Names(), " / "))
@@ -232,9 +285,13 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("必须指定 strategy.impl，可选：%s",
 			strings.Join(eng.Strategies.Names(), " / "))
 	}
-	if !eng.Strategies.Has(c.Strategy.Impl) {
-		return fmt.Errorf("未知 strategy 实现 %q，可选：%s",
-			c.Strategy.Impl, strings.Join(eng.Strategies.Names(), " / "))
+	if c.Strategy.Impl == compositeImpl {
+		if err := validateComposite(c.Strategy); err != nil {
+			return err
+		}
+	} else if !eng.Strategies.Has(c.Strategy.Impl) {
+		return fmt.Errorf("未知 strategy 实现 %q，可选：%s（或 %s）",
+			c.Strategy.Impl, strings.Join(eng.Strategies.Names(), " / "), compositeImpl)
 	}
 	seen := map[string]bool{}
 	for i, r := range c.Risk {
@@ -260,8 +317,13 @@ func (c *Config) Validate() error {
 	if c.Data.Univers.Limit < 0 {
 		return fmt.Errorf("data.universe.limit 不能为负")
 	}
-	// 策略参数按 Specs 校验
-	if specs, ok := eng.Strategies.Specs(c.Strategy.Impl); ok {
+	// 策略参数按 Specs 校验（组合策略的参数在各个源上，已由 validateComposite 查过）。
+	//
+	// **配置是结构而非标量的策略跳过这一段**：规则树的 params 是
+	// 三棵树加一张指标表，按 map[string]float64 去解必然失败。
+	// 它的校验在 dryBuild 里由 Configure 自己做，而且查得更细
+	// （引用了不存在的指标、字段名写错、比较符不认识都会报出来）
+	if specs, ok := eng.Strategies.Specs(c.Strategy.Impl); ok && !c.strategyIsStructured() {
 		p, err := decodeStrategyParams(specs, c.Strategy.Params)
 		if err != nil {
 			return fmt.Errorf("strategy.params: %w", err)
@@ -300,8 +362,153 @@ func (c *Config) dryBuild() error {
 			return fmt.Errorf("risk[%d]: %w", i, err)
 		}
 	}
-	if _, err := eng.Strategies.Build(c.Strategy.Impl, nil); err != nil {
-		return fmt.Errorf("strategy: %w", err)
+	for i, r := range c.Exit {
+		if _, err := trading.Exits.Build(r.Impl, r.Params); err != nil {
+			return fmt.Errorf("exit[%d]: %w", i, err)
+		}
+	}
+	if c.Strategy.Impl != compositeImpl {
+		st, err := eng.Strategies.Build(c.Strategy.Impl, nil)
+		if err != nil {
+			return fmt.Errorf("strategy: %w", err)
+		}
+		// 结构化配置（规则树）也要在这里查一遍 —— 引用了不存在的指标、
+		// 字段名写错、比较符不认识，都该在跑之前失败
+		if cs, ok := st.(eng.ConfigurableStrategy); ok {
+			if err := cs.Configure(c.Strategy.Params); err != nil {
+				return fmt.Errorf("strategy.params: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+const compositeImpl = "composite"
+
+// 按市场的默认值。**一处定义**，配置层与前端都从这里取 ——
+// 抄一份到别处就会分叉，然后出现「界面显示 1000 USDT、引擎按 100 万跑」。
+const (
+	marketCrypto = "crypto"
+	// defaultCashAShare 20,000 元。散户量级；
+	// 太大会让「一手买不起」这类真实约束在回测里消失
+	defaultCashAShare = int64(2_000_000)
+	// defaultCashCrypto 1,000 USDT（单位 0.01 USDT）
+	defaultCashCrypto = int64(100_000)
+)
+
+func defaultMarketImpl(market string) string {
+	if market == marketCrypto {
+		return marketCrypto
+	}
+	return "ashare"
+}
+
+func defaultCashCents(market string) int64 {
+	if market == marketCrypto {
+		return defaultCashCrypto
+	}
+	return defaultCashAShare
+}
+
+// defaultLedger 加密用逐仓双向，A 股用现货。
+//
+// A 股普通账户不能做空（融资融券本项目明确不建模），
+// 给它一个保证金账本只会让策略以为能开空。
+func defaultLedger(market string) string {
+	if market == marketCrypto {
+		return "margin"
+	}
+	return "spot"
+}
+
+// maxLeverage 杠杆上限。
+//
+// **加密是账户级可选的 1–100x**，与期货不同 —— 期货每个合约有各自
+// 固定的保证金率，交易者选不了；加密交易所让你在开仓时任选倍数，
+// 所以它是**配置项**而不是标的属性。
+// 100 是主流交易所 BTC/ETH 永续对普通用户的常见上限
+// （更高的档位要么限币种、要么限仓位规模，回测里假装有它没有意义）。
+const maxLeverage = 100
+
+// validateLeverage 查杠杆与维持保证金率的取值域，以及它们与账本的搭配。
+func (c *Config) validateLeverage() error {
+	lev := c.Portfolio.Leverage
+	if lev < 1 || lev > maxLeverage {
+		return fmt.Errorf("portfolio.leverage = %d 越界，可选 1–%d", lev, maxLeverage)
+	}
+	if mmr := c.Portfolio.MaintMarginPPM; mmr < 1 || mmr >= 1_000_000 {
+		return fmt.Errorf("portfolio.maint_margin_ppm = %d 越界，"+
+			"可选 1–999999（百万分之一，主流交易所约 5000 = 0.5%%）", mmr)
+	}
+	if c.Portfolio.Ledger == "margin" {
+		// 维持保证金率高于开仓保证金率时，仓位一开出来就该被强平 ——
+		// 这不是「风控严」，是参数写错了
+		if openPPM := int64(1_000_000) / lev; c.Portfolio.MaintMarginPPM >= openPPM {
+			return fmt.Errorf(
+				"portfolio: %d 倍杠杆的开仓保证金率是 %d ppm，"+
+					"而维持保证金率 %d ppm 不低于它 —— 仓位一开出来就会被强平",
+				lev, openPPM, c.Portfolio.MaintMarginPPM)
+		}
+		return nil
+	}
+	// 现货账本上杠杆是没有意义的。**必须报错而不是忽略**：
+	// 静默忽略的话，用户以为自己在用 5 倍杠杆回测，
+	// 拿到的却是 1 倍的结果，而报告里看不出任何异常
+	if lev != 1 {
+		return fmt.Errorf("portfolio.leverage = %d 但 ledger = %q —— "+
+			"现货账本没有杠杆。要用杠杆请把 ledger 设为 margin",
+			lev, c.Portfolio.Ledger)
+	}
+	return nil
+}
+
+// DefaultBenchmark 各市场的默认基准标的。
+//
+// A 股没有指数数据（C10 纯技术面，ETL 没拉指数行情），只能用宽基 ETF
+// 代理；加密用 BTC 永续本身 —— 它就是这个市场的「大盘」。
+func DefaultBenchmark(market string) string {
+	if market == marketCrypto {
+		return "BTC-USDT-SWAP"
+	}
+	return ""
+}
+
+// validateComposite 在跑之前把组合策略能查的都查掉。
+func validateComposite(m Module) error {
+	if _, err := eng.ParseCombineMode(m.Mode); err != nil {
+		return fmt.Errorf("strategy.mode: %w", err)
+	}
+	if len(m.Sources) == 0 {
+		return fmt.Errorf("strategy.sources 不能为空 —— 组合至少要有一个决策源")
+	}
+	for i, src := range m.Sources {
+		if src.Impl == compositeImpl {
+			// 嵌套组合能表达的东西，用一层加合适的 mode 都能表达，
+			// 而嵌套会让「谁否决谁」变得难以推理
+			return fmt.Errorf("strategy.sources[%d]: 不支持嵌套组合", i)
+		}
+		if !eng.Strategies.Has(src.Impl) {
+			return fmt.Errorf("strategy.sources[%d]: 未知实现 %q，可选：%s",
+				i, src.Impl, strings.Join(eng.Strategies.Names(), " / "))
+		}
+		// 结构化配置的源（规则树）自己校验，而且查得更细 ——
+		// 它没有 ParamSpec，按标量去解必然失败
+		if st, err := eng.Strategies.Build(src.Impl, nil); err == nil {
+			if cs, ok := st.(eng.ConfigurableStrategy); ok {
+				if err := cs.Configure(src.Params); err != nil {
+					return fmt.Errorf("strategy.sources[%d].params: %w", i, err)
+				}
+				continue
+			}
+		}
+		specs, _ := eng.Strategies.Specs(src.Impl)
+		p, err := decodeStrategyParams(specs, src.Params)
+		if err != nil {
+			return fmt.Errorf("strategy.sources[%d].params: %w", i, err)
+		}
+		if err := spec.ValidateAll(specs, p); err != nil {
+			return fmt.Errorf("strategy.sources[%d].params: %w", i, err)
+		}
 	}
 	return nil
 }
@@ -328,6 +535,19 @@ func parseLevel(s string) (record.Level, error) {
 func (c *Config) Level() record.Level {
 	l, _ := parseLevel(c.Recorder.Level)
 	return l
+}
+
+// strategyIsStructured 报告当前策略的配置是不是「结构」而非标量。
+func (c *Config) strategyIsStructured() bool {
+	if c.Strategy.Impl == compositeImpl {
+		return false
+	}
+	st, err := eng.Strategies.Build(c.Strategy.Impl, nil)
+	if err != nil {
+		return false
+	}
+	_, ok := st.(eng.ConfigurableStrategy)
+	return ok
 }
 
 func decodeStrategyParams(specs []spec.ParamSpec, raw json.RawMessage) (spec.Params, error) {

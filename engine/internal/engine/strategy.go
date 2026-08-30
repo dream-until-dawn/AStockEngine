@@ -79,8 +79,9 @@ type StepContext interface {
 	// Instrument 标的静态属性
 	Instrument(id mktdata.InstrumentID) *mktdata.Instrument
 
-	// Portfolio 当前账本（只读使用；直接改动会绕过撮合，破坏账目自洽）
-	Portfolio() *trading.Portfolio
+	// Ledger 当前账本。**只读** —— 字段已全部私有，
+	// 想改账要经撮合，绕过去就没有账目自洽可言了
+	Ledger() trading.Ledger
 	// Available 该标的当前可卖数量（已考虑 T+1）
 	Available(id mktdata.InstrumentID) int64
 	// Pending 尚未成交的订单。策略据此避免重复下单
@@ -92,11 +93,27 @@ type StepContext interface {
 	// EquityCents 当前总权益（分），按本时点收盘价估值
 	EquityCents() int64
 
+	// AdjBar 按指定方式复权后的整根 bar。
+	//
+	// 规则树的条件里可以写 `close > ma20`，两侧**必须同基准** ——
+	// 拿原始价去和均线比，除权日会凭空产生一次穿越，而那不是行情是分红。
+	// 只给 AdjClose 不够：条件也能引用 open / high / low。
+	AdjBar(id mktdata.InstrumentID, mode mktdata.AdjMode) (mktdata.Bar, bool)
 	// AdjClose 按指定方式复权后的收盘价。
 	//
 	// **拒绝 AdjQFQ**：前复权锚定末日，用于决策即构成未来函数（C1）
 	// 且不可复现（C5）。它只允许出现在展示路径上。
 	AdjClose(id mktdata.InstrumentID, back int, mode mktdata.AdjMode) (int64, bool)
+}
+
+// ConfigurableStrategy 供**配置是结构而非标量**的策略实现。
+//
+// 普通策略的参数是 `map[string]float64`（由 ParamSpec 描述），
+// 规则树的配置是三棵树加一张指标表 —— 那不是标量，塞不进 Params。
+// 实现本接口的策略由装配层直接把整段 JSON 交过来自行解析，
+// **并且跳过标量参数的校验**（它没有 ParamSpec 可校验）。
+type ConfigurableStrategy interface {
+	Configure(raw json.RawMessage) error
 }
 
 // StatefulStrategy 供**确有跨步状态**的策略实现。
@@ -108,12 +125,41 @@ type StepContext interface {
 // 但在实现本接口之前，先确认状态是否**真的**需要自己存 ——
 // 多数看似需要的状态其实可以从 StepContext 导出：
 //
-//	「持有哪些标的」 → ctx.Portfolio().Position(id).Total > 0
+//	「持有哪些标的」 → ctx.Ledger().EachExposure(...)
 //	「哪些单在途」   → ctx.Pending()
 //	「可卖多少」     → ctx.Available(id)
 //
 // 从 ctx 导出的状态天然随引擎快照一起恢复，无需额外处理。
 // 只有真正的跨步记忆（如「上一步指标是否在均线之上」）才需要本接口。
+// ShortSeller 由**会发出开空信号**的策略实现。
+//
+// 装配时用它挡下「在不允许做空的市场上配了一棵做空树」。
+// 不挡的话后果是**静默失效**：开空信号会被 Sizer 当成减仓，
+// 而手上没有多头可减，订单被丢掉 —— 一笔成交都不会有，
+// 报告上却看不出任何异常，只是策略「什么都没做」。
+type ShortSeller interface {
+	NeedsShort() bool
+}
+
+// VirtualTrip 一轮**虚拟持仓**：策略说该买、但被自己的有效性判断
+// 挡下来的那些机会。它从未占用资金，所以只有收益率、没有金额。
+type VirtualTrip struct {
+	Instrument mktdata.InstrumentID
+	OpenDay    int32
+	CloseDay   int32
+	// Ratio 这一轮的收益率（做空方向已取反）
+	Ratio float64
+}
+
+// VirtualReporter 由**会产生虚拟持仓**的策略实现。
+//
+// 「有效性」这类过滤判断的全部价值，就在于它过滤掉的机会后来怎么样了。
+// 不把它们报出来，被过滤的交易在报告里完全不存在 ——
+// 而「这个过滤到底对不对」恰恰只能靠它们来判断。
+type VirtualReporter interface {
+	VirtualTrips() []VirtualTrip
+}
+
 type StatefulStrategy interface {
 	Strategy
 	SnapshotState() ([]byte, error)
@@ -144,7 +190,10 @@ var Strategies = registry.New[Strategy]("strategy")
 
 // RegisterStrategy 是给策略实现用的便捷注册函数：
 // 传一个零参构造器，参数规格从实例上取。
-func RegisterStrategy(name string, make func() Strategy) {
-	Strategies.Register(name, make().Specs(),
+//
+// desc 是一句话中文说明，**必填** —— 没有它，用户在下拉框里
+// 只看得到一个英文标识符。
+func RegisterStrategy(name, desc string, make func() Strategy) {
+	Strategies.Register(name, desc, make().Specs(),
 		func(json.RawMessage) (Strategy, error) { return make(), nil })
 }

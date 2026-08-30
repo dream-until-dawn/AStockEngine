@@ -1,0 +1,110 @@
+{
+  "name": "A 股小池 · 有效性树与止损值不值得留（子树开关）",
+  "base": "base/pool12.json",
+  "grid": {
+    "strategy.params.valid": [
+      null,
+      {
+        "left": {
+          "kind": "ind",
+          "ind": "rsi",
+          "field": "RSI"
+        },
+        "cmp": "lt",
+        "right": {
+          "kind": "value",
+          "value": 60
+        }
+      },
+      {
+        "left": {
+          "kind": "ind",
+          "ind": "rsi",
+          "field": "RSI"
+        },
+        "cmp": "lt",
+        "right": {
+          "kind": "value",
+          "value": 70
+        }
+      },
+      {
+        "left": {
+          "kind": "ind",
+          "ind": "rsi",
+          "field": "RSI"
+        },
+        "cmp": "lt",
+        "right": {
+          "kind": "value",
+          "value": 80
+        }
+      }
+    ],
+    "exit": [
+      [],
+      [
+        {
+          "impl": "stop_loss",
+          "params": {
+            "pct": 4
+          }
+        }
+      ],
+      [
+        {
+          "impl": "stop_loss",
+          "params": {
+            "pct": 6
+          }
+        }
+      ],
+      [
+        {
+          "impl": "stop_loss",
+          "params": {
+            "pct": 8
+          }
+        }
+      ]
+    ],
+    "strategy.params.indicators[0].params.short": [
+      8,
+      12,
+      16
+    ],
+    "strategy.params.indicators[0].params.long": [
+      26,
+      34,
+      45
+    ],
+    "sizer.params.slots": [
+      3,
+      5,
+      8
+    ]
+  },
+  "constraints": [
+    "strategy.params.indicators[0].params.short < strategy.params.indicators[0].params.long"
+  ],
+  "walk_forward": {
+    "enabled": true,
+    "is_years": 3,
+    "oos_years": 1,
+    "step_years": 1,
+    "warmup_days": 250,
+    "min_windows": 6
+  },
+  "noise_probe": {
+    "points": 5,
+    "repeats": 5,
+    "perturb_pct": 0.1
+  },
+  "gate": {
+    "min_round_trips": 10,
+    "max_liquidation_ratio": 0.1,
+    "max_halt_exit_ratio": 0.2,
+    "max_friction_ratio": 0.25
+  },
+  "rank": "excess_over_maxdd"
+}

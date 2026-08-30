@@ -1,0 +1,61 @@
+{
+  "name": "加密单标的 BTC · 规则树 · 全量粗网格",
+  "base": "../backtest/crypto_single_ruletree.json",
+  "grid": {
+    "strategy.params.indicators[0].params.short": [
+      8,
+      12,
+      16
+    ],
+    "strategy.params.indicators[0].params.long": [
+      26,
+      34,
+      45
+    ],
+    "strategy.params.indicators[0].params.signal": [
+      5,
+      9,
+      14
+    ],
+    "exit[0].params.pct": [
+      8,
+      12,
+      20
+    ],
+    "exit[1].params.pct": [
+      15,
+      25,
+      40
+    ],
+    "sizer.params.pct": [
+      50,
+      75,
+      90
+    ],
+    "portfolio.leverage": [
+      1,
+      2,
+      3
+    ]
+  },
+  "constraints": [
+    "strategy.params.indicators[0].params.short < strategy.params.indicators[0].params.long"
+  ],
+  "walk_forward": {
+    "enabled": true,
+    "is_years": 1.5,
+    "oos_years": 0.5,
+    "step_years": 0.5,
+    "warmup_days": 60,
+    "min_windows": 6
+  },
+  "noise_probe": {
+    "points": 5,
+    "repeats": 5,
+    "perturb_pct": 0.1
+  },
+  "gate": {
+    "min_round_trips": 3
+  },
+  "rank": "excess_over_maxdd"
+}

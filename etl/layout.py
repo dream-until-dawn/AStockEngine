@@ -35,9 +35,10 @@ META_TABLES = (
     "calendar",          # 交易日历
     "adj_factor",        # 复权因子（事件式）
     "corporate_action",  # 分红送配
+    "funding",           # 永续合约资金费率（8h 一次，原始粒度）
 )
 
-MARKETS = ("ashare",)    # 远期扩展：us / hk / futures / crypto
+MARKETS = ("ashare", "crypto")    # 远期扩展：us / hk / futures
 FREQS = ("1d",)          # 远期扩展：1m / 5m / 1h
 
 

@@ -51,6 +51,8 @@ func TestSnapshotRoundTrip(t *testing.T) {
 		{"EMA12", func() Indicator { return NewEMA(12, DefaultPriceScale) }},
 		{"MACD", func() Indicator { return NewMACD(12, 26, 9, DefaultPriceScale) }},
 		{"KDJ", func() Indicator { return NewKDJ(9, 3, 3) }},
+		{"RSI14", func() Indicator { return NewRSI(14) }},
+		{"Donchian20", func() Indicator { return NewDonchian(20, DefaultPriceScale) }},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

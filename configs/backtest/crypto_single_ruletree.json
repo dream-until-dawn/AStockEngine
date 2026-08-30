@@ -1,0 +1,113 @@
+{
+  "name": "加密单标的（BTC-USDT-SWAP）· 规则树 · 仅开多 · 默认有效 · 带止盈止损。基准就是它自己 —— 在一个涨了十倍的标的上，跑赢「一直拿着」才说明选时有价值。",
+  "data": {
+    "root": "../../data",
+    "market": "crypto",
+    "freq": "1d",
+    "from": 20200101,
+    "to": 0,
+    "universe": {
+      "symbols": [
+        "BTC-USDT-SWAP"
+      ]
+    }
+  },
+  "market": {
+    "impl": "crypto"
+  },
+  "fee": {
+    "impl": "config",
+    "params": {
+      "path": "../fee/crypto_okx.json"
+    }
+  },
+  "slippage": {
+    "impl": "fixed_bps",
+    "params": {
+      "bps": 5
+    }
+  },
+  "portfolio": {
+    "initial_cash_cents": 100000,
+    "ledger": "margin",
+    "leverage": 2,
+    "maint_margin_ppm": 5000
+  },
+  "broker": {
+    "volume_cap_ppm": 100000,
+    "allow_partial_fill": true
+  },
+  "metrics": {
+    "benchmark": "BTC-USDT-SWAP",
+    "risk_free_ppm": 0
+  },
+  "recorder": {
+    "level": "summary"
+  },
+  "strategy": {
+    "impl": "rule_tree",
+    "params": {
+      "indicators": [
+        {
+          "name": "macd",
+          "kind": "macd",
+          "params": {
+            "short": 12,
+            "long": 26,
+            "signal": 9
+          }
+        }
+      ],
+      "direction": "long",
+      "buy": {
+        "left": {
+          "kind": "ind",
+          "ind": "macd",
+          "field": "DIF"
+        },
+        "cmp": "cross_above",
+        "right": {
+          "kind": "ind",
+          "ind": "macd",
+          "field": "DEA"
+        }
+      },
+      "sell": {
+        "left": {
+          "kind": "ind",
+          "ind": "macd",
+          "field": "DIF"
+        },
+        "cmp": "cross_below",
+        "right": {
+          "kind": "ind",
+          "ind": "macd",
+          "field": "DEA"
+        }
+      }
+    }
+  },
+  "sizer": {
+    "impl": "pct_equity",
+    "params": {
+      "pct": 90,
+      "base": "cost",
+      "max_positions": 1
+    }
+  },
+  "risk": [],
+  "exit": [
+    {
+      "impl": "stop_loss",
+      "params": {
+        "pct": 10
+      }
+    },
+    {
+      "impl": "take_profit",
+      "params": {
+        "pct": 25
+      }
+    }
+  ]
+}
