@@ -43,10 +43,16 @@ type ExitContext interface {
 	Time() mktdata.TimePoint
 	Ledger() Ledger
 	EquityCents() int64
+	// PeakEquityCents 历史峰值权益。回撤熔断要在这里读 ——
+	// 自己记一份峰值就会与引擎的那份分叉，而分叉的两个数都看不出错
+	PeakEquityCents() int64
 	Available(id mktdata.InstrumentID) int64
 	Bar(id mktdata.InstrumentID) (mktdata.Bar, bool)
 	Instrument(id mktdata.InstrumentID) *mktdata.Instrument
 	Pending() []PendingOrder
+	// Market 市场规则。平仓方向要问它：单向市场只能卖出平多，
+	// 双向市场还要买入平空
+	Market() Market
 }
 
 // ExitRule 检查已有持仓，产生离场信号。

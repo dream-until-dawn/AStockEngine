@@ -680,6 +680,14 @@ func (s *RuleTree) RestoreState(b []byte) error {
 // ⚠ 在途单仍然是按标的整体挡的（inFlight）：一多一空两棵树组在一起时，
 // 多头的在途单会挡住空头这一步的开仓。保守但不精确 ——
 // 精确做法要按 (标的, 方向) 过滤在途队列，等真有人这么用再说。
+// NeedsShort 报告这棵树是否会发出开空信号。
+//
+// 装配时用它挡下「在不允许做空的市场上配了一棵做空树」——
+// 不挡的话后果是**静默失效**：开空信号会被 dispatch 当成减仓，
+// 而手上没有多头可减，于是订单被丢掉，一笔成交都不会有。
+// 报告上看不出任何异常，只是策略「什么都没做」。
+func (s *RuleTree) NeedsShort() bool { return s.short }
+
 func (s *RuleTree) holdsMine(ctx eng.StepContext, id mktdata.InstrumentID) bool {
 	ex := ctx.Ledger().Exposure(id)
 	if s.short {

@@ -45,6 +45,16 @@ type moduleDTO struct {
 	// 光有 `macd_cross` 这样的英文标识符，没用过引擎的人看不出它是什么
 	Desc  string         `json:"desc"`
 	Specs []paramSpecDTO `json:"specs"`
+
+	// 以下三项只有 market 模块会填 —— 它们不是「参数」，
+	// 是这个市场的固有属性，前端据此决定界面上出现什么。
+
+	// AllowsShort 支不支持做空。决定「仅做空」「双向持仓」
+	// 两个模式要不要出现在选单里
+	AllowsShort bool `json:"allowsShort,omitempty"`
+	// Money / QtyUnit 计价与数量单位，如 元/股、USDT/张
+	Money   string `json:"money,omitempty"`
+	QtyUnit string `json:"qtyUnit,omitempty"`
 }
 
 func toSpecDTO(s spec.ParamSpec) paramSpecDTO {
@@ -82,7 +92,7 @@ func (s *Store) handleModules(w http.ResponseWriter, _ *http.Request) {
 		"exit":     collect(trading.Exits.Names(), trading.Exits.Specs, trading.Exits.Desc),
 		"slippage": collect(trading.Slippages.Names(), trading.Slippages.Specs, trading.Slippages.Desc),
 		"fee":      collect(trading.Fees.Names(), trading.Fees.Specs, trading.Fees.Desc),
-		"market":   collect(trading.Markets.Names(), trading.Markets.Specs, trading.Markets.Desc),
+		"market":   marketCatalog(),
 		// 指标目录：规则树的条件左右侧从这里取可选列。
 		// **选了哪些指标决定了有哪些列可选** —— 启用 KDJ 才会出现 K/D/J
 		"indicator": indicatorCatalog(),
@@ -247,3 +257,22 @@ func cmpCatalog() []map[string]string {
 
 // UnaryCmps 只用左侧的比较符，界面据此隐藏右侧。
 func unaryCmps() []string { return []string{"rising", "falling"} }
+
+// marketCatalog 市场规则模块，外加**这个市场支不支持做空**。
+//
+// 前端据此决定「仅做空」「双向持仓」两个模式要不要出现。
+// 由服务端从 Market 问出来，不让前端按市场名硬编码 ——
+// 硬编码会在加第三个市场时安静地漏掉它。
+func marketCatalog() []moduleDTO {
+	out := collect(trading.Markets.Names(), trading.Markets.Specs, trading.Markets.Desc)
+	for i := range out {
+		m, err := trading.Markets.Build(out[i].Name, nil)
+		if err != nil {
+			continue
+		}
+		money, qty := m.Units()
+		out[i].AllowsShort = m.AllowsShort()
+		out[i].Money, out[i].QtyUnit = money, qty
+	}
+	return out
+}

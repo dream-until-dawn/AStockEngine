@@ -39,7 +39,13 @@ export default function ConfigBuilder({
   // A 股默认 20,000 元，把 20000 当成 USDT 填进去，回测会以 20 倍的
   // 本金起跑，而报告上每个数字都看着正常
   const isCrypto = (cfg.data?.market ?? 'ashare') === 'crypto'
-  const cur = isCrypto ? 'USDT' : '元'
+  // 市场规则决定计价单位与能不能做空。**从目录里查，不按市场名硬编码** ——
+  // 硬编码会在加第三个市场时安静地漏掉它
+  const marketImpl = (cfg.market as ModuleValue | undefined)?.impl
+    ?? (isCrypto ? 'crypto' : 'ashare')
+  const mkt = cat?.market.find((m) => m.name === marketImpl)
+  const cur = mkt?.money ?? (isCrypto ? 'USDT' : '元')
+  const allowsShort = mkt?.allowsShort ?? false
   const defCash = isCrypto ? 100_000 : 2_000_000
 
   useEffect(() => {
@@ -98,6 +104,7 @@ export default function ConfigBuilder({
           cat={cat}
           value={(cfg.strategy ?? { impl: '' }) as ModuleValue}
           onChange={(v) => set('strategy', v)}
+          allowsShort={allowsShort}
         />
       </Section>
 
@@ -254,16 +261,65 @@ export default function ConfigBuilder({
 
 // ---- 策略槽位（含组合）----
 
+// PosMode 持仓模式。**不是一个引擎参数**，而是「配置长什么样」的三种形态：
+//
+//	long  —— 一棵 direction=long 的规则树
+//	short —— 一棵 direction=short 的规则树
+//	both  —— composite/union 组两棵树，一多一空
+//
+// 引擎侧没有「双向模式」这个开关，双向就是把两棵树组起来 ——
+// 一棵树表达一个意图，硬塞进一棵只会让「这个条件是给多头还是空头的」
+// 变成日常问题。这里的选单只是把那三种形态包装成一次点击。
+type PosMode = 'long' | 'short' | 'both'
+
+/** posModeOf 从当前配置反推它是哪种形态。 */
+function posModeOf(v: ModuleValue): PosMode | null {
+  if (v.impl === 'rule_tree') {
+    return (v.params?.direction as string) === 'short' ? 'short' : 'long'
+  }
+  if (v.impl === 'composite' && (v.sources ?? []).length === 2 &&
+      (v.sources ?? []).every((s) => s.impl === 'rule_tree')) {
+    const dirs = (v.sources ?? []).map((s) => (s.params?.direction as string) ?? 'long')
+    if (dirs.includes('long') && dirs.includes('short')) return 'both'
+  }
+  return null // 别的形态（多决策源组合等）不归这个选单管
+}
+
+/** switchPosMode 在三种形态之间转换，尽量保留已经编好的树。 */
+function switchPosMode(v: ModuleValue, mode: PosMode): ModuleValue {
+  const trees = v.impl === 'composite' ? (v.sources ?? []) : [v]
+  const pick = (dir: string) =>
+    trees.find((s) => ((s.params?.direction as string) ?? 'long') === dir)
+  const treeFor = (dir: string): ModuleValue => {
+    const found = pick(dir) ?? trees[0]
+    const params = { ...(found?.params ?? blankRuleTree()), direction: dir }
+    return { impl: 'rule_tree', params: params as Record<string, unknown> }
+  }
+  if (mode === 'both') {
+    // 转双向时，缺的那一边用现有那棵**原样复制**过去 ——
+    // 不自动把条件取反：取反是猜测，而猜错的条件跑出来一样有结果，
+    // 只是那个结果不是用户想要的
+    return {
+      impl: 'composite', mode: 'union',
+      sources: [treeFor('long'), treeFor('short')],
+    }
+  }
+  return treeFor(mode)
+}
+
 function StrategySlot({
-  cat, value, onChange,
+  cat, value, onChange, allowsShort,
 }: {
   cat: ModuleCatalog
   value: ModuleValue
   onChange: (v: ModuleValue) => void
+  allowsShort: boolean
 }) {
   const isComposite = value.impl === 'composite'
   const isTree = value.impl === 'rule_tree'
   const sources = value.sources ?? []
+  const posMode = posModeOf(value)
+  const hedgePair = posMode === 'both'
   return (
     <>
       <div className="filters">
@@ -276,7 +332,7 @@ function StrategySlot({
             <option value="composite">composite（多决策源组合）</option>
           </select>
         </Field>
-        {isComposite && (
+        {isComposite && !hedgePair && (
           <Field label="合并方式">
             <select value={value.mode ?? 'union'}
               onChange={(e) => onChange({ ...value, mode: e.target.value })}>
@@ -286,7 +342,36 @@ function StrategySlot({
             </select>
           </Field>
         )}
+        {posMode && (
+          <Field label="持仓模式">
+            <select value={posMode}
+              onChange={(e) => onChange(switchPosMode(value, e.target.value as PosMode))}>
+              <option value="long">仅做多（long）</option>
+              {/* 后两个只在支持做空的市场出现。**服务端也会拦** ——
+                  界面藏起来只是方便，不是保证 */}
+              {allowsShort && <option value="short">仅做空（short）</option>}
+              {allowsShort && <option value="both">双向持仓（both）</option>}
+            </select>
+          </Field>
+        )}
       </div>
+      {posMode && !allowsShort && (
+        <p className="note">
+          当前市场规则（<code>{'market.impl'}</code>）不支持做空，
+          所以只有「仅做多」——「仅做空」与「双向持仓」需要 T+0 且允许开空的市场，
+          如加密永续。
+        </p>
+      )}
+      {hedgePair && (
+        <p className="note">
+          双向 = <strong>两棵独立的规则树</strong>（composite / union）：
+          一棵管做多、一棵管做空，各写各的条件。
+          引擎里没有「双向模式」这个开关 —— 一棵树表达一个意图，
+          硬塞进一棵只会让「这个条件是给多头还是空头的」变成日常问题。
+          切过来时另一边是<strong>原样复制</strong>的，不会自动把条件取反：
+          取反是猜测，而猜错的条件照样跑得出结果，只是那结果不是你想要的。
+        </p>
+      )}
 
       {isTree && (
         <div style={{ marginTop: 8 }}>
@@ -312,41 +397,68 @@ function StrategySlot({
             <strong>顺序有意义</strong>：union 同标的同方向保留靠前的源；
             veto 只有<strong>第一个源</strong>产生订单，其余源只做否决。
           </p>
-          {sources.map((s, i) => (
-            <div key={i} style={{
-              border: '1px solid var(--border)', borderRadius: 4,
-              padding: 8, marginTop: 6,
-            }}>
-              <div className="filters">
-                <span className="k">源 {i}{i === 0 ? '（主）' : ''}</span>
-                <select value={s.impl}
-                  onChange={(e) => onChange({
-                    ...value,
-                    sources: sources.map((x, j) =>
-                      j === i ? switchImpl(cat.strategy, x, e.target.value) : x),
-                  })}>
-                  <ImplOptions list={cat.strategy} />
-                </select>
-                <button disabled={i === 0} onClick={() => onChange({
-                  ...value, sources: swap(sources, i, i - 1),
-                })}>↑</button>
-                <button disabled={i === sources.length - 1} onClick={() => onChange({
-                  ...value, sources: swap(sources, i, i + 1),
-                })}>↓</button>
-                <button onClick={() => onChange({
-                  ...value, sources: sources.filter((_, j) => j !== i),
-                })}>移除</button>
+          {sources.map((s, i) => {
+            const setSrc = (v: ModuleValue) => onChange({
+              ...value, sources: sources.map((x, j) => (j === i ? v : x)),
+            })
+            const dir = (s.params?.direction as string) ?? 'long'
+            return (
+              <div key={i} style={{
+                border: '1px solid var(--border)', borderRadius: 4,
+                padding: 8, marginTop: 6,
+              }}>
+                <div className="filters">
+                  {/* 双向的两个源不叫「源 0 / 源 1」—— 那不说明任何事。
+                      它们是做多腿与做空腿，直接这么写 */}
+                  <span className="k">
+                    {hedgePair
+                      ? (dir === 'short' ? '做空腿' : '做多腿')
+                      : `源 ${i}${i === 0 ? '（主）' : ''}`}
+                  </span>
+                  {!hedgePair && (
+                    <select value={s.impl}
+                      onChange={(e) => setSrc(switchImpl(cat.strategy, s, e.target.value))}>
+                      <ImplOptions list={cat.strategy} />
+                    </select>
+                  )}
+                  {/* 双向的这一对是固定的：增删改序都会把它变成别的东西，
+                      所以直接不给这些按钮，改用上面的「持仓模式」切换 */}
+                  {!hedgePair && (
+                    <>
+                      <button disabled={i === 0} onClick={() => onChange({
+                        ...value, sources: swap(sources, i, i - 1),
+                      })}>↑</button>
+                      <button disabled={i === sources.length - 1} onClick={() => onChange({
+                        ...value, sources: swap(sources, i, i + 1),
+                      })}>↓</button>
+                      <button onClick={() => onChange({
+                        ...value, sources: sources.filter((_, j) => j !== i),
+                      })}>移除</button>
+                    </>
+                  )}
+                </div>
+                {s.impl === 'rule_tree' ? (
+                  // 规则树没有 ParamSpec，用 ParamForm 渲染出来是一张空表 ——
+                  // 组合里的树因此曾经完全没法编辑
+                  <RuleTreeEditor
+                    cfg={asTree(s.params)}
+                    onChange={(c) => setSrc({
+                      ...s,
+                      params: { ...(c as unknown as Record<string, unknown>), direction: dir },
+                    })}
+                    cat={cat}
+                  />
+                ) : (
+                  <ParamForm
+                    specs={specsOf(cat.strategy, s.impl)}
+                    value={s.params ?? {}}
+                    onChange={(p) => setSrc({ ...s, params: p })}
+                  />
+                )}
               </div>
-              <ParamForm
-                specs={specsOf(cat.strategy, s.impl)}
-                value={s.params ?? {}}
-                onChange={(p) => onChange({
-                  ...value,
-                  sources: sources.map((x, j) => (j === i ? { ...x, params: p } : x)),
-                })}
-              />
-            </div>
-          ))}
+            )
+          })}
+          {!hedgePair && (
           <button style={{ marginTop: 8 }} onClick={() => {
             const first = cat.strategy[0]
             onChange({
@@ -354,6 +466,7 @@ function StrategySlot({
               sources: [...sources, { impl: first.name, params: defaults(first.specs) }],
             })
           }}>+ 加一个决策源</button>
+          )}
         </div>
       )}
     </>

@@ -206,6 +206,13 @@ func (e *Engine) Ledger() trading.Ledger { return e.led }
 // 换了市场就会静默给出错的年化系数。
 func (e *Engine) Market() trading.Market { return e.market }
 
+// Failure 报告风控链是否已判定策略失败（如资金不足以再开仓）。
+//
+// **报告必须显示它**：破产之后净值走成一条直线，
+// 最大回撤定格在失败那天、年化波动被后面的零波动摊薄、夏普反而变好看 ——
+// 不说出来的话，一个已经死掉的策略会显示成一个低波动策略。
+func (e *Engine) Failure() (bool, int32, string) { return e.risk.Failure() }
+
 // Step 前进一个事件时点。
 //
 // 阶段顺序不可颠倒，每一处都有理由：
@@ -529,6 +536,9 @@ type snapshot struct {
 	// 不存的话，从快照恢复后峰值归零，移动止损**静默失效**：
 	// 不报错、不异常，只是再也不会触发
 	Exits []byte `json:"exits,omitempty"`
+	// Risks 风控链的跨步状态。熔断的冷静期倒计时在这里 ——
+	// 不存的话，从快照恢复的那一步冷静期归零，**熔断静默解除**
+	Risks []byte `json:"risks,omitempty"`
 	// ResultHash 输出指纹的滚动哈希状态。
 	//
 	// 不存的话，从快照恢复后继续跑出来的指纹会缺掉快照之前的全部成交 ——
@@ -566,6 +576,13 @@ func (e *Engine) Snapshot() ([]byte, error) {
 			return nil, fmt.Errorf("离场规则状态快照失败: %w", err)
 		}
 		s.Exits = b
+	}
+	if len(e.risk) > 0 {
+		b, err := e.risk.SnapshotState()
+		if err != nil {
+			return nil, fmt.Errorf("风控规则状态快照失败: %w", err)
+		}
+		s.Risks = b
 	}
 	for _, key := range e.keys {
 		m := make(map[string]indicator.State, len(e.indicators[key]))
@@ -627,6 +644,11 @@ func (e *Engine) Restore(data []byte) error {
 	if len(e.exits) > 0 {
 		if err := e.exits.RestoreState(s.Exits); err != nil {
 			return fmt.Errorf("恢复离场规则状态失败: %w", err)
+		}
+	}
+	if len(e.risk) > 0 {
+		if err := e.risk.RestoreState(s.Risks); err != nil {
+			return fmt.Errorf("恢复风控规则状态失败: %w", err)
 		}
 	}
 	return nil

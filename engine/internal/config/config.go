@@ -266,6 +266,9 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("未知 market 实现 %q，可选：%s",
 			c.Market.Impl, strings.Join(trading.Markets.Names(), " / "))
 	}
+	if err := c.validateLeverage(); err != nil {
+		return err
+	}
 	if !trading.Fees.Has(c.Fee.Impl) {
 		return fmt.Errorf("未知 fee 实现 %q，可选：%s",
 			c.Fee.Impl, strings.Join(trading.Fees.Names(), " / "))
@@ -416,6 +419,47 @@ func defaultLedger(market string) string {
 		return "margin"
 	}
 	return "spot"
+}
+
+// maxLeverage 杠杆上限。
+//
+// **加密是账户级可选的 1–100x**，与期货不同 —— 期货每个合约有各自
+// 固定的保证金率，交易者选不了；加密交易所让你在开仓时任选倍数，
+// 所以它是**配置项**而不是标的属性。
+// 100 是主流交易所 BTC/ETH 永续对普通用户的常见上限
+// （更高的档位要么限币种、要么限仓位规模，回测里假装有它没有意义）。
+const maxLeverage = 100
+
+// validateLeverage 查杠杆与维持保证金率的取值域，以及它们与账本的搭配。
+func (c *Config) validateLeverage() error {
+	lev := c.Portfolio.Leverage
+	if lev < 1 || lev > maxLeverage {
+		return fmt.Errorf("portfolio.leverage = %d 越界，可选 1–%d", lev, maxLeverage)
+	}
+	if mmr := c.Portfolio.MaintMarginPPM; mmr < 1 || mmr >= 1_000_000 {
+		return fmt.Errorf("portfolio.maint_margin_ppm = %d 越界，"+
+			"可选 1–999999（百万分之一，主流交易所约 5000 = 0.5%%）", mmr)
+	}
+	if c.Portfolio.Ledger == "margin" {
+		// 维持保证金率高于开仓保证金率时，仓位一开出来就该被强平 ——
+		// 这不是「风控严」，是参数写错了
+		if openPPM := int64(1_000_000) / lev; c.Portfolio.MaintMarginPPM >= openPPM {
+			return fmt.Errorf(
+				"portfolio: %d 倍杠杆的开仓保证金率是 %d ppm，"+
+					"而维持保证金率 %d ppm 不低于它 —— 仓位一开出来就会被强平",
+				lev, openPPM, c.Portfolio.MaintMarginPPM)
+		}
+		return nil
+	}
+	// 现货账本上杠杆是没有意义的。**必须报错而不是忽略**：
+	// 静默忽略的话，用户以为自己在用 5 倍杠杆回测，
+	// 拿到的却是 1 倍的结果，而报告里看不出任何异常
+	if lev != 1 {
+		return fmt.Errorf("portfolio.leverage = %d 但 ledger = %q —— "+
+			"现货账本没有杠杆。要用杠杆请把 ledger 设为 margin",
+			lev, c.Portfolio.Ledger)
+	}
+	return nil
 }
 
 // DefaultBenchmark 各市场的默认基准标的。

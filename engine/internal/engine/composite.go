@@ -101,6 +101,19 @@ func (c *Composite) Name() string {
 // Specs 组合本身没有参数 —— 参数属于各个源。
 func (c *Composite) Specs() []spec.ParamSpec { return nil }
 
+// NeedsShort 任一源要做空，整个组合就要做空。
+//
+// 双向配置正是「一棵多头树 + 一棵空头树」，所以这个转发不是形式主义 ——
+// 不转发的话，装配时的市场校验对组合策略一律失效。
+func (c *Composite) NeedsShort() bool {
+	for _, s := range c.sources {
+		if ss, ok := s.Strategy.(ShortSeller); ok && ss.NeedsShort() {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *Composite) Init(ic InitContext) error {
 	for i := range c.sources {
 		s := &c.sources[i]

@@ -131,6 +131,16 @@ type ConfigurableStrategy interface {
 //
 // 从 ctx 导出的状态天然随引擎快照一起恢复，无需额外处理。
 // 只有真正的跨步记忆（如「上一步指标是否在均线之上」）才需要本接口。
+// ShortSeller 由**会发出开空信号**的策略实现。
+//
+// 装配时用它挡下「在不允许做空的市场上配了一棵做空树」。
+// 不挡的话后果是**静默失效**：开空信号会被 Sizer 当成减仓，
+// 而手上没有多头可减，订单被丢掉 —— 一笔成交都不会有，
+// 报告上却看不出任何异常，只是策略「什么都没做」。
+type ShortSeller interface {
+	NeedsShort() bool
+}
+
 type StatefulStrategy interface {
 	Strategy
 	SnapshotState() ([]byte, error)

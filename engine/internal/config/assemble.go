@@ -255,14 +255,28 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 		return nil, err
 	}
 	chain := make(trading.RiskChain, 0, len(c.Risk))
+	// riskExits 是风控规则里**同时也是离场规则**的那些。
+	//
+	// 回撤熔断勾选「触发时清仓」后，它既要拦开仓（Risk），
+	// 又要发平仓信号（ExitRule）—— 两件事必须由**同一个实例**做，
+	// 否则两份冷静期状态各走各的。
+	//
+	// 用接口判断而不是认名字：认名字的话，将来改个名就静默失效
+	var riskExits trading.ExitChain
 	for i, r := range c.Risk {
 		rr, err := trading.Risks.Build(r.Impl, r.Params)
 		if err != nil {
 			return nil, fmt.Errorf("risk[%d]: %w", i, err)
 		}
 		chain = append(chain, rr)
+		if er, ok := rr.(trading.ExitRule); ok {
+			riskExits = append(riskExits, er)
+		}
 	}
-	exits := make(trading.ExitChain, 0, len(c.Exit))
+	// 风控出的离场信号排在**用户配的离场规则之前** ——
+	// 熔断清仓要压过止盈：ExitChain 按标的去重，靠前的赢
+	exits := make(trading.ExitChain, 0, len(riskExits)+len(c.Exit))
+	exits = append(exits, riskExits...)
 	for i, r := range c.Exit {
 		er, err := trading.Exits.Build(r.Impl, r.Params)
 		if err != nil {
@@ -277,6 +291,15 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 	strat, params, err := buildStrategy(c.Strategy, market.AllowsShort())
 	if err != nil {
 		return nil, err
+	}
+	// 做空的策略只能配在允许做空的市场上。**必须在这里拦**：
+	// 放过去的话开空信号会被 Sizer 当成减仓、因无多头可减而丢掉，
+	// 一笔成交都不会有，报告上却看不出任何异常
+	if ss, ok := strat.(eng.ShortSeller); ok && ss.NeedsShort() && !market.AllowsShort() {
+		return nil, fmt.Errorf(
+			"策略要开空，但市场规则 %q 不支持做空 —— "+
+				"「仅做空」与「双向持仓」只在支持做空的市场（如 crypto）可用",
+			market.Name())
 	}
 
 	allowPartial := true

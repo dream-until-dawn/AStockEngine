@@ -170,6 +170,14 @@ func main() {
 			fmt.Printf("    %-24s %d\n", k, rejectBy[k])
 		}
 	}
+	if failed, day, why := e.Failure(); failed {
+		// 破产之后净值走成一条直线：最大回撤定格在这一天、
+		// 年化波动被后面的零波动摊薄、夏普反而变好看。
+		// **必须先说这一句**，否则底下每个指标都会被误读
+		fmt.Printf("  [!] 策略于 %d 判定失败：%s\n", day, why)
+		fmt.Println("      此后不再开新仓，净值为一条直线 —— " +
+			"下面的年化波动、夏普、最大回撤都因此失真，不要按常规解读。")
+	}
 	if w := led.Warnings(); len(w) > 0 {
 		fmt.Printf("  账本告警 %d 条，首条：%s\n", len(w), w[0])
 	}

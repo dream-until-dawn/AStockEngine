@@ -441,6 +441,21 @@ export interface ModuleSpec {
   /** 一句话中文说明，来自引擎的注册表 */
   desc: string
   specs: ParamSpec[]
+
+  // 以下三项只有 market 模块会有 —— 它们不是「参数」，
+  // 是这个市场的固有属性，界面据此决定出现什么。
+
+  /**
+   * 支不支持做空。决定「仅做空」「双向持仓」两个持仓模式要不要出现。
+   *
+   * **由服务端从 Market 问出来**，不要在前端按市场名硬编码 ——
+   * 硬编码会在加第三个市场时安静地漏掉它。
+   */
+  allowsShort?: boolean
+  /** 计价单位，如「元」「USDT」 */
+  money?: string
+  /** 数量单位，如「股」「张」 */
+  qtyUnit?: string
 }
 
 export interface ModuleCatalog {

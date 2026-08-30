@@ -287,11 +287,11 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 	if hasLimit && b.High == b.Low {
 		if po.Side == SideBuy && b.High >= up {
 			return rej(RejectOneWordBoard,
-				fmt.Sprintf("一字涨停 %.3f，无法买入", float64(up)/1000))
+				fmt.Sprintf("一字涨停 %.4f，无法买入", priceOf(inst, up)))
 		}
 		if po.Side == SideSell && b.Low <= down {
 			return rej(RejectOneWordBoard,
-				fmt.Sprintf("一字跌停 %.3f，无法卖出", float64(down)/1000))
+				fmt.Sprintf("一字跌停 %.4f，无法卖出", priceOf(inst, down)))
 		}
 	}
 
@@ -304,11 +304,11 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 	if hasLimit {
 		if po.Side == SideBuy && ref >= up {
 			return rej(RejectLimitUpNoBuy,
-				fmt.Sprintf("参考价 %.3f 已达涨停 %.3f", float64(ref)/1000, float64(up)/1000))
+				fmt.Sprintf("参考价 %.4f 已达涨停 %.4f", priceOf(inst, ref), priceOf(inst, up)))
 		}
 		if po.Side == SideSell && ref <= down {
 			return rej(RejectLimitDownNoSell,
-				fmt.Sprintf("参考价 %.3f 已达跌停 %.3f", float64(ref)/1000, float64(down)/1000))
+				fmt.Sprintf("参考价 %.4f 已达跌停 %.4f", priceOf(inst, ref), priceOf(inst, down)))
 		}
 	}
 
@@ -319,13 +319,13 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 
 	// 限价单：买单要求成交价不高于限价，卖单不低于限价
 	if po.Type == OrderLimit {
+		px := func(v int64) float64 { return priceOf(inst, v) }
 		if po.Side == SideBuy && price > po.LimitPrice {
 			if b.Low <= po.LimitPrice {
 				price = po.LimitPrice // 当日曾跌到限价，按限价成交
 			} else {
 				return rej(RejectLimitPriceNotReached,
-					fmt.Sprintf("限价 %.3f，当日最低 %.3f",
-						float64(po.LimitPrice)/1000, float64(b.Low)/1000))
+					fmt.Sprintf("限价 %.4f，当日最低 %.4f", px(po.LimitPrice), px(b.Low)))
 			}
 		}
 		if po.Side == SideSell && price < po.LimitPrice {
@@ -333,8 +333,7 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 				price = po.LimitPrice
 			} else {
 				return rej(RejectLimitPriceNotReached,
-					fmt.Sprintf("限价 %.3f，当日最高 %.3f",
-						float64(po.LimitPrice)/1000, float64(b.High)/1000))
+					fmt.Sprintf("限价 %.4f，当日最高 %.4f", px(po.LimitPrice), px(b.High)))
 			}
 		}
 	}
@@ -396,4 +395,16 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 		return rej(reason, detail)
 	}
 	return fill, Rejection{}, true
+}
+
+// priceOf 把定点价按标的自己的 price_scale 转成人读值。
+//
+// 只用于拼消息。**不要拿它去算钱** —— 浮点一进来，
+// 定点整数这条线就断了。
+func priceOf(inst *mktdata.Instrument, v int64) float64 {
+	scale := int64(1000)
+	if inst != nil && inst.PriceScale > 0 {
+		scale = int64(inst.PriceScale)
+	}
+	return float64(v) / float64(scale)
 }

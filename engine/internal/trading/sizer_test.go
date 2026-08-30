@@ -19,9 +19,17 @@ type fakeSizeCtx struct {
 	avail   map[mktdata.InstrumentID]int64
 	mkt     Market
 	peak    int64
+	// led 显式指定账本。为空时用 pf —— 大多数用例只关心现货，
+	// 但双向的用例要塞一个 MarginLedger 进来
+	led Ledger
 }
 
-func (c *fakeSizeCtx) Ledger() Ledger          { return c.pf }
+func (c *fakeSizeCtx) Ledger() Ledger {
+	if c.led != nil {
+		return c.led
+	}
+	return c.pf
+}
 func (c *fakeSizeCtx) EquityCents() int64      { return c.equity }
 func (c *fakeSizeCtx) InitialCashCents() int64 { return c.initial }
 func (c *fakeSizeCtx) PeakEquityCents() int64  { return c.peak }

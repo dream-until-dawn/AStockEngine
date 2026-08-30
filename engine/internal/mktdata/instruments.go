@@ -129,6 +129,16 @@ type Instrument struct {
 	//
 	// 没有它，「数量」这一列就没有意义 —— 名义额 = 张数 × ct_val × 价格。
 	ContractMult int64
+
+	// PriceTick 价格最小变动，与价格同 scale。0 表示未知（不做规整）。
+	//
+	// 加密来自 `attrs.tick_sz`：BTC-USDT-SWAP 是 0.1 USDT、
+	// ETH-USDT-SWAP 是 0.01。A 股是 0.01 元，但 ETL 没有这一列，
+	// 故为 0 —— **未知就不规整**，猜一个 tick 比不规整更糟。
+	//
+	// 用途只有一个：滑点调整后的成交价必须仍是**市场上真实存在的价格**。
+	// 行情里的 OHLC 天然落在 tick 上，加了滑点就不一定了。
+	PriceTick int64
 	// Attrs 市场特定属性的原始 JSON，可空。
 	// 引擎只解出确实要用的字段（当前只有 ct_val），其余原样留着
 	Attrs string
@@ -192,6 +202,23 @@ func parseContractMult(attrs string) int64 {
 		return 0
 	}
 	return decimalToFixed(m.CtVal, contractMultOne)
+}
+
+// parsePriceTick 从 attrs 里取 tick_sz，按该标的的 price_scale 转成定点。
+//
+// 与 ct_val 同理走字符串解析：0.1 × 1e8 经 float64 是 10000000.000000002，
+// 0.01 更差。tick 差一个单位，规整后的价格就会系统性地偏一侧。
+func parsePriceTick(attrs string, priceScale int32) int64 {
+	if priceScale <= 0 {
+		return 0
+	}
+	var m struct {
+		TickSz string `json:"tick_sz"`
+	}
+	if err := json.Unmarshal([]byte(attrs), &m); err != nil || m.TickSz == "" {
+		return 0
+	}
+	return decimalToFixed(m.TickSz, int64(priceScale))
 }
 
 // decimalToFixed 把十进制字符串按 scale 转成定点整数，**不经过 float**。
@@ -298,6 +325,7 @@ func LoadUniverse(path string) (*Universe, error) {
 			if m := parseContractMult(*r.Attrs); m > 0 {
 				inst.ContractMult = m
 			}
+			inst.PriceTick = parsePriceTick(*r.Attrs, r.PriceScale)
 		}
 		u.byID[inst.ID] = inst
 		u.all = append(u.all, inst)
