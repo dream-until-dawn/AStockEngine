@@ -187,8 +187,12 @@ func TestCrossIsPerNode(t *testing.T) {
 // 两者都不报错，只是信号悄悄不对。而 C6 的实盘每天从快照恢复。
 func TestRuleTreeSnapshotRoundTrip(t *testing.T) {
 	a := NewRuleTree()
-	a.virtual[7] = true
-	a.virtual[9] = true
+	a.virtual[7] = virtualPos{Day: 20250102, Price: 12_345}
+	a.virtual[9] = virtualPos{Day: 20250103, Price: 67_890}
+	a.vtrips = append(a.vtrips, VirtualTrip{
+		Instrument: 5, OpenDay: 20241201, CloseDay: 20241220,
+		OpenPrice: 10_000, ClosePrice: 11_000,
+	})
 	a.evalCross(cmpCrossU, -1, "buy", 7)
 
 	b := NewRuleTree()
@@ -199,8 +203,26 @@ func TestRuleTreeSnapshotRoundTrip(t *testing.T) {
 	if err := b.RestoreState(snap); err != nil {
 		t.Fatal(err)
 	}
-	if !b.virtual[7] || !b.virtual[9] || b.VirtualCount() != 2 {
+	if b.VirtualCount() != 2 {
 		t.Errorf("虚拟持仓没恢复：%v", b.virtual)
+	}
+	// **开仓日与开仓价也要恢复**：只存标的 ID 的话，恢复后那笔
+	// 虚拟持仓平掉时凑不出开仓端，整轮记录就丢了
+	if got := b.virtual[7]; got.Day != 20250102 || got.Price != 12_345 {
+		t.Errorf("虚拟持仓 7 的开仓记录没恢复：%+v", got)
+	}
+	if got := b.virtual[9]; got.Day != 20250103 || got.Price != 67_890 {
+		t.Errorf("虚拟持仓 9 的开仓记录没恢复：%+v", got)
+	}
+	// 已走完的虚拟轮次不能丢 —— 丢了的话，从快照恢复之后
+	// 之前被过滤掉的那些机会在报告里凭空消失
+	if vt := b.vtrips; len(vt) != 1 || vt[0].Instrument != 5 ||
+		vt[0].ClosePrice != 11_000 {
+		t.Errorf("虚拟轮次没恢复：%+v", vt)
+	}
+	// 收益率：10000 → 11000 是 +10%
+	if vt := b.VirtualTrips(); len(vt) != 1 || vt[0].Ratio < 0.0999 || vt[0].Ratio > 0.1001 {
+		t.Errorf("虚拟轮次的收益率算错了：%+v", vt)
 	}
 	// 恢复后再喂一个正值，应当判为上穿（说明 prev=-1 被带过来了）
 	if triTrue != b.evalCross(cmpCrossU, +1, "buy", 7) {
@@ -214,7 +236,7 @@ func TestRuleTreeSnapshotRoundTrip(t *testing.T) {
 func TestRuleTreeSnapshotIsDeterministic(t *testing.T) {
 	s := NewRuleTree()
 	for i := int32(1); i <= 50; i++ {
-		s.virtual[mktdata.InstrumentID(i)] = true
+		s.virtual[mktdata.InstrumentID(i)] = virtualPos{Day: 20250100 + i, Price: int64(i) * 137}
 	}
 	a, _ := s.SnapshotState()
 	b, _ := s.SnapshotState()
@@ -385,5 +407,26 @@ func TestPrevSnapshotKeepsZero(t *testing.T) {
 	// 恢复后喂 1：若 0 被省掉，这里会是「未知」而不是「上升」
 	if got := b.evalTrend(cmpRising, 1, "n", 1); got != triTrue {
 		t.Errorf("恢复后 0 → 1 应为上升，得到 %v —— 取值 0 的状态被省掉了", got)
+	}
+}
+
+// TestVirtualTripReturnRatio 虚拟轮次只有收益率，且做空方向要取反。
+//
+// 虚拟持仓从未占用资金，也就没经过 Sizer 定量 —— 硬给它安一个
+// 「本该赚多少钱」的金额，那个金额是编出来的。
+// 收益率是这笔决策唯一真实可算的东西。
+func TestVirtualTripReturnRatio(t *testing.T) {
+	long := VirtualTrip{OpenPrice: 10_000, ClosePrice: 11_000}
+	if got := long.ReturnRatio(); got < 0.0999 || got > 0.1001 {
+		t.Errorf("做多 10000→11000 应是 +10%%，得到 %.4f", got)
+	}
+	// 同样的价格走势，做空是亏的
+	short := VirtualTrip{OpenPrice: 10_000, ClosePrice: 11_000, Short: true}
+	if got := short.ReturnRatio(); got > -0.0999 || got < -0.1001 {
+		t.Errorf("做空 10000→11000 应是 -10%%，得到 %.4f", got)
+	}
+	// 开仓价缺失时返回 0，而不是除零
+	if got := (VirtualTrip{ClosePrice: 11_000}).ReturnRatio(); got != 0 {
+		t.Errorf("没有开仓价时应返回 0，得到 %.4f", got)
 	}
 }

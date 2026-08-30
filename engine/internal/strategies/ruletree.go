@@ -3,7 +3,6 @@ package strategies
 import (
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 
 	eng "github.com/dream-until-dawn/AStockEngine/engine/internal/engine"
@@ -38,9 +37,18 @@ type RuleTree struct {
 	// short 为真时买入树开的是**空头**，卖出树平的也是空头
 	short bool
 
-	// virtual 虚拟持仓集合。**必须跨步保存** ——
-	// 从快照恢复后它归零，被过滤掉的机会会立刻重新触发买入
-	virtual map[mktdata.InstrumentID]bool
+	// virtual 虚拟持仓。**必须跨步保存** ——
+	// 从快照恢复后它归零，被过滤掉的机会会立刻重新触发买入。
+	//
+	// 存的不只是「有没有」，还有开仓那天与那天的价格 ——
+	// 虚拟持仓平掉时要能凑出一轮完整的记录（见 VirtualTrip）
+	virtual map[mktdata.InstrumentID]virtualPos
+	// vtrips 已经走完的虚拟轮次。
+	//
+	// 「有效性」这棵树的全部价值就是**它过滤掉的那些机会后来怎么样了**。
+	// 不记的话，被过滤的交易在报告里完全不存在 ——
+	// 而「过滤对不对」恰恰只能靠它们来判断
+	vtrips []VirtualTrip
 	// notReady 上一步里有多少只标的因指标未就绪而没进决策集合。
 	//
 	// **预热是逐标的的**：MACD(12,26,9) 要 35 根、MA200 要 200 根，
@@ -151,9 +159,45 @@ type ruleTreeCfg struct {
 	Direction string `json:"direction,omitempty"`
 }
 
+// virtualPos 一个虚拟持仓的开仓记录。
+type virtualPos struct {
+	Day int32 `json:"day"`
+	// Price 开仓那天的后复权收盘价，与条件求值同基准 ——
+	// 拿原始价算收益，除权日会凭空多出一段涨跌
+	Price int64 `json:"price"`
+}
+
+// VirtualTrip 一轮虚拟持仓：买入树说买、有效性树说不算数的那些机会。
+//
+// **没有金额，只有收益率**。虚拟持仓从来没有占用过资金，
+// 也就没有经过 Sizer 定量 —— 硬给它安一个「本该赚多少钱」的金额，
+// 那个金额是编出来的。收益率是这笔决策唯一真实可算的东西。
+type VirtualTrip struct {
+	Instrument mktdata.InstrumentID `json:"instrument"`
+	OpenDay    int32                `json:"open_day"`
+	CloseDay   int32                `json:"close_day"`
+	// OpenPrice / ClosePrice 后复权价，与条件求值同基准
+	OpenPrice  int64 `json:"open_price"`
+	ClosePrice int64 `json:"close_price"`
+	// Short 这棵树是做空方向的，收益率要取反
+	Short bool `json:"short"`
+}
+
+// ReturnRatio 这一轮虚拟持仓的收益率。做空方向已取反。
+func (t VirtualTrip) ReturnRatio() float64 {
+	if t.OpenPrice <= 0 {
+		return 0
+	}
+	r := float64(t.ClosePrice-t.OpenPrice) / float64(t.OpenPrice)
+	if t.Short {
+		return -r
+	}
+	return r
+}
+
 func NewRuleTree() *RuleTree {
 	return &RuleTree{
-		virtual: make(map[mktdata.InstrumentID]bool, 1024),
+		virtual: make(map[mktdata.InstrumentID]virtualPos, 1024),
 		prev:    make(map[stateKey]float64, 4096),
 	}
 }
@@ -318,7 +362,8 @@ func (s *RuleTree) Init(ic eng.InitContext) error {
 	if s.buy == nil || s.sell == nil {
 		return fmt.Errorf("rule_tree 尚未配置")
 	}
-	s.virtual = make(map[mktdata.InstrumentID]bool, 1024)
+	s.virtual = make(map[mktdata.InstrumentID]virtualPos, 1024)
+	s.vtrips = nil
 	s.prev = make(map[stateKey]float64, 4096)
 	for _, in := range s.inds {
 		kind, params := in.Kind, in.Params
@@ -389,7 +434,8 @@ func (s *RuleTree) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 		// 双向下把一多一空两棵树用 composite 组起来时，
 		// 笼统判断会让多头树因为已有空头而不开仓（反之亦然）。
 		held := s.holdsMine(ctx, id)
-		if held || s.virtual[id] {
+		vpos, isVirtual := s.virtual[id]
+		if held || isVirtual {
 			if sellOK {
 				if held {
 					// 平仓方向与开仓相反：做多发卖出平、做空发买入平。
@@ -399,7 +445,16 @@ func (s *RuleTree) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 						Side: s.closeSide(), Tag: "tree_sell",
 					})
 				}
-				// 虚拟持仓在卖出信号出现时清掉 —— 之后才可能再次买入
+				// 虚拟持仓在卖出信号出现时清掉 —— 之后才可能再次买入。
+				// 清掉之前先把这一轮记下来
+				if isVirtual {
+					s.vtrips = append(s.vtrips, VirtualTrip{
+						Instrument: id,
+						OpenDay:    vpos.Day, CloseDay: bar.TradingDay,
+						OpenPrice: vpos.Price, ClosePrice: adj.Close,
+						Short: s.short,
+					})
+				}
 				delete(s.virtual, id)
 			}
 			continue
@@ -414,10 +469,11 @@ func (s *RuleTree) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 			})
 		} else {
 			// 不下单，但记成持有 —— 在卖出信号出现前不再触发买入
-			s.virtual[id] = true
+			s.virtual[id] = virtualPos{Day: bar.TradingDay, Price: adj.Close}
 		}
 	}
-	// 已经真实持有的标的不必再留虚拟标记（开仓成交后会走到这一步）
+	// 已经真实持有的标的不必再留虚拟标记（开仓成交后会走到这一步）。
+	// **这不算一轮虚拟轮次** —— 它没被过滤掉，它变成真仓了
 	for id := range s.virtual {
 		if s.holdsMine(ctx, id) {
 			delete(s.virtual, id)
@@ -628,21 +684,28 @@ func barField(b mktdata.Bar, f string) float64 {
 // ---- 跨步状态 ----
 
 type ruleTreeState struct {
-	Virtual []int32            `json:"virtual"`
-	Prev    map[string]float64 `json:"prev"`
+	// Virtual 虚拟持仓。**存的是开仓日与开仓价，不只是标的 ID** ——
+	// 只存 ID 的话，恢复后那笔虚拟持仓平掉时凑不出开仓端，
+	// 整轮记录就丢了
+	Virtual map[string]virtualPos `json:"virtual"`
+	// VTrips 已走完的虚拟轮次。不存的话，从快照恢复之后
+	// 之前被过滤掉的那些机会在报告里凭空消失
+	VTrips []VirtualTrip      `json:"vtrips,omitempty"`
+	Prev   map[string]float64 `json:"prev"`
 }
 
 func (s *RuleTree) SnapshotState() ([]byte, error) {
 	st := ruleTreeState{
-		Virtual: make([]int32, 0, len(s.virtual)),
+		Virtual: make(map[string]virtualPos, len(s.virtual)),
+		VTrips:  s.vtrips,
 		Prev:    make(map[string]float64, len(s.prev)),
 	}
-	for id := range s.virtual {
-		st.Virtual = append(st.Virtual, int32(id))
+	// map 的键在 encoding/json 里按字典序输出，所以这里不必再排 ——
+	// 而 slice 会按插入序输出，vtrips 本来就是按时间追加的，也是定序的。
+	// 定序是 C5 的要求：同一状态必须序列化出同样的字节
+	for id, p := range s.virtual {
+		st.Virtual[fmt.Sprint(int32(id))] = p
 	}
-	// 排序：map 遍历顺序随机，不排的话同一状态会序列化出不同字节，
-	// 而快照本身会进指纹（C5）
-	sort.Slice(st.Virtual, func(i, j int) bool { return st.Virtual[i] < st.Virtual[j] })
 	// **不能省略取值为 0 的项**：键在表里就代表「见过」，
 	// 省掉 0 会让「见过且当时为 0」退化成「没见过」，恢复后第一根就误判
 	for k, v := range s.prev {
@@ -656,10 +719,15 @@ func (s *RuleTree) RestoreState(b []byte) error {
 	if err := json.Unmarshal(b, &st); err != nil {
 		return err
 	}
-	s.virtual = make(map[mktdata.InstrumentID]bool, len(st.Virtual))
-	for _, id := range st.Virtual {
-		s.virtual[mktdata.InstrumentID(id)] = true
+	s.virtual = make(map[mktdata.InstrumentID]virtualPos, len(st.Virtual))
+	for k, p := range st.Virtual {
+		var id int32
+		if _, err := fmt.Sscan(k, &id); err != nil {
+			return fmt.Errorf("虚拟持仓快照里的标的 ID %q 无法解析: %w", k, err)
+		}
+		s.virtual[mktdata.InstrumentID(id)] = p
 	}
+	s.vtrips = st.VTrips
 	s.prev = make(map[stateKey]float64, len(st.Prev))
 	for k, v := range st.Prev {
 		i := strings.LastIndex(k, "|")
@@ -712,6 +780,23 @@ func (s *RuleTree) closeSide() trading.Side {
 
 // VirtualCount 返回当前虚拟持仓数，供单步调试展示。
 func (s *RuleTree) VirtualCount() int { return len(s.virtual) }
+
+// VirtualTrips 返回已走完的虚拟轮次，转成引擎口径。
+//
+// 引擎那边只要收益率 —— 价格是**后复权**的定点值，脱离标的的 scale
+// 没有意义，而收益率是个比值，跨标的可比。
+func (s *RuleTree) VirtualTrips() []eng.VirtualTrip {
+	out := make([]eng.VirtualTrip, 0, len(s.vtrips))
+	for _, t := range s.vtrips {
+		out = append(out, eng.VirtualTrip{
+			Instrument: t.Instrument, OpenDay: t.OpenDay,
+			CloseDay: t.CloseDay, Ratio: t.ReturnRatio(),
+		})
+	}
+	return out
+}
+
+var _ eng.VirtualReporter = (*RuleTree)(nil)
 
 // Warmup 返回上一步「进了决策集合」与「指标未就绪」的标的数。
 //

@@ -125,12 +125,23 @@ type tripDTO struct {
 	// QtyScale 这一行自己的数量标度。加密是 1e8，A 股是 1
 	QtyScale int32 `json:"qtyScale"`
 	// Short 这是一轮做空。盈亏方向相反，前端要能标出来
-	Short     bool  `json:"short"`
-	Cost      int64 `json:"cost"`
-	Proceed   int64 `json:"proceed"`
-	PnL       int64 `json:"pnl"`
-	HoldDays  int   `json:"holdDays"`
-	FromBonus bool  `json:"fromBonus"`
+	Short   bool  `json:"short"`
+	Cost    int64 `json:"cost"`
+	Proceed int64 `json:"proceed"`
+	PnL     int64 `json:"pnl"`
+	// Ratio 收益率。真实轮次由金额算出；**虚拟轮次只有它** ——
+	// 虚拟持仓从未占用资金，编一个金额出来是假的
+	Ratio    float64 `json:"ratio"`
+	HoldDays int     `json:"holdDays"`
+	// Virtual 虚拟持仓：策略说该买、被自己的有效性判断挡下来的那一轮。
+	// 没有真实成交，也不计入胜率与盈亏
+	Virtual bool `json:"virtual"`
+	// OpenTag / CloseTag 这一轮**是怎么开的、又是怎么结束的**。
+	// 没有它，正常止盈的、被止损砍的、被熔断清仓的、被强平爆掉的，
+	// 在表里长得一模一样
+	OpenTag   string `json:"openTag,omitempty"`
+	CloseTag  string `json:"closeTag,omitempty"`
+	FromBonus bool   `json:"fromBonus"`
 }
 
 // marketInfo 本次回测所在市场的展示口径。
@@ -336,12 +347,32 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 			Qty: t.Qty, QtyScale: 1, Short: t.Short,
 			Cost: t.CostCents, Proceed: t.ProceedCents,
 			PnL: t.PnLCents, HoldDays: t.HoldDays, FromBonus: t.FromBonus,
+			OpenTag: t.OpenTag, CloseTag: t.CloseTag,
+		}
+		if t.CostCents > 0 {
+			d.Ratio = float64(t.PnLCents) / float64(t.CostCents)
 		}
 		if in != nil {
 			d.Symbol, d.Name = in.Symbol, in.Name
 			if in.QtyScale > 0 {
 				d.QtyScale = in.QtyScale
 			}
+		}
+		res.RoundTrips = append(res.RoundTrips, d)
+	}
+	// 虚拟轮次接在真实轮次后面，由前端按 virtual 标记区分。
+	//
+	// **放进同一张表而不是另开一张**：它们要被一起看 ——
+	// 「被过滤掉的那些后来怎么样了」只有和真实成交并排才读得出来
+	for _, vt := range e.VirtualTrips() {
+		d := tripDTO{
+			ID: int32(vt.Instrument), OpenDay: vt.OpenDay, CloseDay: vt.CloseDay,
+			QtyScale: 1, Virtual: true, Ratio: vt.Ratio,
+			HoldDays: daysBetween(vt.OpenDay, vt.CloseDay),
+			OpenTag:  "tree_buy_invalid", CloseTag: "tree_sell",
+		}
+		if in := s.Uni.Get(vt.Instrument); in != nil {
+			d.Symbol, d.Name = in.Symbol, in.Name
 		}
 		res.RoundTrips = append(res.RoundTrips, d)
 	}
@@ -607,4 +638,26 @@ func (s *Store) handleUniverse(w http.ResponseWriter, r *http.Request) {
 		"limit": maxUniverseForWeb, "overLimit": len(ids) > maxUniverseForWeb,
 		"sample": sample, "truncated": truncated,
 	})
+}
+
+// daysBetween 由两个 YYYYMMDD 估算相隔的自然日数。
+//
+// 与 metrics.dayDiff 同一套算法。虚拟轮次不走 metrics 那条路
+// （它们没有成交），持有天数只能在这里算。
+func daysBetween(from, to int32) int {
+	if from == 0 || to == 0 {
+		return 0
+	}
+	return int(julianDay(to) - julianDay(from))
+}
+
+func julianDay(d int32) int32 {
+	y, m, day := d/10000, d/100%100, d%100
+	if m <= 2 {
+		y -= 1
+		m += 12
+	}
+	a := y / 100
+	b := 2 - a + a/4
+	return int32(365.25*float64(y+4716)) + int32(30.6001*float64(m+1)) + day + b - 1524
 }

@@ -141,6 +141,25 @@ type ShortSeller interface {
 	NeedsShort() bool
 }
 
+// VirtualTrip 一轮**虚拟持仓**：策略说该买、但被自己的有效性判断
+// 挡下来的那些机会。它从未占用资金，所以只有收益率、没有金额。
+type VirtualTrip struct {
+	Instrument mktdata.InstrumentID
+	OpenDay    int32
+	CloseDay   int32
+	// Ratio 这一轮的收益率（做空方向已取反）
+	Ratio float64
+}
+
+// VirtualReporter 由**会产生虚拟持仓**的策略实现。
+//
+// 「有效性」这类过滤判断的全部价值，就在于它过滤掉的机会后来怎么样了。
+// 不把它们报出来，被过滤的交易在报告里完全不存在 ——
+// 而「这个过滤到底对不对」恰恰只能靠它们来判断。
+type VirtualReporter interface {
+	VirtualTrips() []VirtualTrip
+}
+
 type StatefulStrategy interface {
 	Strategy
 	SnapshotState() ([]byte, error)

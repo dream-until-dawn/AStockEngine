@@ -63,6 +63,19 @@ func printReport(r metrics.Result) {
 		fmt.Printf("  未平仓        %d 只，开仓金额 %.2f %s，不计入胜率\n",
 			t.OpenPositions, cents(t.OpenCostCents), money)
 	}
+	if len(t.CloseBy) > 0 {
+		// **这一轮是怎么结束的**：正常卖出信号、止损、止盈、熔断清仓、
+		// 被强平 —— 几种结局对「策略行不行」的意义完全不同，
+		// 只报一个胜率是看不出来的。尤其是强平：那不是策略的决定
+		fmt.Print("  离场原因      ")
+		for i, k := range sortedStrKeys(t.CloseBy) {
+			if i > 0 {
+				fmt.Print("    ")
+			}
+			fmt.Printf("%s %d", closeTagLabel(k), t.CloseBy[k])
+		}
+		fmt.Println()
+	}
 	fmt.Println()
 
 	fmt.Printf("  单边成交额    %.2f %s    年化换手 %.2f 倍\n",
@@ -145,4 +158,28 @@ func warnLine(ws []string) string {
 		return ""
 	}
 	return "  ⚠ " + strings.Join(ws, "\n  ⚠ ")
+}
+
+// closeTagLabel 把成交 tag 译成人读的离场原因。
+//
+// 认不出来的 tag **原样返回**而不是归到「其他」——
+// 策略可以自定 tag，把它们混成一堆就等于把归因扔了。
+func closeTagLabel(tag string) string {
+	switch tag {
+	case "":
+		return "未标注"
+	case "liquidation":
+		return "强平"
+	case "stop_loss":
+		return "止损"
+	case "take_profit":
+		return "止盈"
+	case "trailing_stop":
+		return "移动止损"
+	case "drawdown_halt":
+		return "熔断清仓"
+	case "tree_sell":
+		return "卖出信号"
+	}
+	return tag
 }

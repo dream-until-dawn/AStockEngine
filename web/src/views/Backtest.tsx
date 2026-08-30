@@ -176,6 +176,15 @@ function Result({
       n: `${m.trades.wins} 赢 / ${m.trades.losses} 输` },
     { k: '盈亏比', v: num(m.trades.profit_factor) },
     { k: '年化换手', v: `${m.turnover.toFixed(1)} 倍` },
+    // 离场原因：正常卖出、止损、止盈、熔断清仓、被强平 ——
+    // 几种结局对「策略行不行」的意义完全不同，只看胜率是看不出来的。
+    // 强平尤其要显眼：那不是策略的决定，是市场施加的
+    ...(closeTop(m.trades.close_by) ? [{
+      k: '离场原因',
+      v: closeTop(m.trades.close_by),
+      n: closeBreakdown(m.trades.close_by),
+      cls: (m.trades.close_by?.liquidation ?? 0) > 0 ? 'down' : undefined,
+    }] : []),
     { k: '摩擦成本', v: `${(friction / m.initial_cents * 100).toFixed(2)}%`,
       n: `费用 ${fmtCompact(yuan(m.fee_cents))} + 滑点 ${fmtCompact(yuan(m.slippage_cents))} ${cur}` },
   ]
@@ -303,14 +312,48 @@ function Pager({ page, pages, setPage }: { page: number; pages: number; setPage:
   )
 }
 
+// CLOSE_LABEL 把成交 tag 译成人读的离场原因。
+//
+// **认不出来的 tag 原样显示**，不归到「其他」—— 策略可以自定 tag，
+// 把它们混成一堆就等于把归因扔了（A 股的 macd_death / ma_death 就是这样）。
+const CLOSE_LABEL: Record<string, string> = {
+  liquidation: '强平',
+  stop_loss: '止损',
+  take_profit: '止盈',
+  trailing_stop: '移动止损',
+  drawdown_halt: '熔断清仓',
+  tree_sell: '卖出信号',
+  tree_buy_invalid: '虚拟买入',
+}
+/** 需要显眼标出来的离场原因 —— 它们不是策略自己的决定。 */
+const CLOSE_ALERT = new Set(['liquidation', 'drawdown_halt', 'stop_loss'])
+
+function closeLabel(tag?: string): string {
+  if (!tag) return '未标注'
+  return CLOSE_LABEL[tag] ?? tag
+}
+
+type TripFilter = 'all' | 'real' | 'virtual'
+
 function TripTable({ rows, meta, cur }: { rows: RoundTrip[]; meta: Meta; cur: string }) {
   const [sortPnl, setSortPnl] = useState(false)
-  const sorted = useMemo(
-    () => (sortPnl ? [...rows].sort((a, b) => a.pnl - b.pnl) : rows),
-    [rows, sortPnl],
-  )
+  const [kind, setKind] = useState<TripFilter>('all')
+  const nVirtual = useMemo(() => rows.filter((r) => r.virtual).length, [rows])
+  const sorted = useMemo(() => {
+    const kept = kind === 'all' ? rows : rows.filter((r) => (kind === 'virtual') === !!r.virtual)
+    // 虚拟轮次没有金额，按盈亏排时用收益率
+    return sortPnl
+      ? [...kept].sort((a, b) => (a.virtual ? a.ratio : a.pnl / 1e9) - (b.virtual ? b.ratio : b.pnl / 1e9))
+      : kept
+  }, [rows, sortPnl, kind])
   const { page, pages, slice, setPage } = useLocalPage(sorted, 40)
   const cols: Col<RoundTrip>[] = [
+    {
+      key: 'kind', title: '仓位',
+      render: (r) => r.virtual
+        ? <span className="tag" title="策略说该买，但被「有效性」树挡下来了：没有真实成交、不占资金、不计入胜率">虚拟</span>
+        : <span className="muted">实仓</span>,
+    },
     { key: 'sym', title: '代码', render: (r) => <span className="mono">{r.symbol}</span> },
     { key: 'name', title: '名称', render: (r) => r.name },
     { key: 'open', title: '开仓', render: (r) => fmtDay(r.openDay) },
@@ -321,18 +364,43 @@ function TripTable({ rows, meta, cur }: { rows: RoundTrip[]; meta: Meta; cur: st
         r.short ? <span className="down">空</span> : <span className="up">多</span>,
     },
     {
-      key: 'qty', title: '数量', num: true,
-      render: (r) => fmtNum(r.qty / (r.qtyScale || 1)),
-    },
-    { key: 'cost', title: `成本(${cur})`, num: true, render: (r) => yuan(r.cost).toFixed(2) },
-    { key: 'proceed', title: `收入(${cur})`, num: true, render: (r) => yuan(r.proceed).toFixed(2) },
-    {
-      key: 'pnl', title: `盈亏(${cur})`, num: true, sort: 'pnl',
+      key: 'why', title: '离场原因',
       render: (r) => (
-        <span className={r.pnl > 0 ? 'up' : r.pnl < 0 ? 'down' : 'muted'}>
-          {r.pnl > 0 ? '+' : ''}{yuan(r.pnl).toFixed(2)}
+        <span className={CLOSE_ALERT.has(r.closeTag ?? '') ? 'down' : ''}>
+          {closeLabel(r.closeTag)}
         </span>
       ),
+    },
+    {
+      key: 'qty', title: '数量', num: true,
+      render: (r) => (r.virtual ? <span className="muted">—</span> : fmtNum(r.qty / (r.qtyScale || 1))),
+    },
+    {
+      key: 'cost', title: `成本(${cur})`, num: true,
+      render: (r) => (r.virtual ? <span className="muted">—</span> : yuan(r.cost).toFixed(2)),
+    },
+    {
+      key: 'proceed', title: `收入(${cur})`, num: true,
+      render: (r) => (r.virtual ? <span className="muted">—</span> : yuan(r.proceed).toFixed(2)),
+    },
+    {
+      key: 'pnl', title: `盈亏(${cur})`, num: true, sort: 'pnl',
+      render: (r) => {
+        // 虚拟持仓从未占用资金，编一个「本该赚多少钱」出来是假的 ——
+        // 收益率才是这笔决策唯一真实可算的东西
+        if (r.virtual) {
+          return (
+            <span className={r.ratio > 0 ? 'up' : r.ratio < 0 ? 'down' : 'muted'}>
+              {r.ratio > 0 ? '+' : ''}{(r.ratio * 100).toFixed(2)}%
+            </span>
+          )
+        }
+        return (
+          <span className={r.pnl > 0 ? 'up' : r.pnl < 0 ? 'down' : 'muted'}>
+            {r.pnl > 0 ? '+' : ''}{yuan(r.pnl).toFixed(2)}
+          </span>
+        )
+      },
     },
     {
       key: 'flag', title: '', render: (r) =>
@@ -342,20 +410,39 @@ function TripTable({ rows, meta, cur }: { rows: RoundTrip[]; meta: Meta; cur: st
   return (
     <>
       <div className="filters" style={{ marginBottom: 8 }}>
+        {nVirtual > 0 && ([
+          ['all', `全部 ${rows.length}`],
+          ['real', `实仓 ${rows.length - nVirtual}`],
+          ['virtual', `虚拟 ${nVirtual}`],
+        ] as const).map(([k, label]) => (
+          <span key={k} className={`chip ${kind === k ? 'on' : ''}`}
+            onClick={() => { setKind(k); setPage(1) }}>{label}</span>
+        ))}
         <button onClick={() => setSortPnl(!sortPnl)}>
           {sortPnl ? '按平仓时间排' : '按盈亏排（找最惨的）'}
         </button>
         <button onClick={() => downloadCSV('round_trips.csv',
-          ['symbol', 'name', 'open_day', 'close_day', 'hold_days', 'qty',
-           'cost_cents', 'proceed_cents', 'pnl_cents', 'from_bonus'],
-          rows.map((r) => [r.symbol, r.name, r.openDay, r.closeDay, r.holdDays,
-            r.qty, r.cost, r.proceed, r.pnl, r.fromBonus ? 1 : 0]))}>
+          ['symbol', 'name', 'virtual', 'short', 'open_day', 'close_day', 'hold_days',
+           'close_tag', 'qty', 'cost_cents', 'proceed_cents', 'pnl_cents', 'ratio',
+           'from_bonus'],
+          rows.map((r) => [r.symbol, r.name, r.virtual ? 1 : 0, r.short ? 1 : 0,
+            r.openDay, r.closeDay, r.holdDays, r.closeTag ?? '',
+            r.qty, r.cost, r.proceed, r.pnl, r.ratio, r.fromBonus ? 1 : 0]))}>
           导出全部 CSV
         </button>
         <span className="muted" style={{ alignSelf: 'center', fontSize: 12 }}>
           点任意一行进该标的 K 线，成交点会叠在图上
         </span>
       </div>
+      {nVirtual > 0 && (
+        <p className="note">
+          <strong>虚拟</strong>=「买入树说买、有效性树说不算数」的那些机会：
+          没有真实成交、不占用资金、不计入胜率与盈亏。
+          它们只有<strong>收益率</strong>没有金额 —— 从未经过仓位定量，
+          编一个「本该赚多少钱」出来是假的。
+          把虚拟与实仓并排看，才判断得出那棵有效性树到底该不该过滤它们。
+        </p>
+      )}
       <DataTable cols={cols} rows={slice} onRowClick={(r) => { location.hash = `/kline/${r.id}` }}
         empty="本次回测没有完整的一轮交易" />
       <Pager page={page} pages={pages} setPage={setPage} />
@@ -461,4 +548,23 @@ function RejectTable({ run }: { run: RunResult }) {
 
 function keyOf(r: RunReject): string {
   return r.rule ? `风控:${r.rule}` : r.reason
+}
+
+/** closeTop 占比最大的那个离场原因，用作卡片主数字。 */
+function closeTop(by?: Record<string, number>): string {
+  const entries = Object.entries(by ?? {})
+  if (!entries.length) return ''
+  // 强平优先显示 —— 哪怕只有一笔。它不是策略的决定，
+  // 被最常见的那个原因盖过去就等于没报
+  const liq = by?.liquidation ?? 0
+  if (liq > 0) return `强平 ${liq}`
+  const [tag, n] = entries.sort((a, b) => b[1] - a[1])[0]
+  return `${closeLabel(tag)} ${n}`
+}
+
+/** closeBreakdown 全部离场原因，按轮次数降序。 */
+function closeBreakdown(by?: Record<string, number>): string | undefined {
+  const entries = Object.entries(by ?? {}).sort((a, b) => b[1] - a[1])
+  if (!entries.length) return undefined
+  return entries.map(([tag, n]) => `${closeLabel(tag)} ${n}`).join(' · ')
 }

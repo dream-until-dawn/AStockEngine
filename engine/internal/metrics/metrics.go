@@ -90,6 +90,12 @@ type TradeStats struct {
 	// OpenCostCents 未平仓位的开仓金额（分）。跨标的可加，
 	// 也就是「还有多少钱没结算」的答案
 	OpenCostCents int64 `json:"open_cost_cents"`
+	// CloseBy 按离场原因分组的轮次数（成交 tag → 轮次数）。
+	//
+	// **正常卖出、止损、止盈、熔断清仓、强平**，四五种结局对
+	// 「策略行不行」的意义完全不同，只报一个胜率是看不出来的。
+	// 尤其是强平：它不是策略的决定，是市场施加的
+	CloseBy map[string]int `json:"close_by,omitempty"`
 }
 
 // BenchmarkStats 是相对基准的统计。
@@ -226,8 +232,10 @@ func computeTrades(fills []trading.Fill, hedge bool) TradeStats {
 	trips, open := MatchRoundTrips(fills, hedge)
 	var st TradeStats
 	st.RoundTrips = len(trips)
+	st.CloseBy = make(map[string]int, 4)
 	var holdSum float64
 	for _, t := range trips {
+		st.CloseBy[t.CloseTag]++
 		switch {
 		case t.PnLCents > 0:
 			st.Wins++

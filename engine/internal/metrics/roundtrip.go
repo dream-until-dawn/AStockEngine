@@ -26,6 +26,14 @@ type RoundTrip struct {
 	ProceedCents int64
 	PnLCents     int64
 	HoldDays     int
+	// OpenTag / CloseTag 开仓与平仓成交的 tag，**这一轮是怎么开的、
+	// 又是怎么结束的**。
+	//
+	// 没有它，逐轮表里所有的行长得一模一样：策略正常止盈平掉的、
+	// 被止损砍掉的、被熔断清仓的、被强平爆掉的 —— 全都只是一行数字。
+	// 而这四种结局对「策略行不行」的意义完全不同。
+	OpenTag  string
+	CloseTag string
 	// FromBonus 该轮的建仓份额来自送股 / 转增（零成本），而非买入。
 	//
 	// 送股不产生成交记录，但确实增加了可卖份额。若把这部分算成
@@ -38,6 +46,8 @@ type RoundTrip struct {
 type openLot struct {
 	day int32
 	qty int64
+	// tag 开仓那笔成交的 tag，随份额一路带到轮次上
+	tag string
 	// value 该层剩余份额在**开仓那一侧**的金额（分），已含开仓摩擦：
 	// 做多是付出去的成本，做空是收进来的所得
 	value int64
@@ -100,7 +110,7 @@ func MatchRoundTrips(
 				v = f.AmountCents - friction
 			}
 			queues[key] = append(queues[key], openLot{
-				day: f.At.TradingDay, qty: f.Qty, value: v,
+				day: f.At.TradingDay, qty: f.Qty, value: v, tag: f.Tag,
 			})
 			continue
 		}
@@ -139,8 +149,9 @@ func MatchRoundTrips(
 				OpenDay:    lot.day, CloseDay: f.At.TradingDay,
 				Qty: take, Short: short,
 				CostCents: cost, ProceedCents: proceed,
-				PnLCents:  proceed - cost,
-				HoldDays:  dayDiff(lot.day, f.At.TradingDay),
+				PnLCents: proceed - cost,
+				HoldDays: dayDiff(lot.day, f.At.TradingDay),
+				OpenTag:  lot.tag, CloseTag: f.Tag,
 				FromBonus: lot.bonus,
 			})
 

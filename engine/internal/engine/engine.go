@@ -213,6 +213,16 @@ func (e *Engine) Market() trading.Market { return e.market }
 // 不说出来的话，一个已经死掉的策略会显示成一个低波动策略。
 func (e *Engine) Failure() (bool, int32, string) { return e.risk.Failure() }
 
+// VirtualTrips 策略产生的虚拟轮次（被有效性判断过滤掉的机会）。
+// 策略不支持这个概念时返回 nil。
+func (e *Engine) VirtualTrips() []VirtualTrip {
+	vr, ok := e.strategy.(VirtualReporter)
+	if !ok {
+		return nil
+	}
+	return vr.VirtualTrips()
+}
+
 // Step 前进一个事件时点。
 //
 // 阶段顺序不可颠倒，每一处都有理由：
@@ -270,6 +280,7 @@ func (e *Engine) Step() (mktdata.TimePoint, error) {
 	//     强平是市场施加的，不是策略的决定。现货账本什么也不做
 	if liq := e.led.Mark(e.marks(), tp); len(liq) > 0 {
 		e.liquidations = append(e.liquidations, liq...)
+		e.recordLiquidationFills(liq, tp)
 	}
 
 	// 5. 权益快照与峰值。放在撮合之后、策略之前：
@@ -440,6 +451,45 @@ func (e *Engine) tryMatch(po *trading.PendingOrder, tp mktdata.TimePoint) bool {
 	e.fills = append(e.fills, fill)
 	fillDigest(e.resultHash, fill)
 	return true
+}
+
+// recordLiquidationFills 把强平补成一笔**成交记录**。
+//
+// # 为什么必须补
+//
+// 强平是账本自己动手平的仓，不走撮合器，所以从前一笔成交都不产生。
+// 后果是逐轮配对里那个仓位**永远配不上平仓**，一直挂在「未平仓」里 ——
+// 实测：336 笔开仓对 333 笔平仓，差的 3 笔中有 1 笔就是被强平的，
+// 而报告只说「未平仓 2 只」，看不出有一个仓位是爆掉的。
+//
+// 强平在事实上就是一笔交易：交易所按市价替你平了仓。
+// 它该计入成交额、该产生一轮完整的盈亏、该在逐轮里标出来。
+//
+// # 为什么不调 ApplyFill
+//
+// **账已经记过了**（Mark 里扣的保证金）。再记一次就是重复扣。
+// 这里只补「成交记录」这一面，不碰账本 —— 两者本来就是两件事，
+// 只是平时由 fillOne 一起做了。
+func (e *Engine) recordLiquidationFills(liq []trading.Liquidation, tp mktdata.TimePoint) {
+	for _, l := range liq {
+		// 平多要卖、平空要买 —— 与 exitOrder 同一张表
+		side := trading.SideSell
+		if l.Side == trading.SideSell {
+			side = trading.SideBuy
+		}
+		f := trading.Fill{
+			Order: trading.Order{
+				Instrument: l.Instrument, Side: side, Qty: l.Qty,
+				Reduce: true, Tag: trading.TagLiquidation,
+			},
+			At: tp, Price: l.Price, Qty: l.Qty,
+			AmountCents: l.NotionalCents,
+		}
+		e.fills = append(e.fills, f)
+		// **进指纹**：强平改变了持仓，是结果的一部分。
+		// 不进的话，两次运行只要强平不同、指纹却相同，C5 就漏了一块
+		fillDigest(e.resultHash, f)
+	}
 }
 
 // enqueue 给新订单定价并入队；可在本时点成交的立即撮合。

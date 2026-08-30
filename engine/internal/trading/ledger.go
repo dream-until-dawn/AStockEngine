@@ -119,6 +119,13 @@ func (e Exposure) AvgLongCostCents() int64 {
 //
 // 现货账户永远不产生它。留在接口里是因为强平**必须能被记录与展示** ——
 // 一次回测里出现强平却只表现为「权益突然掉了一截」，是最难查的那种失真。
+// 成交上的标准 Tag。策略与规则自定的 tag 不受限，
+// 但这几个由引擎/风控产生的必须是固定值 —— 报告按它们分类。
+const (
+	// TagLiquidation 强平。**不是策略的决定**，是市场施加的
+	TagLiquidation = "liquidation"
+)
+
 type Liquidation struct {
 	Instrument mktdata.InstrumentID
 	At         mktdata.TimePoint

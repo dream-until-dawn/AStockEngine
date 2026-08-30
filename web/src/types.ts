@@ -172,6 +172,10 @@ export type TradeStats = {
   bonus_trips: number
   open_positions: number
   open_qty: number
+  /** 未平仓位的开仓金额（分）。跨标的可加，数量不可加 */
+  open_cost_cents: number
+  /** 按离场原因分组的轮次数（成交 tag → 轮次数） */
+  close_by?: Record<string, number>
 }
 
 export type BenchmarkStats = {
@@ -253,6 +257,19 @@ export type RoundTrip = {
   qtyScale: number
   /** 这是一轮做空 —— 高开低平才是赚 */
   short: boolean
+  /** 收益率。真实轮次由金额算出；**虚拟轮次只有它** */
+  ratio: number
+  /**
+   * 虚拟持仓：策略说该买、被自己的「有效性」判断挡下来的那一轮。
+   *
+   * 没有真实成交，从未占用资金，也不计入胜率与盈亏 ——
+   * 但必须看得见：「有效性」这棵树的全部价值，
+   * 就在于它过滤掉的机会后来怎么样了。
+   */
+  virtual: boolean
+  /** 这一轮**是怎么开的、又是怎么结束的**（成交 tag） */
+  openTag?: string
+  closeTag?: string
 }
 
 // MarketInfo 本次回测所在市场的展示口径，由服务端从 Market 取。

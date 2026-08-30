@@ -1,0 +1,125 @@
+{
+  "name": "加密永续 · BTC/ETH · MACD 金叉（逐仓双向）",
+  "data": {
+    "root": "../../data",
+    "market": "crypto",
+    "freq": "1d",
+    "from": 20200101,
+    "to": 0,
+    "universe": {
+      "market": [
+        "crypto"
+      ],
+      "type": "all",
+      "status": "all"
+    }
+  },
+  "market": {
+    "impl": "crypto"
+  },
+  "fee": {
+    "impl": "config",
+    "params": {
+      "path": "../fee/crypto_okx.json"
+    }
+  },
+  "slippage": {
+    "impl": "fixed_bps",
+    "params": {
+      "bps": 5
+    }
+  },
+  "sizer": {
+    "impl": "equal_weight",
+    "params": {
+      "slots": 2,
+      "base": "initial"
+    }
+  },
+  "risk": [],
+  "exit": [],
+  "broker": {
+    "volume_cap_ppm": 100000,
+    "allow_partial_fill": true
+  },
+  "portfolio": {
+    "initial_cash_cents": 100000,
+    "dividend_tax_ppm": 0,
+    "ledger": "margin",
+    "leverage": 1,
+    "maint_margin_ppm": 5000
+  },
+  "engine": {
+    "indicator_adj": "none",
+    "imply_split_from_factor": false
+  },
+  "strategy": {
+    "impl": "rule_tree",
+    "params": {
+      "indicators": [
+        {
+          "name": "macd",
+          "kind": "macd",
+          "params": {
+            "short": 12,
+            "long": 26,
+            "signal": 9
+          }
+        },
+        {
+          "name": "rsi",
+          "kind": "rsi",
+          "params": {
+            "period": 14
+          }
+        }
+      ],
+      "direction": "long",
+      "buy": {
+        "left": {
+          "kind": "ind",
+          "ind": "macd",
+          "field": "DIF"
+        },
+        "cmp": "cross_above",
+        "right": {
+          "kind": "ind",
+          "ind": "macd",
+          "field": "DEA"
+        }
+      },
+      "valid": {
+        "left": {
+          "kind": "ind",
+          "ind": "rsi",
+          "field": "RSI"
+        },
+        "cmp": "lt",
+        "right": {
+          "kind": "value",
+          "value": 70
+        }
+      },
+      "sell": {
+        "left": {
+          "kind": "ind",
+          "ind": "macd",
+          "field": "DIF"
+        },
+        "cmp": "cross_below",
+        "right": {
+          "kind": "ind",
+          "ind": "macd",
+          "field": "DEA"
+        }
+      }
+    }
+  },
+  "metrics": {
+    "benchmark": "BTC-USDT-SWAP",
+    "risk_free_ppm": 0
+  },
+  "recorder": {
+    "level": "summary"
+  }
+}

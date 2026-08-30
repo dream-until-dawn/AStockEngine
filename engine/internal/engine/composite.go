@@ -114,6 +114,19 @@ func (c *Composite) NeedsShort() bool {
 	return false
 }
 
+// VirtualTrips 汇总各源的虚拟轮次。
+//
+// 双向配置下多头树与空头树各有各的被过滤机会，两边都要报。
+func (c *Composite) VirtualTrips() []VirtualTrip {
+	var out []VirtualTrip
+	for _, s := range c.sources {
+		if vr, ok := s.Strategy.(VirtualReporter); ok {
+			out = append(out, vr.VirtualTrips()...)
+		}
+	}
+	return out
+}
+
 func (c *Composite) Init(ic InitContext) error {
 	for i := range c.sources {
 		s := &c.sources[i]

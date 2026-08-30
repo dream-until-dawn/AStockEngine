@@ -507,3 +507,82 @@ func TestOpenCostIsCrossInstrumentAddable(t *testing.T) {
 		t.Errorf("未平仓金额 = %d，想要 2000000", st.OpenCostCents)
 	}
 }
+
+// ---- 离场原因 ----
+//
+// 没有 tag 的话，逐轮表里所有行长得一模一样：正常止盈平掉的、
+// 被止损砍掉的、被熔断清仓的、被强平爆掉的 —— 全都只是一行数字。
+// 而这几种结局对「策略行不行」的意义完全不同。
+
+func taggedFill(day int32, id int, side trading.Side, reduce bool,
+	price, qty int64, tag string) trading.Fill {
+
+	f := fill(day, id, side, price, qty, 0, 0)
+	f.Reduce = reduce
+	f.Tag = tag
+	return f
+}
+
+// TestRoundTripCarriesTags 开仓与平仓的 tag 都要带到轮次上。
+func TestRoundTripCarriesTags(t *testing.T) {
+	trips, _ := MatchRoundTrips([]trading.Fill{
+		taggedFill(20240102, 1, trading.SideBuy, false, 10_000, 1000, "tree_buy"),
+		taggedFill(20240110, 1, trading.SideSell, true, 9_000, 1000, "stop_loss"),
+	}, false)
+	if len(trips) != 1 {
+		t.Fatalf("配出 %d 轮，想要 1", len(trips))
+	}
+	if trips[0].OpenTag != "tree_buy" || trips[0].CloseTag != "stop_loss" {
+		t.Errorf("tag 没带过来：开 %q 平 %q", trips[0].OpenTag, trips[0].CloseTag)
+	}
+}
+
+// TestLiquidationClosesRoundTrip 强平必须能平掉一轮。
+//
+// **强平不走撮合器**，账本自己动手平仓，从前一笔成交都不产生 ——
+// 于是那个仓位永远配不上平仓，一直挂在「未平仓」里。
+// 实测：336 笔开仓对 333 笔平仓，差的 3 笔里有 1 笔就是被强平的，
+// 而报告只说「未平仓 2 只」，看不出有一个仓位是爆掉的。
+//
+// 引擎现在把强平补成一笔成交记录（不重复记账），配对因此能收口。
+func TestLiquidationClosesRoundTrip(t *testing.T) {
+	trips, open := MatchRoundTrips([]trading.Fill{
+		taggedFill(20240102, 1, trading.SideSell, false, 20_000, 1000, "tree_buy"),  // 开空
+		taggedFill(20240110, 1, trading.SideBuy, true, 30_000, 1000, "liquidation"), // 爆了
+	}, true)
+	if len(trips) != 1 {
+		t.Fatalf("强平应当平掉一轮，得到 %d 轮", len(trips))
+	}
+	if !trips[0].Short {
+		t.Error("被爆的是空头仓位")
+	}
+	if trips[0].CloseTag != "liquidation" {
+		t.Errorf("离场原因应是强平，得到 %q", trips[0].CloseTag)
+	}
+	// 空头 2.00 开、3.00 买回 → 亏 100 万分
+	if trips[0].PnLCents != -1_000_000 {
+		t.Errorf("盈亏 = %d，想要 -1000000", trips[0].PnLCents)
+	}
+	if len(open) != 0 {
+		t.Fatalf("被强平的仓位不该还挂在未平仓里：%+v", open)
+	}
+}
+
+// TestCloseByGroupsReasons 离场原因分组。
+func TestCloseByGroupsReasons(t *testing.T) {
+	st := computeTrades([]trading.Fill{
+		taggedFill(20240102, 1, trading.SideBuy, false, 10_000, 1000, "tree_buy"),
+		taggedFill(20240103, 2, trading.SideBuy, false, 10_000, 1000, "tree_buy"),
+		taggedFill(20240104, 3, trading.SideBuy, false, 10_000, 1000, "tree_buy"),
+		taggedFill(20240110, 1, trading.SideSell, true, 11_000, 1000, "take_profit"),
+		taggedFill(20240111, 2, trading.SideSell, true, 9_000, 1000, "stop_loss"),
+		taggedFill(20240112, 3, trading.SideSell, true, 9_500, 1000, "take_profit"),
+	}, false)
+
+	if st.RoundTrips != 3 {
+		t.Fatalf("应有 3 轮，得到 %d", st.RoundTrips)
+	}
+	if st.CloseBy["take_profit"] != 2 || st.CloseBy["stop_loss"] != 1 {
+		t.Errorf("离场原因分组错了：%v", st.CloseBy)
+	}
+}
