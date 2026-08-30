@@ -16,9 +16,13 @@ type RoundTrip struct {
 	OpenDay    int32
 	CloseDay   int32
 	Qty        int64
-	// CostCents 含买入时分摊的费用与滑点
+	// Short 这一轮是做空。多空的盈亏方向相反，报告要能分开看
+	Short bool
+	// CostCents 这一轮付出去的钱：做多是买入成本，做空是买回花费。
+	// 两者都含分摊到这一轮的费用与滑点
 	CostCents int64
-	// ProceedCents 已扣卖出时分摊的费用与滑点
+	// ProceedCents 这一轮收回来的钱：做多是卖出所得，做空是开仓所得。
+	// 已扣除对应一侧的费用与滑点
 	ProceedCents int64
 	PnLCents     int64
 	HoldDays     int
@@ -32,21 +36,51 @@ type RoundTrip struct {
 
 // openLot 是 FIFO 队列里的一层。
 type openLot struct {
-	day   int32
-	qty   int64
-	cost  int64 // 该层剩余份额对应的成本（分）
+	day int32
+	qty int64
+	// value 该层剩余份额在**开仓那一侧**的金额（分），已含开仓摩擦：
+	// 做多是付出去的成本，做空是收进来的所得
+	value int64
 	bonus bool
+}
+
+// lotKey 队列的键：标的 + 方向。
+//
+// **方向必须进键**：双向持仓下同一标的的多头与空头是两个独立的仓位，
+// 合用一个队列会让「开空」去配对「已有的多头」——
+// 那配出来的既不是一轮多头也不是一轮空头，只是两笔无关成交的差价。
+type lotKey struct {
+	id    mktdata.InstrumentID
+	short bool
 }
 
 // MatchRoundTrips 把成交流配成一轮轮交易。
 //
 // fills 必须按时间升序。返回的轮次也按平仓日升序。
 //
+// # hedge：一笔成交到底是开还是平
+//
+// 现货（hedge=false）只有一种可能：**买即开、卖即平**，`Reduce` 不看。
+// A 股的减仓卖出与清仓卖出都是平多，没有「卖出开仓」这回事。
+//
+// 双向合约（hedge=true）要看 `Reduce`，用的就是 trading.LegOf 那张表。
+//
+// 不区分的后果是：每一笔开空都会被当成「卖掉一个多头」——
+// 手上正好有多头就配出一轮方向错了的轮次（盈亏符号相反），
+// 没有就按送股零成本入队，凭空造出一轮。
+// 平空则会被当成开多，永远留在队列里不平。
+//
+// 注意**轮次数多于平仓笔数是正常的**：一笔平仓可以吃掉 FIFO 队列里的
+// 好几层，每层算一轮。所以「轮次 > 成交数 ÷ 2」本身不说明配对有问题。
+//
 // **卖出量超过已配对的买入量时，多出的部分按零成本入队。** 那是送股 /
 // 转增来的份额 —— 它们不产生成交记录，成本已经付在原有份额上，
 // 再计一次成本会让盈亏比虚高。这些轮次会被标上 FromBonus。
-func MatchRoundTrips(fills []trading.Fill) (trips []RoundTrip, openQty map[mktdata.InstrumentID]int64) {
-	queues := make(map[mktdata.InstrumentID][]openLot, 256)
+func MatchRoundTrips(
+	fills []trading.Fill, hedge bool,
+) (trips []RoundTrip, open map[mktdata.InstrumentID]OpenLeg) {
+
+	queues := make(map[lotKey][]openLot, 256)
 	trips = make([]RoundTrip, 0, len(fills)/2+1)
 
 	for _, f := range fills {
@@ -55,72 +89,133 @@ func MatchRoundTrips(fills []trading.Fill) (trips []RoundTrip, openQty map[mktda
 		}
 		// 摩擦成本（费用 + 滑点）随成交一并计入这一轮
 		friction := f.Fee.Total + f.SlippageCents
-		amount := trading.AmountCents(f.Price, f.Qty)
+		short, opening := legOf(f, hedge)
+		key := lotKey{id: f.Instrument, short: short}
 
-		if f.Side == trading.SideBuy {
-			queues[f.Instrument] = append(queues[f.Instrument], openLot{
-				day: f.At.TradingDay, qty: f.Qty, cost: amount + friction,
+		if opening {
+			// 开多是把钱付出去（成本 = 金额 + 摩擦），
+			// 开空是把钱收进来（所得 = 金额 − 摩擦）—— 符号相反
+			v := f.AmountCents + friction
+			if short {
+				v = f.AmountCents - friction
+			}
+			queues[key] = append(queues[key], openLot{
+				day: f.At.TradingDay, qty: f.Qty, value: v,
 			})
 			continue
 		}
 
-		// 卖出：从队首逐层配对
+		// 平仓：从队首逐层配对
 		remain := f.Qty
-		proceedTotal := amount - friction
-		q := queues[f.Instrument]
+		// 平多是收钱（所得 = 金额 − 摩擦），平空是付钱（花费 = 金额 + 摩擦）
+		closeTotal := f.AmountCents - friction
+		if short {
+			closeTotal = f.AmountCents + friction
+		}
+		q := queues[key]
 		for remain > 0 {
 			if len(q) == 0 {
-				// 没有对应的买入层 —— 这是送股 / 转增来的份额
-				q = append(q, openLot{day: f.At.TradingDay, qty: remain, cost: 0, bonus: true})
+				// 没有对应的开仓层 —— 现货下这是送股 / 转增来的份额。
+				// 合约下不该出现，出现了说明开平判断错了，
+				// FromBonus 会把它标出来
+				q = append(q, openLot{day: f.At.TradingDay, qty: remain, bonus: true})
 			}
 			lot := &q[0]
 			take := lot.qty
 			if take > remain {
 				take = remain
 			}
-			// 成本与收入都按份额比例分摊，保证逐层加总等于总额
-			costPart := lot.cost * take / lot.qty
-			proceedPart := proceedTotal * take / f.Qty
+			// 两侧都按份额比例分摊，保证逐层加总等于总额
+			openPart := lot.value * take / lot.qty
+			closePart := closeTotal * take / f.Qty
 
+			cost, proceed := openPart, closePart
+			if short {
+				// 做空反过来：开仓那一侧是收入，平仓那一侧才是成本
+				cost, proceed = closePart, openPart
+			}
 			trips = append(trips, RoundTrip{
 				Instrument: f.Instrument,
 				OpenDay:    lot.day, CloseDay: f.At.TradingDay,
-				Qty: take, CostCents: costPart, ProceedCents: proceedPart,
-				PnLCents:  proceedPart - costPart,
+				Qty: take, Short: short,
+				CostCents: cost, ProceedCents: proceed,
+				PnLCents:  proceed - cost,
 				HoldDays:  dayDiff(lot.day, f.At.TradingDay),
 				FromBonus: lot.bonus,
 			})
 
 			lot.qty -= take
-			lot.cost -= costPart
+			lot.value -= openPart
 			remain -= take
 			if lot.qty == 0 {
 				q = q[1:]
 			}
 		}
-		queues[f.Instrument] = q
+		queues[key] = q
 	}
 
-	// 回测结束时仍持有的份额不计入胜率 —— 未平仓既不是赢也不是输。
-	// 但要把数量报出来，藏起来会让胜率失真。
-	openQty = make(map[mktdata.InstrumentID]int64, len(queues))
-	for id, q := range queues {
-		var n int64
+	sortTrips(trips)
+	return trips, collectOpen(queues)
+}
+
+// legOf 判断一笔成交作用在哪个方向、是开还是平。
+func legOf(f trading.Fill, hedge bool) (short, opening bool) {
+	leg := trading.LegOf(f.Side, f.Reduce, hedge)
+	return leg.Short, leg.Opening
+}
+
+// OpenLeg 回测结束时某个标的仍未平掉的敞口。
+type OpenLeg struct {
+	// LongQty / ShortQty 定点数量。**不同标的的 scale 不同，
+	// 跨标的相加没有意义** —— 报告要报的是 CostCents
+	LongQty  int64
+	ShortQty int64
+	// CostCents 这些未平仓位的开仓金额（分）。它是跨标的可加的量，
+	// 也是「还有多少钱没结算」这个问题的答案
+	CostCents int64
+}
+
+// collectOpen 汇总回测结束时仍未平掉的仓位。
+//
+// 未平仓不计入胜率 —— 既不是赢也不是输。但要报出来，藏起来会让胜率失真。
+func collectOpen(queues map[lotKey][]openLot) map[mktdata.InstrumentID]OpenLeg {
+	out := make(map[mktdata.InstrumentID]OpenLeg, len(queues))
+	for k, q := range queues {
+		var qty, val int64
 		for _, l := range q {
-			n += l.qty
+			qty += l.qty
+			val += l.value
 		}
-		if n > 0 {
-			openQty[id] = n
+		if qty <= 0 {
+			continue
 		}
+		leg := out[k.id]
+		if k.short {
+			leg.ShortQty += qty
+		} else {
+			leg.LongQty += qty
+		}
+		leg.CostCents += val
+		out[k.id] = leg
 	}
+	return out
+}
 
+// sortTrips 把轮次按平仓日升序排好，同日按标的、再按方向排。
+//
+// **必须定序**：同一天平掉的多笔轮次来自不同队列，而队列存在 map 里，
+// 不排的话同一份配置两次跑出的逐轮明细顺序不同 ——
+// C5 就是在这类地方失守的。
+func sortTrips(trips []RoundTrip) {
 	sort.SliceStable(trips, func(i, j int) bool {
 		if trips[i].CloseDay != trips[j].CloseDay {
 			return trips[i].CloseDay < trips[j].CloseDay
 		}
-		return trips[i].Instrument < trips[j].Instrument
+		if trips[i].Instrument != trips[j].Instrument {
+			return trips[i].Instrument < trips[j].Instrument
+		}
+		return !trips[i].Short && trips[j].Short
 	})
-	return trips, openQty
 }
 
 // dayDiff 由两个 YYYYMMDD 估算相隔的自然日数。

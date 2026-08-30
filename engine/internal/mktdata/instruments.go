@@ -1,7 +1,10 @@
 package mktdata
 
 import (
+	"encoding/json"
 	"fmt"
+	"strconv"
+	"strings"
 
 	"github.com/parquet-go/parquet-go"
 )
@@ -118,6 +121,116 @@ type Instrument struct {
 	ListDate     int32
 	DelistDate   int32 // 0 表示在市
 	Status       Status
+
+	// ContractMult 合约乘数，定点 ×1e8。**每张合约代表多少标的**。
+	//
+	// A 股恒为 1（1e8）。加密永续来自 `attrs.ct_val`：
+	// 1 张 BTC-USDT-SWAP = 0.01 BTC，故为 1e6。
+	//
+	// 没有它，「数量」这一列就没有意义 —— 名义额 = 张数 × ct_val × 价格。
+	ContractMult int64
+	// Attrs 市场特定属性的原始 JSON，可空。
+	// 引擎只解出确实要用的字段（当前只有 ct_val），其余原样留着
+	Attrs string
+}
+
+// NotionalRatio 返回把 (定点价格 × 定点数量) 换算成**计价币种最小单位**
+// 的比值：
+//
+//	金额 = 价格_fp × 数量_fp × num / den
+//
+// 推导：金额(最小单位) = (价格_fp/price_scale) × (数量_fp/qty_scale)
+//
+//	× (乘数_fp/1e8) × 100
+//
+// A 股：num=1 den=**10** —— 与旧的 `price*qty/10` 完全一致。
+// 加密：num=1 den=**1e16**。
+//
+// # 为什么要一步步约分
+//
+// 直接算 `price_scale × qty_scale × 1e8` 在加密上是 **1e24**，
+// 它本身就溢出 int64。所以每乘一个因子就先约一次，
+// 让中间量始终留在 int64 内。
+//
+// 约分之后分母落得下，**但被除数落不下** ——
+// BTC 的 价格_fp × 数量_fp 实测到 1.25e21，远超 int64（SCHEMA 0.6）。
+// 所以除法必须走 128 位中间结果，见 trading.NotionalCents。
+func (i *Instrument) NotionalRatio() (num, den int64) {
+	mult := i.ContractMult
+	if mult <= 0 {
+		mult = contractMultOne
+	}
+	ps, qs := int64(i.PriceScale), int64(i.QtyScale)
+	if ps <= 0 {
+		ps = 1000
+	}
+	if qs <= 0 {
+		qs = 1
+	}
+	num, den = mult*100, int64(1)
+	for _, d := range [...]int64{contractMultOne, ps, qs} {
+		g := gcd(num, d)
+		num /= g
+		den *= d / g
+	}
+	return num, den
+}
+
+const contractMultOne = int64(100_000_000) // 1e8
+
+// parseContractMult 从 attrs 里取 ct_val 并换成定点 ×1e8。
+//
+// ct_val 在 ETL 里**存成字符串**（与 OKX 返回一致，见 SCHEMA 2.3）——
+// 转成 float 再存回去会引入一次没必要的精度损失，而这个值要参与金额计算。
+// 这里也用字符串解析：`strconv.ParseFloat` 后乘 1e8 会在 0.01 上
+// 得到 999999.9999999999，取整成 999999 —— 合约乘数差一，全部名义额跟着差。
+func parseContractMult(attrs string) int64 {
+	var m struct {
+		CtVal string `json:"ct_val"`
+	}
+	if err := json.Unmarshal([]byte(attrs), &m); err != nil || m.CtVal == "" {
+		return 0
+	}
+	return decimalToFixed(m.CtVal, contractMultOne)
+}
+
+// decimalToFixed 把十进制字符串按 scale 转成定点整数，**不经过 float**。
+//
+// 0.01 × 1e8：走 float64 会得到 999999.9999999999。差一个单位，
+// 名义额就跟着差 —— 而这类错不会报警，只会让账目一直偏一点点。
+func decimalToFixed(s string, scale int64) int64 {
+	neg := strings.HasPrefix(s, "-")
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "-"), "+")
+	intPart, frac, _ := strings.Cut(s, ".")
+	digits := 0
+	for scale > 1 {
+		scale /= 10
+		digits++
+	}
+	for len(frac) < digits {
+		frac += "0"
+	}
+	if len(frac) > digits {
+		frac = frac[:digits] // 超出 scale 的位直接截断，不四舍五入
+	}
+	v, err := strconv.ParseInt(intPart+frac, 10, 64)
+	if err != nil {
+		return 0
+	}
+	if neg {
+		return -v
+	}
+	return v
+}
+
+func gcd(a, b int64) int64 {
+	for b != 0 {
+		a, b = b, a%b
+	}
+	if a < 0 {
+		return -a
+	}
+	return a
 }
 
 type instrumentRow struct {
@@ -138,6 +251,13 @@ type instrumentRow struct {
 	// delist_date 可空。parquet-go 用指针表达可空列。
 	DelistDate *int32 `parquet:"delist_date,optional"`
 	StatusV    int8   `parquet:"status"`
+	// attrs 市场特定属性的 JSON。引擎**只解出确实要用的字段**
+	// （当前只有加密永续的 ct_val 合约乘数），其余原样留着。
+	//
+	// 不另立一列 contract_mult：那要改 schema 版本、改 ETL、重建
+	// instruments.parquet，而这里只是把已经写在 attrs 里的东西读出来。
+	// 7,202 行解一次 JSON，一次性开销可忽略。
+	Attrs *string `parquet:"attrs,optional"`
 }
 
 // Universe 是标的元数据的内存索引。
@@ -168,9 +288,16 @@ func LoadUniverse(path string) (*Universe, error) {
 			Type: InstrumentType(r.TypeV), Board: Board(r.BoardV),
 			TrackedBoard: Board(r.TrackedBoard),
 			PriceScale:   r.PriceScale, QtyScale: r.QtyScale,
-			QuoteCcy: Currency(r.QuoteCcy),
+			QuoteCcy:    Currency(r.QuoteCcy),
 			MinOrderQty: r.MinOrderQty, QtyStep: r.QtyStep,
 			ListDate: r.ListDate, DelistDate: delist, Status: Status(r.StatusV),
+			ContractMult: contractMultOne,
+		}
+		if r.Attrs != nil && *r.Attrs != "" {
+			inst.Attrs = *r.Attrs
+			if m := parseContractMult(*r.Attrs); m > 0 {
+				inst.ContractMult = m
+			}
 		}
 		u.byID[inst.ID] = inst
 		u.all = append(u.all, inst)

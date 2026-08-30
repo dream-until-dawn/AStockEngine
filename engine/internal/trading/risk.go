@@ -97,7 +97,7 @@ func shrinkToBudget(ctx RiskContext, o Order, budgetCents int64) int64 {
 	if inst == nil {
 		return 0
 	}
-	maxQty := budgetCents * 10 / bar.Close
+	maxQty := QtyForCents(inst, bar.Close, budgetCents)
 	if maxQty >= o.Qty {
 		return o.Qty
 	}

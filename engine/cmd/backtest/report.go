@@ -36,7 +36,8 @@ func printReport(r metrics.Result) {
 	d := r.MaxDrawdown
 	fmt.Printf("  最大回撤      %s   %d → %d（%d 个交易日）\n",
 		pctAbs(d.Ratio), d.PeakDay, d.TroughDay, d.TroughSteps)
-	fmt.Printf("                %.2f 元 → %.2f 元", cents(d.PeakCents), cents(d.TroughCents))
+	fmt.Printf("                %.2f %s → %.2f %s",
+		cents(d.PeakCents), money, cents(d.TroughCents), money)
 	if d.RecoveryDay != 0 {
 		fmt.Printf("，%d 恢复（%d 个交易日）\n", d.RecoveryDay, d.RecoverySteps)
 	} else if d.Ratio > 0 {
@@ -50,22 +51,25 @@ func printReport(r metrics.Result) {
 	fmt.Printf("  完整轮次      %d 轮（%d 赢 / %d 输 / %d 平）\n",
 		t.RoundTrips, t.Wins, t.Losses, t.Flat)
 	fmt.Printf("  胜率          %s      盈亏比 %s\n", pctAbs(t.WinRate), ratio(t.ProfitFactor))
-	fmt.Printf("  平均盈利      %.2f 元    平均亏损 %.2f 元    平均持有 %.1f 天\n",
-		cents(t.AvgWinCents), cents(t.AvgLossCents), t.AvgHoldDays)
+	fmt.Printf("  平均盈利      %.2f %s    平均亏损 %.2f %s    平均持有 %.1f 天\n",
+		cents(t.AvgWinCents), money, cents(t.AvgLossCents), money, t.AvgHoldDays)
 	if t.BonusTrips > 0 {
 		fmt.Printf("                其中 %d 轮的份额来自送股/转增（零成本入队）\n", t.BonusTrips)
 	}
 	if t.OpenPositions > 0 {
 		// 未平仓不计入胜率，但必须报出来 —— 藏起来会让胜率失真
-		fmt.Printf("  未平仓        %d 只 / %d 股，**不计入胜率**\n",
-			t.OpenPositions, t.OpenQty)
+		// 数量按定点值跨标的相加没有意义（加密的 scale 是 1e8），
+		// 报开仓金额 —— 它才是跨标的可加的量
+		fmt.Printf("  未平仓        %d 只，开仓金额 %.2f %s，不计入胜率\n",
+			t.OpenPositions, cents(t.OpenCostCents), money)
 	}
 	fmt.Println()
 
-	fmt.Printf("  单边成交额    %.2f 元    年化换手 %.2f 倍\n",
-		cents(r.TurnoverCents), r.Turnover)
-	fmt.Printf("  费用 %.2f 元 + 滑点 %.2f 元 = 摩擦 %.2f 元（占成交额 %s）\n",
-		cents(r.FeeCents), cents(r.SlippageCents), cents(r.FeeCents+r.SlippageCents),
+	fmt.Printf("  单边成交额    %.2f %s    年化换手 %.2f 倍\n",
+		cents(r.TurnoverCents), money, r.Turnover)
+	fmt.Printf("  费用 %.2f %s + 滑点 %.2f %s = 摩擦 %.2f %s（占成交额 %s）\n",
+		cents(r.FeeCents), money, cents(r.SlippageCents), money,
+		cents(r.FeeCents+r.SlippageCents), money,
 		pctOf(r.FeeCents+r.SlippageCents, r.TurnoverCents))
 
 	if r.Bench != nil {

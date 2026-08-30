@@ -78,17 +78,29 @@ type curvePoint struct {
 }
 
 type fillDTO struct {
-	D        int32  `json:"d"`
-	ID       int32  `json:"id"`
-	Symbol   string `json:"symbol"`
-	Name     string `json:"name"`
-	Side     string `json:"side"`
+	D      int32  `json:"d"`
+	ID     int32  `json:"id"`
+	Symbol string `json:"symbol"`
+	Name   string `json:"name"`
+	Side   string `json:"side"`
+	// Reduce 平仓单。双向市场下「卖」有两个意思，没有它读不出是平多还是开空
+	Reduce bool `json:"reduce"`
+	// Leg 人读的开平方向：开多 / 平多 / 开空 / 平空。
+	// 单向市场下就是「买」「卖」
+	Leg      string `json:"leg"`
 	Price    int64  `json:"price"`
 	Qty      int64  `json:"qty"`
 	Amount   int64  `json:"amount"`
 	Fee      int64  `json:"fee"`
 	Slippage int64  `json:"slippage"`
 	Tag      string `json:"tag"`
+	// PriceScale / QtyScale 这一行自己的定点标度。
+	//
+	// **不能用全局 scale**：A 股统一 1000，而 BTC 的价格标度是 1e4、
+	// 数量标度 1e8。拿全局值去除，加密的成交价会差好几个数量级 ——
+	// 而且是个看上去很正常的数字
+	PriceScale int32 `json:"priceScale"`
+	QtyScale   int32 `json:"qtyScale"`
 }
 
 type rejectDTO struct {
@@ -104,21 +116,43 @@ type rejectDTO struct {
 }
 
 type tripDTO struct {
-	ID        int32  `json:"id"`
-	Symbol    string `json:"symbol"`
-	Name      string `json:"name"`
-	OpenDay   int32  `json:"openDay"`
-	CloseDay  int32  `json:"closeDay"`
-	Qty       int64  `json:"qty"`
-	Cost      int64  `json:"cost"`
-	Proceed   int64  `json:"proceed"`
-	PnL       int64  `json:"pnl"`
-	HoldDays  int    `json:"holdDays"`
-	FromBonus bool   `json:"fromBonus"`
+	ID       int32  `json:"id"`
+	Symbol   string `json:"symbol"`
+	Name     string `json:"name"`
+	OpenDay  int32  `json:"openDay"`
+	CloseDay int32  `json:"closeDay"`
+	Qty      int64  `json:"qty"`
+	// QtyScale 这一行自己的数量标度。加密是 1e8，A 股是 1
+	QtyScale int32 `json:"qtyScale"`
+	// Short 这是一轮做空。盈亏方向相反，前端要能标出来
+	Short     bool  `json:"short"`
+	Cost      int64 `json:"cost"`
+	Proceed   int64 `json:"proceed"`
+	PnL       int64 `json:"pnl"`
+	HoldDays  int   `json:"holdDays"`
+	FromBonus bool  `json:"fromBonus"`
+}
+
+// marketInfo 本次回测所在市场的展示口径。
+//
+// **前端不能按市场名去查表**：查表漏了一个市场只会安静地印出「元」，
+// 而加密账户的余额不是元。由服务端从 Market 取，前端照抄。
+type marketInfo struct {
+	// Impl 市场规则实现名（ashare / crypto）
+	Impl string `json:"impl"`
+	// Money 计价单位，如「元」「USDT」
+	Money string `json:"money"`
+	// Qty 数量单位，如「股」「张」
+	Qty string `json:"qty"`
+	// Hedge 双向持仓。为真时成交要区分开多/开空/平多/平空
+	Hedge bool `json:"hedge"`
+	// AnnualDays 年化系数，报告里要标出来 —— A 股约 243、加密 365
+	AnnualDays float64 `json:"annualDays"`
 }
 
 type runResult struct {
 	Name        string          `json:"name"`
+	Market      marketInfo      `json:"market"`
 	Config      json.RawMessage `json:"config"`
 	Stats       runStats        `json:"stats"`
 	Fingerprint fingerprints    `json:"fingerprint"`
@@ -261,6 +295,7 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 		Fills:              rec.Fills(),
 		RiskFreePPM:        cfg.Metrics.RiskFreePPM,
 		TradingDaysPerYear: e.Market().AnnualDays(s.Cal, from, to),
+		Hedge:              e.Market().AllowsShort(),
 	}
 	benchByDay := map[int32]int64{}
 	if bd, be, ok := ds.BenchmarkCurve(); ok {
@@ -269,6 +304,11 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 		benchByDay = normalizeBench(bd, be, days, cfg.Portfolio.InitialCashCents)
 	}
 	res.Metrics = metrics.Compute(in)
+	money, qtyUnit := e.Market().Units()
+	res.Market = marketInfo{
+		Impl: e.Market().Name(), Money: money, Qty: qtyUnit,
+		Hedge: e.Market().AllowsShort(), AnnualDays: in.TradingDaysPerYear,
+	}
 
 	// ---- 曲线 ----
 	res.Curve = make([]curvePoint, 0, len(rec.Steps()))
@@ -285,19 +325,23 @@ func (s *Store) handleBacktest(w http.ResponseWriter, r *http.Request) {
 	fills := rec.Fills()
 	res.Fills = make([]fillDTO, 0, len(fills))
 	for _, f := range fills {
-		res.Fills = append(res.Fills, s.fillDTO(f))
+		res.Fills = append(res.Fills, s.fillDTO(f, e.Market().AllowsShort()))
 	}
-	trips, _ := metrics.MatchRoundTrips(fills)
+	trips, _ := metrics.MatchRoundTrips(fills, e.Market().AllowsShort())
 	res.RoundTrips = make([]tripDTO, 0, len(trips))
 	for _, t := range trips {
 		in := s.Uni.Get(t.Instrument)
 		d := tripDTO{
 			ID: int32(t.Instrument), OpenDay: t.OpenDay, CloseDay: t.CloseDay,
-			Qty: t.Qty, Cost: t.CostCents, Proceed: t.ProceedCents,
+			Qty: t.Qty, QtyScale: 1, Short: t.Short,
+			Cost: t.CostCents, Proceed: t.ProceedCents,
 			PnL: t.PnLCents, HoldDays: t.HoldDays, FromBonus: t.FromBonus,
 		}
 		if in != nil {
 			d.Symbol, d.Name = in.Symbol, in.Name
+			if in.QtyScale > 0 {
+				d.QtyScale = in.QtyScale
+			}
 		}
 		res.RoundTrips = append(res.RoundTrips, d)
 	}
@@ -391,16 +435,45 @@ func normalizeBench(bd []int32, be []int64, days []int32, initial int64) map[int
 	return out
 }
 
-func (s *Store) fillDTO(f trading.Fill) fillDTO {
+func (s *Store) fillDTO(f trading.Fill, hedge bool) fillDTO {
 	d := fillDTO{
 		D: f.At.TradingDay, ID: int32(f.Instrument), Side: sideName(f.Side),
-		Price: f.Price, Qty: f.Qty, Amount: trading.AmountCents(f.Price, f.Qty),
+		Reduce: f.Reduce, Leg: legName(f.Side, f.Reduce, hedge),
+		Price: f.Price, Qty: f.Qty, Amount: f.AmountCents,
 		Fee: f.Fee.Total, Slippage: f.SlippageCents, Tag: f.Tag,
+		PriceScale: 1000, QtyScale: 1,
 	}
 	if in := s.Uni.Get(f.Instrument); in != nil {
 		d.Symbol, d.Name = in.Symbol, in.Name
+		if in.PriceScale > 0 {
+			d.PriceScale = in.PriceScale
+		}
+		if in.QtyScale > 0 {
+			d.QtyScale = in.QtyScale
+		}
 	}
 	return d
+}
+
+// legName 把「买卖 + 开平」译成人读的开多 / 平多 / 开空 / 平空。
+//
+// 单向市场只说「买」「卖」—— 那里没有第二种可能，
+// 多写一个「开多」只是噪音。
+func legName(side trading.Side, reduce, hedge bool) string {
+	if !hedge {
+		return sideName(side)
+	}
+	leg := trading.LegOf(side, reduce, true)
+	switch {
+	case leg.Opening && !leg.Short:
+		return "开多"
+	case !leg.Opening && !leg.Short:
+		return "平多"
+	case leg.Opening && leg.Short:
+		return "开空"
+	default:
+		return "平空"
+	}
 }
 
 func (s *Store) rejectDTO(r trading.Rejection) rejectDTO {

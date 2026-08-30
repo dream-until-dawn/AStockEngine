@@ -44,6 +44,10 @@ type Input struct {
 	Benchmark *Curve
 	// BenchmarkName 基准标的代码，供报告标注
 	BenchmarkName string
+	// Hedge 该市场是否双向持仓。**决定一笔卖出是「平多」还是「开空」**，
+	// 判错会把每一次开空都配成一轮凭空的多头轮次。
+	// 由 Market.AllowsShort() 给出
+	Hedge bool
 }
 
 // Drawdown 一次回撤。
@@ -75,9 +79,17 @@ type TradeStats struct {
 	AvgHoldDays   float64 `json:"avg_hold_days"`
 	// BonusTrips 建仓份额来自送股/转增的轮次数，已计入上面的统计但单独报出
 	BonusTrips int `json:"bonus_trips"`
-	// OpenPositions 回测结束时仍持有的标的数与份额，**不计入胜率**
-	OpenPositions int   `json:"open_positions"`
-	OpenQty       int64 `json:"open_qty"`
+	// OpenPositions 回测结束时仍持有的标的数，**不计入胜率**
+	OpenPositions int `json:"open_positions"`
+	// OpenQty 未平仓的定点数量之和。
+	//
+	// **跨标的相加只在同一 scale 下有意义**：A 股全都是 1 股 = 1，
+	// 加起来就是股数；加密的 qty_scale 是 1e8，加起来是个没有单位的数。
+	// 报告要报的是 OpenCostCents
+	OpenQty int64 `json:"open_qty"`
+	// OpenCostCents 未平仓位的开仓金额（分）。跨标的可加，
+	// 也就是「还有多少钱没结算」的答案
+	OpenCostCents int64 `json:"open_cost_cents"`
 }
 
 // BenchmarkStats 是相对基准的统计。
@@ -195,7 +207,7 @@ func Compute(in Input) Result {
 
 	// 成交统计
 	for _, f := range in.Fills {
-		r.TurnoverCents += trading.AmountCents(f.Price, f.Qty)
+		r.TurnoverCents += f.AmountCents
 		r.FeeCents += f.Fee.Total
 		r.SlippageCents += f.SlippageCents
 	}
@@ -203,15 +215,15 @@ func Compute(in Input) Result {
 		r.Turnover = float64(r.TurnoverCents) / avg / r.Years
 	}
 
-	r.Trades = computeTrades(in.Fills)
+	r.Trades = computeTrades(in.Fills, in.Hedge)
 	if in.Benchmark != nil && in.Benchmark.Len() > 0 {
 		r.Bench = computeBenchmark(in, tpy)
 	}
 	return r
 }
 
-func computeTrades(fills []trading.Fill) TradeStats {
-	trips, open := MatchRoundTrips(fills)
+func computeTrades(fills []trading.Fill, hedge bool) TradeStats {
+	trips, open := MatchRoundTrips(fills, hedge)
 	var st TradeStats
 	st.RoundTrips = len(trips)
 	var holdSum float64
@@ -247,8 +259,9 @@ func computeTrades(fills []trading.Fill) TradeStats {
 		st.ProfitFactor = math.Inf(1) // 从未亏过
 	}
 	st.OpenPositions = len(open)
-	for _, q := range open {
-		st.OpenQty += q
+	for _, leg := range open {
+		st.OpenQty += leg.LongQty + leg.ShortQty
+		st.OpenCostCents += leg.CostCents
 	}
 	return st
 }

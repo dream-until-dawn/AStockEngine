@@ -20,8 +20,17 @@ type Order struct {
 	Side       Side
 	Type       OrderType
 	Qty        int64
-	LimitPrice int64  // 仅限价单，定点
-	Tag        string // 策略自定，用于归因
+	LimitPrice int64 // 仅限价单，定点
+	// Reduce 平仓单。**双向持仓下缺了它就无法判断意图**：
+	//
+	//	买 + 开 = 开多      买 + 平 = 平空
+	//	卖 + 开 = 开空      卖 + 平 = 平多
+	//
+	// 现货账本忽略它（卖出永远是平多）。由 Sizer 从
+	// Signal.Kind == SignalExit 设置 —— 信号层本来就区分开平，
+	// 只是这个区分在折算成订单时被丢掉了。
+	Reduce bool
+	Tag    string // 策略自定，用于归因
 }
 
 // PendingOrder 是已定价、等待成交的订单。
@@ -96,7 +105,13 @@ type Fill struct {
 	// 也无法与行情数据核对。
 	Price int64 // 定点成交价
 	Qty   int64
-	Fee   FeeBreakdown
+	// AmountCents 名义额，计价币种的最小单位（A 股 = 分，加密 = 0.01 USDT）。
+	//
+	// **由撮合器算好放进来**，账本与绩效不再各算一遍。理由有两个：
+	// 一是换算要知道标的的 scale 与合约乘数，而账本手里没有标的表；
+	// 二是同一笔成交的金额在三处各算一次，迟早会有一处口径不同。
+	AmountCents int64
+	Fee         FeeBreakdown
 	// SlippageCents 执行摩擦（分）。它不是「费用」——
 	// 佣金印花税过户费是付给第三方的真金白银，滑点是执行质量的损耗，
 	// 两者分开记，费用合计才能与券商对账单对得上。
@@ -114,6 +129,16 @@ type Rejection struct {
 	// v0.4 的单步调试两个都要展示。
 	Rule   string
 	Detail string
+}
+
+// WithAmount 补上名义额，供**手工构造 Fill** 的地方使用（主要是测试）。
+//
+// 生产路径只有 Broker.Match 会造 Fill，它自己算好。但 AmountCents 漏填
+// 就是 0，而 0 不会报错 —— 账目会安静地少掉这一笔。
+// 与其靠每处记得填，不如给一个补齐的入口。
+func (f Fill) WithAmount(in *mktdata.Instrument) Fill {
+	f.AmountCents = NotionalCents(in, f.Price, f.Qty)
+	return f
 }
 
 // Slippage 滑点模型，可插拔。
@@ -141,7 +166,10 @@ type Slippage interface {
 	Name() string
 	// CostCents 返回这笔成交因滑点付出的额外成本（分，恒为非负）。
 	// 买入时加到成本上，卖出时从收入里扣掉。
-	CostCents(side Side, price int64, qty int64, b mktdata.Bar) int64
+	//
+	// **收的是名义额而不是 (价格, 数量)**：换算成金额要知道标的的
+	// scale 与合约乘数，滑点模型不该也去操心这个。
+	CostCents(side Side, amountCents int64, b mktdata.Bar) int64
 }
 
 // NoSlippage 无滑点，用于隔离测试。
@@ -149,19 +177,15 @@ type NoSlippage struct{}
 
 func (NoSlippage) Name() string { return "none" }
 
-func (NoSlippage) CostCents(Side, int64, int64, mktdata.Bar) int64 { return 0 }
+func (NoSlippage) CostCents(Side, int64, mktdata.Bar) int64 { return 0 }
 
 // BpsSlippage 固定基点滑点：按成交额的万分之 Bps/10 计成本。
 type BpsSlippage struct{ Bps int64 }
 
 func (s BpsSlippage) Name() string { return "fixed_bps" }
 
-func (s BpsSlippage) CostCents(_ Side, price, qty int64, _ mktdata.Bar) int64 {
-	if s.Bps <= 0 || qty <= 0 {
-		return 0
-	}
-	amount := AmountCents(price, qty)
-	if amount <= 0 {
+func (s BpsSlippage) CostCents(_ Side, amount int64, _ mktdata.Bar) int64 {
+	if s.Bps <= 0 || amount <= 0 {
 		return 0
 	}
 	// 四舍五入到分。这里的取整误差是 1 分对上万分，无关紧要 ——
@@ -329,7 +353,10 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 	}
 
 	// 成交量占比上限
-	cap := b.Volume * br.Cfg.VolumeCapPPM / 1_000_000
+	// 走 128 位：BTC 的日成交量定点值到 1.25e17，直接乘 100000 ppm
+	// 是 1.25e22，**回绕之后上限变成一个很小的数**，于是所有单子
+	// 都被判成「超出成交量占比上限」—— 实测踩过这一脚
+	cap := MulDiv(b.Volume, br.Cfg.VolumeCapPPM, 1_000_000)
 	if cap <= 0 {
 		return rej(RejectVolumeCap, "当日成交量为 0")
 	}
@@ -346,15 +373,17 @@ func (br *Broker) Match(po *PendingOrder, inst *mktdata.Instrument, b mktdata.Ba
 	}
 
 	// 资金 / 持仓校验
-	amount := AmountCents(price, qty)
+	// 名义额按**标的自己的 scale 与合约乘数**算，且走 128 位中间结果 ——
+	// BTC 的 价格_fp × 数量_fp 实测到 1.25e21，直接相乘会静默回绕（SCHEMA 0.6）
+	amount := NotionalCents(inst, price, qty)
 	fee := br.Fee.Calc(FeeRequest{
 		Instrument: inst, Side: po.Side, Qty: qty,
 		AmountCents: amount, TradingDay: b.TradingDay,
 	})
-	slip := br.Slippage.CostCents(po.Side, price, qty, b)
+	slip := br.Slippage.CostCents(po.Side, amount, b)
 	fill := Fill{
 		Order: po.Order, At: now, Price: price, Qty: qty,
-		Fee: fee, SlippageCents: slip,
+		AmountCents: amount, Fee: fee, SlippageCents: slip,
 	}
 
 	// **可行性由账本判断，不由撮合器判断。**

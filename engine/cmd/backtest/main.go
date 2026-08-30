@@ -133,18 +133,25 @@ func main() {
 	dur := time.Since(t1)
 	rec := e.Recorder()
 
+	// 计价与数量单位由市场给出。加密账户的余额不是「元」，持仓也不是「股」——
+	// 单位印错的数字看上去完全正常，是最难被发现的一类错
+	money, qtyUnit = e.Market().Units()
+
 	led := e.Ledger()
 	final := e.EquityCents()
 	fmt.Println("=== 结果 ===")
 	fmt.Printf("  步数 %d  耗时 %v\n", e.Steps(), dur.Round(time.Millisecond))
 	fmt.Printf("  信号 %d 条  成交 %d 笔  拒单 %d 笔\n", signals, fills, rejects)
-	fmt.Printf("  初始 %.2f 元 → 权益 %.2f 元（%+.2f%%）\n",
-		cents(initial), cents(final), float64(final-initial)/float64(initial)*100)
-	fmt.Printf("  现金 %.2f 元  持仓 %d 只  已实现 %.2f 元\n",
-		cents(led.CashCents()), led.NumPositions(), cents(led.RealizedCents()))
-	fmt.Printf("  峰值权益 %.2f 元\n", cents(e.PeakEquityCents()))
-	fmt.Printf("  费用合计 %.2f 元（占初始 %.2f%%）",
-		cents(led.TotalFeeCents()), float64(led.TotalFeeCents())/float64(initial)*100)
+	fmt.Printf("  初始 %.2f %s → 权益 %.2f %s（%+.2f%%）\n",
+		cents(initial), money, cents(final), money,
+		float64(final-initial)/float64(initial)*100)
+	fmt.Printf("  现金 %.2f %s  持仓 %d 只  已实现 %.2f %s\n",
+		cents(led.CashCents()), money, led.NumPositions(),
+		cents(led.RealizedCents()), money)
+	fmt.Printf("  峰值权益 %.2f %s\n", cents(e.PeakEquityCents()), money)
+	fmt.Printf("  费用合计 %.2f %s（占初始 %.2f%%）",
+		cents(led.TotalFeeCents()), money,
+		float64(led.TotalFeeCents())/float64(initial)*100)
 	fees := led.FeeCents()
 	for _, k := range sortedKeys(fees) {
 		fmt.Printf("  %s %.2f", k, cents(fees[k]))
@@ -152,9 +159,10 @@ func main() {
 	fmt.Println()
 	// 滑点单列。它以前藏在成交价里，报告只看得到佣金印花税，
 	// 看不到执行摩擦到底吃掉多少 —— 而它经常比佣金还大
-	fmt.Printf("  滑点合计 %.2f 元（占初始 %.2f%%）  摩擦合计 %.2f 元\n",
-		cents(led.SlippageCents()), float64(led.SlippageCents())/float64(initial)*100,
-		cents(led.TotalFeeCents()+led.SlippageCents()))
+	fmt.Printf("  滑点合计 %.2f %s（占初始 %.2f%%）  摩擦合计 %.2f %s\n",
+		cents(led.SlippageCents()), money,
+		float64(led.SlippageCents())/float64(initial)*100,
+		cents(led.TotalFeeCents()+led.SlippageCents()), money)
 
 	if len(rejectBy) > 0 {
 		fmt.Println("  拒单原因分布：")
@@ -326,6 +334,14 @@ func writeCurve(path string, curve []record.Step) error {
 }
 
 func cents(v int64) float64 { return float64(v) / 100 }
+
+// money / qtyUnit 是本次回测所在市场的计价与数量单位，由 Market.Units() 给出，
+// 在装配完成后一次性设好。
+//
+// 包级变量在这里是够用的：backtest 是一次跑一份配置的命令行程序，
+// 一个进程内只有一个市场。写成参数要穿过七八个打印函数，
+// 而它们做的只是拼字符串。
+var money, qtyUnit = "元", "股"
 
 func sortedKeys(m map[string]int64) []string {
 	out := make([]string, 0, len(m))

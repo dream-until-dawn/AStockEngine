@@ -49,6 +49,7 @@ func ComputeMetrics(
 		InitialCents: cfg.Portfolio.InitialCashCents,
 		Fills:        rec.Fills(),
 		RiskFreePPM:  cfg.Metrics.RiskFreePPM,
+		Hedge:        mkt.AllowsShort(),
 	}
 	var from, to int32
 	if len(days) > 0 {

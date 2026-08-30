@@ -87,8 +87,23 @@ type BrokerCfg struct {
 
 // PortfolioCfg 账户参数。
 type PortfolioCfg struct {
+	// InitialCashCents 初始资金，**计价币种的最小单位**。
+	//
+	// A 股 = 分（默认 20,000 元 = 2,000,000）
+	// 加密 = 0.01 USDT（默认 1,000 USDT = 100,000）
+	//
+	// 默认值随 data.market 变 —— 把 100 万元的默认值原样搬到
+	// 加密上就是 100 万 USDT，那不是一个散户的账户
 	InitialCashCents int64 `json:"initial_cash_cents"`
 	DividendTaxPPM   int64 `json:"dividend_tax_ppm"`
+	// Ledger 账本实现：spot（现货，仅多）/ margin（逐仓双向）。
+	// 空表示按市场选：A 股 spot，加密 margin
+	Ledger string `json:"ledger,omitempty"`
+	// Leverage 杠杆倍数，仅 margin 账本有意义。默认 1
+	Leverage int64 `json:"leverage,omitempty"`
+	// MaintMarginPPM 维持保证金率（百万分之一），仅 margin 有意义。
+	// 默认 5000（0.5%），与主流交易所 BTC 永续的量级一致
+	MaintMarginPPM int64 `json:"maint_margin_ppm,omitempty"`
 }
 
 // EngineCfg 引擎参数。
@@ -198,8 +213,11 @@ func (c *Config) applyDefaults() {
 	if c.Data.Freq == "" {
 		c.Data.Freq = "1d"
 	}
+	// **默认值随市场变。** 把 A 股的默认原样搬到加密上，
+	// 得到的是「用 A 股规则跑 BTC」或「100 万 USDT 的账户」——
+	// 两者都不报错，只是结果没有意义
 	if c.Market.Impl == "" {
-		c.Market.Impl = "ashare"
+		c.Market.Impl = defaultMarketImpl(c.Data.Market)
 	}
 	if c.Fee.Impl == "" {
 		c.Fee.Impl = "zero"
@@ -214,7 +232,16 @@ func (c *Config) applyDefaults() {
 		c.Broker.VolumeCapPPM = 100_000
 	}
 	if c.Portfolio.InitialCashCents <= 0 {
-		c.Portfolio.InitialCashCents = 100_000_000 // 100 万元
+		c.Portfolio.InitialCashCents = defaultCashCents(c.Data.Market)
+	}
+	if c.Portfolio.Ledger == "" {
+		c.Portfolio.Ledger = defaultLedger(c.Data.Market)
+	}
+	if c.Portfolio.Leverage <= 0 {
+		c.Portfolio.Leverage = 1
+	}
+	if c.Portfolio.MaintMarginPPM <= 0 {
+		c.Portfolio.MaintMarginPPM = 5_000 // 0.5%
 	}
 	if c.Engine.IndicatorAdj == "" {
 		c.Engine.IndicatorAdj = "hfq"
@@ -355,6 +382,53 @@ func (c *Config) dryBuild() error {
 
 const compositeImpl = "composite"
 
+// 按市场的默认值。**一处定义**，配置层与前端都从这里取 ——
+// 抄一份到别处就会分叉，然后出现「界面显示 1000 USDT、引擎按 100 万跑」。
+const (
+	marketCrypto = "crypto"
+	// defaultCashAShare 20,000 元。散户量级；
+	// 太大会让「一手买不起」这类真实约束在回测里消失
+	defaultCashAShare = int64(2_000_000)
+	// defaultCashCrypto 1,000 USDT（单位 0.01 USDT）
+	defaultCashCrypto = int64(100_000)
+)
+
+func defaultMarketImpl(market string) string {
+	if market == marketCrypto {
+		return marketCrypto
+	}
+	return "ashare"
+}
+
+func defaultCashCents(market string) int64 {
+	if market == marketCrypto {
+		return defaultCashCrypto
+	}
+	return defaultCashAShare
+}
+
+// defaultLedger 加密用逐仓双向，A 股用现货。
+//
+// A 股普通账户不能做空（融资融券本项目明确不建模），
+// 给它一个保证金账本只会让策略以为能开空。
+func defaultLedger(market string) string {
+	if market == marketCrypto {
+		return "margin"
+	}
+	return "spot"
+}
+
+// DefaultBenchmark 各市场的默认基准标的。
+//
+// A 股没有指数数据（C10 纯技术面，ETL 没拉指数行情），只能用宽基 ETF
+// 代理；加密用 BTC 永续本身 —— 它就是这个市场的「大盘」。
+func DefaultBenchmark(market string) string {
+	if market == marketCrypto {
+		return "BTC-USDT-SWAP"
+	}
+	return ""
+}
+
 // validateComposite 在跑之前把组合策略能查的都查掉。
 func validateComposite(m Module) error {
 	if _, err := eng.ParseCombineMode(m.Mode); err != nil {
@@ -372,6 +446,16 @@ func validateComposite(m Module) error {
 		if !eng.Strategies.Has(src.Impl) {
 			return fmt.Errorf("strategy.sources[%d]: 未知实现 %q，可选：%s",
 				i, src.Impl, strings.Join(eng.Strategies.Names(), " / "))
+		}
+		// 结构化配置的源（规则树）自己校验，而且查得更细 ——
+		// 它没有 ParamSpec，按标量去解必然失败
+		if st, err := eng.Strategies.Build(src.Impl, nil); err == nil {
+			if cs, ok := st.(eng.ConfigurableStrategy); ok {
+				if err := cs.Configure(src.Params); err != nil {
+					return fmt.Errorf("strategy.sources[%d].params: %w", i, err)
+				}
+				continue
+			}
 		}
 		specs, _ := eng.Strategies.Specs(src.Impl)
 		p, err := decodeStrategyParams(specs, src.Params)

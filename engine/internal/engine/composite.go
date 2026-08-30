@@ -73,10 +73,13 @@ type Source struct {
 type Composite struct {
 	sources []Source
 	mode    CombineMode
+	// hedge 所在市场是否双向持仓。**决定「卖」是平多还是开空**，
+	// 从而决定两个源发出的信号算不算同一个动作
+	hedge bool
 }
 
 // NewComposite 装配组合策略。
-func NewComposite(mode CombineMode, sources []Source) (*Composite, error) {
+func NewComposite(mode CombineMode, sources []Source, hedge bool) (*Composite, error) {
 	if len(sources) == 0 {
 		return nil, fmt.Errorf("组合策略至少要有一个决策源")
 	}
@@ -84,7 +87,7 @@ func NewComposite(mode CombineMode, sources []Source) (*Composite, error) {
 		return nil, fmt.Errorf("只有一个决策源时 %s 没有意义 —— "+
 			"confirm 会原样通过，veto 没有否决者", mode)
 	}
-	return &Composite{sources: sources, mode: mode}, nil
+	return &Composite{sources: sources, mode: mode, hedge: hedge}, nil
 }
 
 func (c *Composite) Name() string {
@@ -124,35 +127,51 @@ func (c *Composite) OnBar(ctx StepContext) ([]Signal, error) {
 
 	switch c.mode {
 	case CombineConfirm:
-		return combineConfirm(perSource), nil
+		return c.combineConfirm(perSource), nil
 	case CombineVeto:
-		return combineVeto(perSource), nil
+		return c.combineVeto(perSource), nil
 	default:
-		return combineUnion(perSource), nil
+		return c.combineUnion(perSource), nil
 	}
 }
 
 // sigKey 标识「同一只标的的同一个动作」。
 //
-// 用 (标的, 方向) 而不是 (标的, Kind)：Enter 与 Target 都是加仓意图，
-// 合并时该当成一回事；真正互斥的是买与卖。
+// 单向市场用 (标的, 方向)：Enter 与 Target 都是加仓意图，合并时该当成
+// 一回事；真正互斥的是买与卖。
+//
+// # 双向市场必须再加上仓位槽
+//
+// 「卖」在双向下有两个完全不同的意思：**平多**与**开空**。
+// 一多一空两棵镜像的树组在一起时，MACD 下穿那一根上
+// 多头树发「平多（卖）」、空头树发「开空（卖）」——
+// 只按 (标的, 卖) 去重，后者会被前者顶掉，而且不报任何错。
+// 实测：336 笔成交里只有 2 笔是开空，整个空头腿等于没接上。
 type sigKey struct {
 	id   mktdata.InstrumentID
 	side trading.Side
+	// leg 仓位槽与开平。单向市场下恒为零值，键退化成 (标的, 方向)
+	leg trading.PosLeg
 }
 
-func keyOf(s Signal) sigKey { return sigKey{s.Instrument, s.Side} }
+func (c *Composite) keyOf(s Signal) sigKey {
+	k := sigKey{id: s.Instrument, side: s.Side}
+	if c.hedge {
+		k.leg = trading.LegOf(s.Side, s.Kind == SignalExit, true)
+	}
+	return k
+}
 
 // combineUnion 并集，同标的同方向保留第一个源的。
 //
 // **保留第一个而不是最后一个**：源的顺序在配置里是显式写的，
 // 靠前即优先，这样「主策略 + 补充策略」的意图能直接表达。
-func combineUnion(per [][]Signal) []Signal {
+func (c *Composite) combineUnion(per [][]Signal) []Signal {
 	seen := make(map[sigKey]bool, 64)
 	out := make([]Signal, 0, 64)
 	for _, sigs := range per {
 		for _, s := range sigs {
-			k := keyOf(s)
+			k := c.keyOf(s)
 			if seen[k] {
 				continue
 			}
@@ -166,7 +185,7 @@ func combineUnion(per [][]Signal) []Signal {
 // combineConfirm 交集：所有源都发出同向信号才采纳。
 //
 // Strength 取各源的**最小值** —— 一组判断的可信度不高于其中最弱的那个。
-func combineConfirm(per [][]Signal) []Signal {
+func (c *Composite) combineConfirm(per [][]Signal) []Signal {
 	if len(per) == 0 {
 		return nil
 	}
@@ -175,7 +194,7 @@ func combineConfirm(per [][]Signal) []Signal {
 	for _, sigs := range per {
 		local := make(map[sigKey]bool, len(sigs))
 		for _, s := range sigs {
-			k := keyOf(s)
+			k := c.keyOf(s)
 			if local[k] {
 				continue // 同一源内重复只算一次
 			}
@@ -188,7 +207,7 @@ func combineConfirm(per [][]Signal) []Signal {
 	}
 	out := make([]Signal, 0, 32)
 	for _, s := range per[0] {
-		k := keyOf(s)
+		k := c.keyOf(s)
 		if count[k] != len(per) {
 			continue
 		}
@@ -199,24 +218,33 @@ func combineConfirm(per [][]Signal) []Signal {
 	return out
 }
 
+// vetoKey 否决只认 (标的, 方向)。
+//
+// **不带仓位槽**：否决表达的是「这只标的这个方向别做」，
+// 而不是「别平多但可以开空」—— 后者不是一个覆盖层能表达的意图。
+type vetoKey struct {
+	id   mktdata.InstrumentID
+	side trading.Side
+}
+
 // combineVeto 否决：第一个源出信号，后续源的**反向**信号把它挡掉。
 //
 // 「反向」= 同一标的、相反方向。AI 覆盖层只需要在不看好的标的上
 // 发一个反向信号，不必替你选股。
-func combineVeto(per [][]Signal) []Signal {
+func (c *Composite) combineVeto(per [][]Signal) []Signal {
 	if len(per) == 0 {
 		return nil
 	}
-	vetoed := make(map[sigKey]bool, 32)
+	vetoed := make(map[vetoKey]bool, 32)
 	for _, sigs := range per[1:] {
 		for _, s := range sigs {
 			// 记下「反对方向」：卖单否决买信号，买单否决卖信号
-			vetoed[sigKey{s.Instrument, opposite(s.Side)}] = true
+			vetoed[vetoKey{s.Instrument, opposite(s.Side)}] = true
 		}
 	}
 	out := make([]Signal, 0, len(per[0]))
 	for _, s := range per[0] {
-		if vetoed[keyOf(s)] {
+		if vetoed[vetoKey{s.Instrument, s.Side}] {
 			continue
 		}
 		out = append(out, s)

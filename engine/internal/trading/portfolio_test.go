@@ -45,7 +45,7 @@ func TestManualCheckStockRoundTrip(t *testing.T) {
 	}
 
 	fill := Fill{Order: Order{Instrument: inst.ID, Side: SideBuy, Qty: buyQty},
-		Price: buyPrice, Qty: buyQty, Fee: buyFee}
+		Price: buyPrice, Qty: buyQty, Fee: buyFee}.WithAmount(inst)
 	if err := pf.ApplyFill(fill, 1_000_000_000); err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +77,7 @@ func TestManualCheckStockRoundTrip(t *testing.T) {
 	}
 
 	sf := Fill{Order: Order{Instrument: inst.ID, Side: SideSell, Qty: buyQty},
-		Price: sellPrice, Qty: buyQty, Fee: sellFee}
+		Price: sellPrice, Qty: buyQty, Fee: sellFee}.WithAmount(inst)
 	if err := pf.ApplyFill(sf, 0); err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestT1Settlement(t *testing.T) {
 	now := int64(1_700_000_000_000)
 
 	fill := Fill{Order: Order{Instrument: inst.ID, Side: SideBuy, Qty: 1000},
-		Price: 10_000, Qty: 1000, Fee: FeeBreakdown{Items: map[string]int64{}}}
+		Price: 10_000, Qty: 1000, Fee: FeeBreakdown{Items: map[string]int64{}}}.WithAmount(inst)
 	if err := pf.ApplyFill(fill, now+1); err != nil { // T+1 才可卖
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestCashDividendCredited(t *testing.T) {
 	inst := mainStock()
 	pf := NewPortfolio(oneMillionYuan)
 	fill := Fill{Order: Order{Instrument: inst.ID, Side: SideBuy, Qty: 1000},
-		Price: 10_000, Qty: 1000, Fee: FeeBreakdown{Items: map[string]int64{}}}
+		Price: 10_000, Qty: 1000, Fee: FeeBreakdown{Items: map[string]int64{}}}.WithAmount(inst)
 	pf.ApplyFill(fill, 0)
 	before := pf.CashCents()
 
@@ -177,7 +177,7 @@ func TestStockDividendDilutesCost(t *testing.T) {
 	inst := mainStock()
 	pf := NewPortfolio(oneMillionYuan)
 	fill := Fill{Order: Order{Instrument: inst.ID, Side: SideBuy, Qty: 1000},
-		Price: 10_000, Qty: 1000, Fee: FeeBreakdown{Items: map[string]int64{}}}
+		Price: 10_000, Qty: 1000, Fee: FeeBreakdown{Items: map[string]int64{}}}.WithAmount(inst)
 	pf.ApplyFill(fill, 0)
 	before := pf.Exposure(inst.ID)
 	costBefore := before.LongCost
@@ -219,7 +219,7 @@ func TestImpliedSplitWarns(t *testing.T) {
 	inst := mainStock()
 	pf := NewPortfolio(oneMillionYuan)
 	fill := Fill{Order: Order{Instrument: inst.ID, Side: SideBuy, Qty: 1000},
-		Price: 10_000, Qty: 1000, Fee: FeeBreakdown{Items: map[string]int64{}}}
+		Price: 10_000, Qty: 1000, Fee: FeeBreakdown{Items: map[string]int64{}}}.WithAmount(inst)
 	pf.ApplyFill(fill, 0)
 
 	pf.ApplyImpliedSplit(inst.ID, day2024, 2.0, 0)

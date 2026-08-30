@@ -57,6 +57,13 @@ type Market interface {
 	NormalizeQty(inst *mktdata.Instrument, qty int64, side Side, held int64) (int64, bool)
 	// Tradable 报告该标的当日是否可交易
 	Tradable(inst *mktdata.Instrument, b mktdata.Bar) bool
+	// AllowsShort 报告该市场是否允许做空。
+	//
+	// **它决定 `Enter + 卖` 的含义**：不允许做空时那是减仓
+	// （A 股的网格策略就这么用），允许时那是开空。
+	// 同一个信号在两个市场里意思不同，而策略不该为此分叉 ——
+	// 由市场规则来解释，正是 Market 这一层存在的理由。
+	AllowsShort() bool
 	// AnnualDays 返回该市场一年有多少个「步」，用于年化收益与波动。
 	//
 	// **放在 Market 而不是 Calendar 上**：A 股由日历实测（含节假日、
@@ -66,6 +73,13 @@ type Market interface {
 	//
 	// cal 可以为 nil（不依赖日历的市场直接返回常数）。
 	AnnualDays(cal *mktdata.Calendar, from, to int32) float64
+	// Units 返回该市场的计价单位与数量单位，如 ("元", "股") / ("USDT", "张")。
+	//
+	// **纯展示用，不参与任何计算**。放进接口而不是在报告里按市场名查表：
+	// 查表漏了一个市场只会安静地印出「元」，而加密账户的余额不是元 ——
+	// 一个看上去正常的错数字比报错难发现得多。放这里，
+	// 新市场不实现就编译不过。
+	Units() (money, qty string)
 }
 
 // ---- A 股实现 ----
@@ -112,6 +126,16 @@ func NewAShareMarket() *AShareMarket {
 }
 
 func (m *AShareMarket) Name() string { return "ashare" }
+
+// Units A 股以人民币计价、以股为数量单位。
+func (m *AShareMarket) Units() (string, string) { return "元", "股" }
+
+// AllowsShort A 股普通账户不能做空。
+//
+// 融资融券确有做空，但本项目**明确不建模**（C8 / Disclosures），
+// 所以这里是 false —— 返回 true 会让策略以为能开空，
+// 而账本根本没有空头槽位。
+func (m *AShareMarket) AllowsShort() bool { return false }
 
 // AnnualDays 由交易日历实测，而不是用「252」这个约定俗成的数。
 //
@@ -299,4 +323,42 @@ func (m *AShareMarket) Tradable(inst *mktdata.Instrument, b mktdata.Bar) bool {
 		return false
 	}
 	return b.TradingDay >= inst.ListDate
+}
+
+// PosLeg 一笔买卖作用在哪个仓位槽、是开还是平。
+type PosLeg struct {
+	// Short 作用在空头槽
+	Short bool
+	// Opening 开仓（false 即平仓）
+	Opening bool
+}
+
+// LegOf 由「买卖方向 + 是否平仓 + 市场是否双向」推出仓位槽与开平。
+//
+// 双向：
+//
+//	买 + 开 = 开多      买 + 平 = 平空
+//	卖 + 开 = 开空      卖 + 平 = 平多
+//
+// 单向：买恒为开多，卖恒为平多 —— reduce 不看。
+// A 股的减仓卖出与清仓卖出都是平多，没有「卖出开仓」这回事。
+//
+// # 为什么要单独抽出来
+//
+// 这张表原先在四个地方各写了一遍：保证金账本记账、轮次配对、
+// 仓位模块定方向、组合策略去重。**每一处写错的表现都不一样，
+// 而且都不报错**：账本记错槽位、轮次凭空多出几百轮、
+// 开空变成开多、开空信号被平多信号顶掉。
+// 前三处各自被发现过一次，第四处是在前三处都修好之后
+// 才暴露出来的 —— 那时 336 笔成交里只有 2 笔是开空。
+//
+// 一张表，一个地方。
+func LegOf(side Side, reduce, hedge bool) PosLeg {
+	if !hedge {
+		return PosLeg{Short: false, Opening: side == SideBuy}
+	}
+	if reduce {
+		return PosLeg{Short: side == SideBuy, Opening: false}
+	}
+	return PosLeg{Short: side == SideSell, Opening: true}
 }

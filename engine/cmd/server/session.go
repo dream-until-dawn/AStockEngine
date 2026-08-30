@@ -257,7 +257,7 @@ func (s *Store) snapDTOs(e *eng.Engine) ([]positionDTO, []pendingDTO) {
 		}
 		if b, ok := e.BarAt(id); ok {
 			d.Last = b.Close
-			d.Value = trading.AmountCents(b.Close, ex.Long)
+			d.Value = trading.NotionalCents(s.Uni.Get(id), b.Close, ex.Long)
 			d.PnL = d.Value - ex.LongCost
 			d.Suspended = b.Suspended()
 		}
@@ -345,7 +345,7 @@ func (s *Store) capture(e *eng.Engine) stepEvent {
 		ev.Orders = append(ev.Orders, d)
 	}
 	for _, f := range e.Fills() {
-		ev.Fills = append(ev.Fills, s.fillDTO(f))
+		ev.Fills = append(ev.Fills, s.fillDTO(f, e.Market().AllowsShort()))
 	}
 	for _, r := range e.Rejections() {
 		ev.Rejects = append(ev.Rejects, s.rejectDTO(r))

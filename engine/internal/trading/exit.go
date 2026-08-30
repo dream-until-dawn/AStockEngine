@@ -190,7 +190,7 @@ func eachSellable(ctx ExitContext, fn func(h holding)) {
 		if !ok || bar.Suspended() || bar.Close <= 0 {
 			return true
 		}
-		value := AmountCents(bar.Close, e.Long)
+		value := NotionalCents(ctx.Instrument(id), bar.Close, e.Long)
 		fn(holding{id: id, ratio: float64(value) / float64(e.LongCost), bar: bar})
 		return true
 	})

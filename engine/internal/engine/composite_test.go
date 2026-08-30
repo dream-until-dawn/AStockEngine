@@ -72,7 +72,7 @@ func eq(t *testing.T, name string, got, want []int) {
 
 func TestCombineUnion(t *testing.T) {
 	// 源 0 买 1、2；源 1 买 2、3 —— 2 重复，保留源 0 的
-	got := combineUnion([][]Signal{
+	got := spotComposite().combineUnion([][]Signal{
 		{buy(1), buy(2)},
 		{buy(2), buy(3)},
 	})
@@ -81,7 +81,7 @@ func TestCombineUnion(t *testing.T) {
 
 func TestCombineConfirmNeedsAll(t *testing.T) {
 	// 只有 2 是两个源都同意的
-	got := combineConfirm([][]Signal{
+	got := spotComposite().combineConfirm([][]Signal{
 		{buy(1), buy(2)},
 		{buy(2), buy(3)},
 	})
@@ -93,7 +93,7 @@ func TestCombineConfirmTakesMinStrength(t *testing.T) {
 	a.Strength = 0.9
 	b := buy(1)
 	b.Strength = 0.3
-	got := combineConfirm([][]Signal{{a}, {b}})
+	got := spotComposite().combineConfirm([][]Signal{{a}, {b}})
 	if len(got) != 1 {
 		t.Fatalf("期望 1 条，得到 %d", len(got))
 	}
@@ -105,7 +105,7 @@ func TestCombineConfirmTakesMinStrength(t *testing.T) {
 
 // TestCombineConfirmSameSideOnly 方向不同不算确认。
 func TestCombineConfirmSameSideOnly(t *testing.T) {
-	got := combineConfirm([][]Signal{{buy(1)}, {sell(1)}})
+	got := spotComposite().combineConfirm([][]Signal{{buy(1)}, {sell(1)}})
 	if len(got) != 0 {
 		t.Errorf("一个要买一个要卖，不该算作确认，得到 %v", ids(got))
 	}
@@ -113,7 +113,7 @@ func TestCombineConfirmSameSideOnly(t *testing.T) {
 
 func TestCombineVeto(t *testing.T) {
 	// 源 0 想买 1、2、3；源 1 对 2 发出卖信号 —— 买 2 被否决
-	got := combineVeto([][]Signal{
+	got := spotComposite().combineVeto([][]Signal{
 		{buy(1), buy(2), buy(3)},
 		{sell(2)},
 	})
@@ -125,13 +125,13 @@ func TestCombineVeto(t *testing.T) {
 // 否决者要表达「别做这笔」，就得发**反向**信号。
 // 后续源发出同向信号只会被无视 —— 否则「两个源都想买」会变成「不买」。
 func TestCombineVetoIgnoresSameSide(t *testing.T) {
-	got := combineVeto([][]Signal{{buy(1), buy(2)}, {buy(2)}})
+	got := spotComposite().combineVeto([][]Signal{{buy(1), buy(2)}, {buy(2)}})
 	eq(t, "veto 同向", ids(got), []int{1, 2})
 }
 
 // TestCombineVetoOnlyFirstSourceTrades 后续源只做否决，不产生自己的单。
 func TestCombineVetoOnlyFirstSourceTrades(t *testing.T) {
-	got := combineVeto([][]Signal{{buy(1)}, {buy(9), sell(9)}})
+	got := spotComposite().combineVeto([][]Signal{{buy(1)}, {buy(9), sell(9)}})
 	eq(t, "veto 不采纳否决者的信号", ids(got), []int{1})
 }
 
@@ -143,7 +143,7 @@ func TestCompositeDispatchesParamsPerSource(t *testing.T) {
 	c, err := NewComposite(CombineUnion, []Source{
 		{Name: "a", Strategy: a, Params: spec.Params{"x": 1}},
 		{Name: "b", Strategy: b, Params: spec.Params{"x": 2}},
-	})
+	}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestCompositeNamespacesIndicators(t *testing.T) {
 	b := &fixedStrategy{name: "b", declared: []string{"macd"}}
 	c, _ := NewComposite(CombineUnion, []Source{
 		{Name: "a", Strategy: a}, {Name: "b", Strategy: b},
-	})
+	}, false)
 	fi := &fakeInit{}
 	if err := c.Init(fi); err != nil {
 		t.Fatal(err)
@@ -180,13 +180,13 @@ func TestCompositeNamespacesIndicators(t *testing.T) {
 
 func TestCompositeRejectsDegenerate(t *testing.T) {
 	one := []Source{{Name: "a", Strategy: &fixedStrategy{name: "a"}}}
-	if _, err := NewComposite(CombineConfirm, one); err == nil {
+	if _, err := NewComposite(CombineConfirm, one, false); err == nil {
 		t.Error("只有一个源时 confirm 该报错 —— 它会原样通过，等于没配")
 	}
-	if _, err := NewComposite(CombineVeto, one); err == nil {
+	if _, err := NewComposite(CombineVeto, one, false); err == nil {
 		t.Error("只有一个源时 veto 该报错 —— 没有否决者")
 	}
-	if _, err := NewComposite(CombineUnion, nil); err == nil {
+	if _, err := NewComposite(CombineUnion, nil, false); err == nil {
 		t.Error("零个源该报错")
 	}
 }
@@ -220,3 +220,84 @@ func (f *fakeInit) Instrument(mktdata.InstrumentID) *mktdata.Instrument {
 }
 
 var _ InitContext = (*fakeInit)(nil)
+
+// spotComposite 造一个单向市场的空组合，专供直接测试三个合并函数。
+//
+// 合并函数现在是方法（需要知道市场是否双向），但**它们的单向行为
+// 一个字都不该变** —— 这些用例原样保留就是在守这一点。
+func spotComposite() *Composite { return &Composite{hedge: false} }
+
+// hedgeComposite 双向市场的空组合。
+func hedgeComposite() *Composite { return &Composite{hedge: true} }
+
+// TestUnionHedgeKeepsCloseAndOpenOnSameSide 双向下「平多」与「开空」都是卖，
+// 但它们是两个动作，union 不许把后者去重掉。
+//
+// 一多一空两棵镜像的树组在一起时，MACD 下穿那一根上正好同时发出这两个信号。
+// 按 (标的, 方向) 去重会让开空被平多顶掉，**且不报任何错** ——
+// 实测表现为 336 笔成交里只有 2 笔开空，整条空头腿等于没接上。
+func TestUnionHedgeKeepsCloseAndOpenOnSameSide(t *testing.T) {
+	per := [][]Signal{
+		{{Instrument: 1, Kind: SignalExit, Side: trading.SideSell}},  // 多头树：平多
+		{{Instrument: 1, Kind: SignalEnter, Side: trading.SideSell}}, // 空头树：开空
+	}
+	got := hedgeComposite().combineUnion(per)
+	if len(got) != 2 {
+		t.Fatalf("双向下应保留 2 条（平多 + 开空），得到 %d 条：%+v", len(got), got)
+	}
+	if got[0].Kind != SignalExit || got[1].Kind != SignalEnter {
+		t.Errorf("顺序应保持源的顺序，得到 %+v", got)
+	}
+
+	// 买侧同理：开多与平空都是买
+	perBuy := [][]Signal{
+		{{Instrument: 1, Kind: SignalEnter, Side: trading.SideBuy}}, // 多头树：开多
+		{{Instrument: 1, Kind: SignalExit, Side: trading.SideBuy}},  // 空头树：平空
+	}
+	if got := hedgeComposite().combineUnion(perBuy); len(got) != 2 {
+		t.Fatalf("买侧应保留 2 条（开多 + 平空），得到 %d 条：%+v", len(got), got)
+	}
+}
+
+// TestUnionSpotStillDedupesBySide 单向市场的去重口径一个字都没变。
+//
+// A 股里「减仓卖」与「清仓卖」都是平多，是同一个动作，仍该去重。
+func TestUnionSpotStillDedupesBySide(t *testing.T) {
+	per := [][]Signal{
+		{{Instrument: 1, Kind: SignalExit, Side: trading.SideSell}},
+		{{Instrument: 1, Kind: SignalEnter, Side: trading.SideSell}},
+	}
+	got := spotComposite().combineUnion(per)
+	if len(got) != 1 {
+		t.Fatalf("单向下同标的同方向应只留 1 条，得到 %d 条：%+v", len(got), got)
+	}
+	if got[0].Kind != SignalExit {
+		t.Errorf("应保留第一个源的，得到 %+v", got[0])
+	}
+}
+
+// TestUnionHedgeStillDedupesSameLeg 同一个仓位槽上的重复仍要去掉 ——
+// 两个源都说「开多」，还是只下一次单。
+func TestUnionHedgeStillDedupesSameLeg(t *testing.T) {
+	per := [][]Signal{
+		{{Instrument: 1, Kind: SignalEnter, Side: trading.SideBuy, Tag: "first"}},
+		{{Instrument: 1, Kind: SignalEnter, Side: trading.SideBuy, Tag: "second"}},
+	}
+	got := hedgeComposite().combineUnion(per)
+	if len(got) != 1 || got[0].Tag != "first" {
+		t.Fatalf("同槽重复应只留第一个源的，得到 %+v", got)
+	}
+}
+
+// TestVetoIgnoresLeg 否决只认 (标的, 方向)，不因双向而改口径。
+func TestVetoIgnoresLeg(t *testing.T) {
+	per := [][]Signal{
+		{{Instrument: 1, Kind: SignalEnter, Side: trading.SideBuy}},
+		{{Instrument: 1, Kind: SignalEnter, Side: trading.SideSell}}, // 反向 = 否决
+	}
+	for _, c := range []*Composite{spotComposite(), hedgeComposite()} {
+		if got := c.combineVeto(per); len(got) != 0 {
+			t.Fatalf("hedge=%v：反向信号应否决掉，得到 %+v", c.hedge, got)
+		}
+	}
+}

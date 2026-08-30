@@ -35,6 +35,8 @@ type RuleTree struct {
 	buy   *Node
 	valid *Node
 	sell  *Node
+	// short 为真时买入树开的是**空头**，卖出树平的也是空头
+	short bool
 
 	// virtual 虚拟持仓集合。**必须跨步保存** ——
 	// 从快照恢复后它归零，被过滤掉的机会会立刻重新触发买入
@@ -138,6 +140,15 @@ type ruleTreeCfg struct {
 	Buy        *Node     `json:"buy"`
 	Valid      *Node     `json:"valid,omitempty"`
 	Sell       *Node     `json:"sell"`
+	// Direction long（默认，做多）/ short（做空）。
+	//
+	// 只允许**单一方向**：一棵树表达一个意图。
+	// 真正的双向用 `composite union` 组两个 rule_tree ——
+	// 一个做多一个做空，各有各的条件。硬塞进一棵树只会让
+	// 「这个条件是给多头还是空头的」变成日常问题。
+	//
+	// 做空只在允许做空的市场有意义（A 股恒为 false，见 Market.AllowsShort）。
+	Direction string `json:"direction,omitempty"`
 }
 
 func NewRuleTree() *RuleTree {
@@ -200,6 +211,14 @@ func (s *RuleTree) Configure(raw json.RawMessage) error {
 		if err := validateNode(t.n, c.Indicators, t.name); err != nil {
 			return err
 		}
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Direction)) {
+	case "", "long":
+		s.short = false
+	case "short":
+		s.short = true
+	default:
+		return fmt.Errorf("未知的 direction %q，可选：long / short", c.Direction)
 	}
 	s.inds, s.buy, s.valid, s.sell = c.Indicators, c.Buy, c.Valid, c.Sell
 	return nil
@@ -325,7 +344,7 @@ type evalCtx struct {
 }
 
 func (s *RuleTree) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
-	held, inFlight := holdingSet(ctx)
+	_, inFlight := holdingSet(ctx)
 	var sigs []eng.Signal
 	s.notReady, s.evaluated = 0, 0
 
@@ -366,12 +385,18 @@ func (s *RuleTree) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 			continue
 		}
 
-		if held[id] || s.virtual[id] {
+		// **按方向看持仓**，不能用「有没有敞口」笼统判断：
+		// 双向下把一多一空两棵树用 composite 组起来时，
+		// 笼统判断会让多头树因为已有空头而不开仓（反之亦然）。
+		held := s.holdsMine(ctx, id)
+		if held || s.virtual[id] {
 			if sellOK {
-				if held[id] {
+				if held {
+					// 平仓方向与开仓相反：做多发卖出平、做空发买入平。
+					// Sizer 会据此把 Reduce 置上，双向账本才知道要动哪个槽位
 					sigs = append(sigs, eng.Signal{
 						Instrument: id, Kind: eng.SignalExit,
-						Side: trading.SideSell, Tag: "tree_sell",
+						Side: s.closeSide(), Tag: "tree_sell",
 					})
 				}
 				// 虚拟持仓在卖出信号出现时清掉 —— 之后才可能再次买入
@@ -385,16 +410,16 @@ func (s *RuleTree) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 		if validOK {
 			sigs = append(sigs, eng.Signal{
 				Instrument: id, Kind: eng.SignalEnter,
-				Side: trading.SideBuy, Tag: "tree_buy",
+				Side: s.openSide(), Tag: "tree_buy",
 			})
 		} else {
 			// 不下单，但记成持有 —— 在卖出信号出现前不再触发买入
 			s.virtual[id] = true
 		}
 	}
-	// 已经真实持有的标的不必再留虚拟标记（买入成交后会走到这一步）
+	// 已经真实持有的标的不必再留虚拟标记（开仓成交后会走到这一步）
 	for id := range s.virtual {
-		if held[id] {
+		if s.holdsMine(ctx, id) {
 			delete(s.virtual, id)
 		}
 	}
@@ -648,6 +673,33 @@ func (s *RuleTree) RestoreState(b []byte) error {
 		s.prev[stateKey{node: k[:i], id: mktdata.InstrumentID(id)}] = v
 	}
 	return nil
+}
+
+// holdsMine 报告**本策略这个方向**上是否已有仓位。
+//
+// ⚠ 在途单仍然是按标的整体挡的（inFlight）：一多一空两棵树组在一起时，
+// 多头的在途单会挡住空头这一步的开仓。保守但不精确 ——
+// 精确做法要按 (标的, 方向) 过滤在途队列，等真有人这么用再说。
+func (s *RuleTree) holdsMine(ctx eng.StepContext, id mktdata.InstrumentID) bool {
+	ex := ctx.Ledger().Exposure(id)
+	if s.short {
+		return ex.Short > 0
+	}
+	return ex.Long > 0
+}
+
+func (s *RuleTree) openSide() trading.Side {
+	if s.short {
+		return trading.SideSell
+	}
+	return trading.SideBuy
+}
+
+func (s *RuleTree) closeSide() trading.Side {
+	if s.short {
+		return trading.SideBuy
+	}
+	return trading.SideSell
 }
 
 // VirtualCount 返回当前虚拟持仓数，供单步调试展示。

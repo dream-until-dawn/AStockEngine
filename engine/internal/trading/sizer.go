@@ -88,20 +88,75 @@ var Sizers = registry.New[Sizer]("sizer")
 
 // ---- 公共工具 ----
 
-// occupancy 统计「已占用的仓位数」与「哪些标的已在场」。
+// slotKey 一个仓位槽：标的 + 方向。
 //
-// 已持有与在途都算占用：同一只标的既不该重复买入，也不该在挂单未成交时
-// 再占一个仓位。**去重**——一只标的同时持有并挂着卖单只算一个占用。
-func occupancy(ctx SizeContext) map[mktdata.InstrumentID]bool {
-	in := make(map[mktdata.InstrumentID]bool, 64)
+// **单向市场里 short 恒为 false**，键退化成标的本身，行为与从前一致。
+type slotKey struct {
+	id    mktdata.InstrumentID
+	short bool
+}
+
+// occupied 记录已占用的仓位槽。
+//
+// 已持有与在途都算占用：同一只标的既不该重复建仓，也不该在挂单未成交时
+// 再占一个槽位。**去重**——一只标的同时持有并挂着卖单只算一个占用。
+type occupied struct {
+	// hedge 双向市场。为真时多空各占一个槽 ——
+	// 「持有 BTC 多头」不该挡住「开 BTC 空头」，那正是双向的意义；
+	// 为假时全部归到多头槽，与单向市场的语义一致
+	hedge bool
+	slots map[slotKey]bool
+}
+
+func occupancy(ctx SizeContext) *occupied {
+	o := &occupied{
+		hedge: ctx.Market().AllowsShort(),
+		slots: make(map[slotKey]bool, 64),
+	}
 	ctx.Ledger().EachExposure(func(id mktdata.InstrumentID, e Exposure) bool {
-		in[id] = true
+		if e.Long > 0 || !o.hedge {
+			o.take(id, SideBuy)
+		}
+		if e.Short > 0 {
+			o.take(id, SideSell)
+		}
 		return true
 	})
 	for _, po := range ctx.Pending() {
-		in[po.Instrument] = true
+		// 在途的**平仓**单不占新槽：它释放的正是已经算过的那个槽
+		if po.Reduce {
+			continue
+		}
+		o.take(po.Instrument, po.Side)
 	}
-	return in
+	return o
+}
+
+func (o *occupied) key(id mktdata.InstrumentID, side Side) slotKey {
+	return slotKey{id: id, short: o.hedge && side == SideSell}
+}
+
+func (o *occupied) has(id mktdata.InstrumentID, side Side) bool {
+	return o.slots[o.key(id, side)]
+}
+
+func (o *occupied) take(id mktdata.InstrumentID, side Side) {
+	o.slots[o.key(id, side)] = true
+}
+
+func (o *occupied) len() int { return len(o.slots) }
+
+// entrySide 建仓单的买卖方向。
+//
+// **单向市场里建仓只能是买**：A 股的策略即便发出 Enter + 卖，
+// 也只能理解成减仓（由 Exit 那条路处理），绝不能变成一张卖出开仓单。
+// 双向市场里 Enter + 卖就是开空 —— 这个区别由 Market 解释，
+// 与 MarginLedger.posFor、MatchRoundTrips 用的是同一张表。
+func entrySide(sig Signal, ctx SizeContext) Side {
+	if LegOf(sig.Side, false, ctx.Market().AllowsShort()).Short {
+		return SideSell
+	}
+	return SideBuy
 }
 
 // buyQty 按预算折算数量并交给 Market 规整。
@@ -117,8 +172,10 @@ func buyQty(ctx SizeContext, id mktdata.InstrumentID, budgetCents int64) (int64,
 	if inst == nil {
 		return 0, false
 	}
-	// 预算是分、价格是厘：分 × 10 / 厘 = 股
-	raw := budgetCents * 10 / bar.Close
+	// 按**标的自己的 scale 与合约乘数**折算，且走 128 位 ——
+	// 写死 ×10 是 A 股口径，在加密上算出来的数量差十几个数量级，
+	// 然后被 NormalizeQty 判成 0，信号就这么静默消失了
+	raw := QtyForCents(inst, bar.Close, budgetCents)
 	if raw <= 0 {
 		return 0, false
 	}
@@ -126,22 +183,35 @@ func buyQty(ctx SizeContext, id mktdata.InstrumentID, budgetCents int64) (int64,
 	return ctx.Market().NormalizeQty(inst, raw, SideBuy, held)
 }
 
-// exitOrder 把清仓信号变成卖单。
+// exitOrder 把清仓信号变成平仓单。
+//
+// **方向由信号的 Side 决定平哪一边**：
+//
+//	Exit + 卖 = 平多（数量取可卖多头）
+//	Exit + 买 = 平空（数量取空头持仓）
+//
+// 单向市场里只有前者。所有平仓单都带 `Reduce`，
+// 否则双向账本会把「卖」当成开空。
 func exitOrder(sig Signal, ctx SizeContext) (Order, bool) {
-	avail := ctx.Available(sig.Instrument)
-	if avail <= 0 {
-		return Order{}, false
-	}
 	inst := ctx.Instrument(sig.Instrument)
 	if inst == nil {
 		return Order{}, false
 	}
-	qty, ok := ctx.Market().NormalizeQty(inst, avail, SideSell, avail)
+	side := SideSell
+	avail := ctx.Available(sig.Instrument)
+	if sig.Side == SideBuy && ctx.Market().AllowsShort() {
+		side = SideBuy
+		avail = ctx.Ledger().Exposure(sig.Instrument).Short
+	}
+	if avail <= 0 {
+		return Order{}, false
+	}
+	qty, ok := ctx.Market().NormalizeQty(inst, avail, side, avail)
 	if !ok || qty <= 0 {
 		return Order{}, false
 	}
 	return Order{
-		Instrument: sig.Instrument, Side: SideSell, Qty: qty,
+		Instrument: sig.Instrument, Side: side, Qty: qty, Reduce: true,
 		Type: orderType(sig), LimitPrice: sig.LimitPrice, Tag: sig.Tag,
 	}, true
 }
@@ -162,14 +232,21 @@ func override(sig Signal, ctx SizeContext) (Order, bool) {
 	if inst == nil {
 		return Order{}, false
 	}
-	held := ctx.Ledger().Exposure(sig.Instrument).Long
+	ex := ctx.Ledger().Exposure(sig.Instrument)
+	held := ex.Long
+	// 平仓单：Exit 一律是平；单向市场里「卖」也只能是平
+	reduce := sig.Kind == SignalExit || !ctx.Market().AllowsShort()
+	if sig.Side == SideBuy && ctx.Market().AllowsShort() && sig.Kind == SignalExit {
+		held = ex.Short
+	}
 	qty, ok := ctx.Market().NormalizeQty(inst, sig.Qty, sig.Side, held)
 	if !ok || qty <= 0 {
 		return Order{}, false
 	}
 	return Order{
 		Instrument: sig.Instrument, Side: sig.Side, Qty: qty,
-		Type: orderType(sig), LimitPrice: sig.LimitPrice, Tag: sig.Tag,
+		Reduce: reduce && sig.Side == SideSell || sig.Kind == SignalExit,
+		Type:   orderType(sig), LimitPrice: sig.LimitPrice, Tag: sig.Tag,
 	}, true
 }
 
@@ -180,7 +257,14 @@ func dispatch(sig Signal, ctx SizeContext) (Order, bool, bool) {
 		o, ok := override(sig, ctx)
 		return o, ok, true
 	}
-	if sig.Kind == SignalExit || sig.Side == SideSell {
+	if sig.Kind == SignalExit {
+		o, ok := exitOrder(sig, ctx)
+		return o, ok, true
+	}
+	// **`Enter + 卖` 的含义由市场决定**：
+	// 不能做空时那是减仓（A 股的网格就这么用），能做空时那是开空。
+	// 后者要走定量路径，不能当成平仓
+	if sig.Side == SideSell && !ctx.Market().AllowsShort() {
 		o, ok := exitOrder(sig, ctx)
 		return o, ok, true
 	}
@@ -225,8 +309,8 @@ func (s *EqualWeight) Size(sigs []Signal, ctx SizeContext) []Order {
 		slotCents = budget / int64(s.slots)
 	}
 
-	occupied := occupancy(ctx)
-	used := len(occupied)
+	occ := occupancy(ctx)
+	used := occ.len()
 	out := make([]Order, 0, len(sigs))
 
 	for _, sig := range sigs {
@@ -236,8 +320,10 @@ func (s *EqualWeight) Size(sigs []Signal, ctx SizeContext) []Order {
 			}
 			continue
 		}
+		// 建仓方向：单向市场恒为买，双向市场跟随信号（Enter + 卖 = 开空）
+		side := entrySide(sig, ctx)
 		// 建仓：预算不足、已在场、仓位已满，三者任一即跳过
-		if slotCents <= 0 || occupied[sig.Instrument] || used >= s.slots {
+		if slotCents <= 0 || occ.has(sig.Instrument, side) || used >= s.slots {
 			continue
 		}
 		qty, ok := buyQty(ctx, sig.Instrument, slotCents)
@@ -245,10 +331,10 @@ func (s *EqualWeight) Size(sigs []Signal, ctx SizeContext) []Order {
 			continue
 		}
 		out = append(out, Order{
-			Instrument: sig.Instrument, Side: SideBuy, Qty: qty,
+			Instrument: sig.Instrument, Side: side, Qty: qty,
 			Type: orderType(sig), LimitPrice: sig.LimitPrice, Tag: sig.Tag,
 		})
-		occupied[sig.Instrument] = true
+		occ.take(sig.Instrument, side)
 		used++
 	}
 	return out
@@ -272,8 +358,8 @@ type FixedCash struct {
 func (s *FixedCash) Name() string { return "fixed_cash" }
 
 func (s *FixedCash) Size(sigs []Signal, ctx SizeContext) []Order {
-	occupied := occupancy(ctx)
-	used := len(occupied)
+	occ := occupancy(ctx)
+	used := occ.len()
 	out := make([]Order, 0, len(sigs))
 	for _, sig := range sigs {
 		if o, ok, handled := dispatch(sig, ctx); handled {
@@ -282,7 +368,9 @@ func (s *FixedCash) Size(sigs []Signal, ctx SizeContext) []Order {
 			}
 			continue
 		}
-		if occupied[sig.Instrument] {
+		// 建仓方向：单向市场恒为买，双向市场跟随信号（Enter + 卖 = 开空）
+		side := entrySide(sig, ctx)
+		if occ.has(sig.Instrument, side) {
 			continue
 		}
 		if s.maxPositions > 0 && used >= s.maxPositions {
@@ -293,10 +381,10 @@ func (s *FixedCash) Size(sigs []Signal, ctx SizeContext) []Order {
 			continue
 		}
 		out = append(out, Order{
-			Instrument: sig.Instrument, Side: SideBuy, Qty: qty,
+			Instrument: sig.Instrument, Side: side, Qty: qty,
 			Type: orderType(sig), LimitPrice: sig.LimitPrice, Tag: sig.Tag,
 		})
-		occupied[sig.Instrument] = true
+		occ.take(sig.Instrument, side)
 		used++
 	}
 	return out
@@ -320,8 +408,8 @@ type FixedQty struct {
 func (s *FixedQty) Name() string { return "fixed_qty" }
 
 func (s *FixedQty) Size(sigs []Signal, ctx SizeContext) []Order {
-	occupied := occupancy(ctx)
-	used := len(occupied)
+	occ := occupancy(ctx)
+	used := occ.len()
 	out := make([]Order, 0, len(sigs))
 	for _, sig := range sigs {
 		if o, ok, handled := dispatch(sig, ctx); handled {
@@ -330,7 +418,9 @@ func (s *FixedQty) Size(sigs []Signal, ctx SizeContext) []Order {
 			}
 			continue
 		}
-		if occupied[sig.Instrument] {
+		// 建仓方向：单向市场恒为买，双向市场跟随信号（Enter + 卖 = 开空）
+		side := entrySide(sig, ctx)
+		if occ.has(sig.Instrument, side) {
 			continue
 		}
 		if s.maxPositions > 0 && used >= s.maxPositions {
@@ -346,10 +436,10 @@ func (s *FixedQty) Size(sigs []Signal, ctx SizeContext) []Order {
 			continue
 		}
 		out = append(out, Order{
-			Instrument: sig.Instrument, Side: SideBuy, Qty: qty,
+			Instrument: sig.Instrument, Side: side, Qty: qty,
 			Type: orderType(sig), LimitPrice: sig.LimitPrice, Tag: sig.Tag,
 		})
-		occupied[sig.Instrument] = true
+		occ.take(sig.Instrument, side)
 		used++
 	}
 	return out
@@ -379,8 +469,8 @@ func (s *PctEquity) Size(sigs []Signal, ctx SizeContext) []Order {
 	if eq := ctx.EquityCents(); eq > 0 {
 		budget = eq * s.ppm / 1_000_000
 	}
-	occupied := occupancy(ctx)
-	used := len(occupied)
+	occ := occupancy(ctx)
+	used := occ.len()
 	out := make([]Order, 0, len(sigs))
 	for _, sig := range sigs {
 		if o, ok, handled := dispatch(sig, ctx); handled {
@@ -389,7 +479,9 @@ func (s *PctEquity) Size(sigs []Signal, ctx SizeContext) []Order {
 			}
 			continue
 		}
-		if budget <= 0 || occupied[sig.Instrument] {
+		// 建仓方向：单向市场恒为买，双向市场跟随信号（Enter + 卖 = 开空）
+		side := entrySide(sig, ctx)
+		if budget <= 0 || occ.has(sig.Instrument, side) {
 			continue
 		}
 		if s.maxPositions > 0 && used >= s.maxPositions {
@@ -400,10 +492,10 @@ func (s *PctEquity) Size(sigs []Signal, ctx SizeContext) []Order {
 			continue
 		}
 		out = append(out, Order{
-			Instrument: sig.Instrument, Side: SideBuy, Qty: qty,
+			Instrument: sig.Instrument, Side: side, Qty: qty,
 			Type: orderType(sig), LimitPrice: sig.LimitPrice, Tag: sig.Tag,
 		})
-		occupied[sig.Instrument] = true
+		occ.take(sig.Instrument, side)
 		used++
 	}
 	return out
@@ -431,7 +523,7 @@ func (s *StrengthWeighted) Name() string { return "strength_weighted" }
 
 func (s *StrengthWeighted) Size(sigs []Signal, ctx SizeContext) []Order {
 	eq := ctx.EquityCents()
-	occupied := occupancy(ctx)
+	occ := occupancy(ctx)
 	out := make([]Order, 0, len(sigs))
 
 	// 先把非建仓的处理掉，同时统计建仓信号的信心之和
@@ -444,7 +536,9 @@ func (s *StrengthWeighted) Size(sigs []Signal, ctx SizeContext) []Order {
 			}
 			continue
 		}
-		if occupied[sig.Instrument] || sig.Strength < s.minStrength {
+		// 建仓方向：单向市场恒为买，双向市场跟随信号（Enter + 卖 = 开空）
+		side := entrySide(sig, ctx)
+		if occ.has(sig.Instrument, side) || sig.Strength < s.minStrength {
 			continue
 		}
 		w := sig.Strength
@@ -469,7 +563,7 @@ func (s *StrengthWeighted) Size(sigs []Signal, ctx SizeContext) []Order {
 			continue
 		}
 		out = append(out, Order{
-			Instrument: sig.Instrument, Side: SideBuy, Qty: qty,
+			Instrument: sig.Instrument, Side: entrySide(sig, ctx), Qty: qty,
 			Type: orderType(sig), LimitPrice: sig.LimitPrice, Tag: sig.Tag,
 		})
 	}

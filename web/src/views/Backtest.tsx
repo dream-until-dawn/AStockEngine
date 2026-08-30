@@ -159,6 +159,9 @@ function Result({
   setTab: (t: 'trips' | 'fills' | 'rejects') => void
 }) {
   const m = run.metrics
+  // 计价单位由服务端从 Market 取。加密账户的余额不是「元」，
+  // 而单位错的数字看上去完全正常 —— 前端不自己按市场名查表
+  const cur = run.market?.money ?? '元'
   const friction = m.fee_cents + m.slippage_cents
   const cards = [
     { k: '总收益', v: pct(m.total_return), cls: m.total_return >= 0 ? 'up' : 'down' },
@@ -174,7 +177,7 @@ function Result({
     { k: '盈亏比', v: num(m.trades.profit_factor) },
     { k: '年化换手', v: `${m.turnover.toFixed(1)} 倍` },
     { k: '摩擦成本', v: `${(friction / m.initial_cents * 100).toFixed(2)}%`,
-      n: `费用 ${fmtCompact(yuan(m.fee_cents))} + 滑点 ${fmtCompact(yuan(m.slippage_cents))} 元` },
+      n: `费用 ${fmtCompact(yuan(m.fee_cents))} + 滑点 ${fmtCompact(yuan(m.slippage_cents))} ${cur}` },
   ]
 
   return (
@@ -251,8 +254,8 @@ function Result({
             </span>
           ))}
         </div>
-        {tab === 'trips' && <TripTable rows={run.roundTrips} meta={meta} />}
-        {tab === 'fills' && <FillTable rows={run.fills} meta={meta} />}
+        {tab === 'trips' && <TripTable rows={run.roundTrips} meta={meta} cur={cur} />}
+        {tab === 'fills' && <FillTable rows={run.fills} cur={cur} />}
         {tab === 'rejects' && <RejectTable run={run} />}
       </div>
     </>
@@ -300,7 +303,7 @@ function Pager({ page, pages, setPage }: { page: number; pages: number; setPage:
   )
 }
 
-function TripTable({ rows, meta }: { rows: RoundTrip[]; meta: Meta }) {
+function TripTable({ rows, meta, cur }: { rows: RoundTrip[]; meta: Meta; cur: string }) {
   const [sortPnl, setSortPnl] = useState(false)
   const sorted = useMemo(
     () => (sortPnl ? [...rows].sort((a, b) => a.pnl - b.pnl) : rows),
@@ -313,11 +316,18 @@ function TripTable({ rows, meta }: { rows: RoundTrip[]; meta: Meta }) {
     { key: 'open', title: '开仓', render: (r) => fmtDay(r.openDay) },
     { key: 'close', title: '平仓', render: (r) => fmtDay(r.closeDay) },
     { key: 'hold', title: '持有', num: true, render: (r) => `${r.holdDays} 天` },
-    { key: 'qty', title: '数量', num: true, render: (r) => fmtNum(r.qty) },
-    { key: 'cost', title: '成本', num: true, render: (r) => yuan(r.cost).toFixed(2) },
-    { key: 'proceed', title: '收入', num: true, render: (r) => yuan(r.proceed).toFixed(2) },
     {
-      key: 'pnl', title: '盈亏', num: true, sort: 'pnl',
+      key: 'dir', title: '方向', render: (r) =>
+        r.short ? <span className="down">空</span> : <span className="up">多</span>,
+    },
+    {
+      key: 'qty', title: '数量', num: true,
+      render: (r) => fmtNum(r.qty / (r.qtyScale || 1)),
+    },
+    { key: 'cost', title: `成本(${cur})`, num: true, render: (r) => yuan(r.cost).toFixed(2) },
+    { key: 'proceed', title: `收入(${cur})`, num: true, render: (r) => yuan(r.proceed).toFixed(2) },
+    {
+      key: 'pnl', title: `盈亏(${cur})`, num: true, sort: 'pnl',
       render: (r) => (
         <span className={r.pnl > 0 ? 'up' : r.pnl < 0 ? 'down' : 'muted'}>
           {r.pnl > 0 ? '+' : ''}{yuan(r.pnl).toFixed(2)}
@@ -359,23 +369,32 @@ function TripTable({ rows, meta }: { rows: RoundTrip[]; meta: Meta }) {
   )
 }
 
-function FillTable({ rows, meta }: { rows: RunFill[]; meta: Meta }) {
+function FillTable({ rows, cur }: { rows: RunFill[]; cur: string }) {
   const { page, pages, slice, setPage } = useLocalPage(rows, 40)
-  const ps = meta.scales.price
+  // 每行带着自己的 scale —— 全局 scale 是 A 股口径，
+  // 拿它去除 BTC 的成交价会差好几个数量级
   const cols: Col<RunFill>[] = [
     { key: 'd', title: '交易日', render: (r) => fmtDay(r.d) },
     { key: 'sym', title: '代码', render: (r) => <span className="mono">{r.symbol}</span> },
     { key: 'name', title: '名称', render: (r) => r.name },
     {
       key: 'side', title: '方向', render: (r) => (
-        <span className={r.side === 'buy' ? 'up' : 'down'}>{r.side === 'buy' ? '买' : '卖'}</span>
+        <span className={r.side === 'buy' ? 'up' : 'down'}>
+          {r.leg || (r.side === 'buy' ? '买' : '卖')}
+        </span>
       ),
     },
-    { key: 'price', title: '成交价', num: true, render: (r) => (r.price / ps).toFixed(3) },
-    { key: 'qty', title: '数量', num: true, render: (r) => fmtNum(r.qty) },
-    { key: 'amt', title: '成交额', num: true, render: (r) => fmtCompact(yuan(r.amount)) },
-    { key: 'fee', title: '费用', num: true, render: (r) => yuan(r.fee).toFixed(2) },
-    { key: 'slip', title: '滑点', num: true, render: (r) => yuan(r.slippage).toFixed(2) },
+    {
+      key: 'price', title: '成交价', num: true,
+      render: (r) => (r.price / (r.priceScale || 1000)).toFixed(3),
+    },
+    {
+      key: 'qty', title: '数量', num: true,
+      render: (r) => fmtNum(r.qty / (r.qtyScale || 1)),
+    },
+    { key: 'amt', title: `成交额(${cur})`, num: true, render: (r) => fmtCompact(yuan(r.amount)) },
+    { key: 'fee', title: `费用(${cur})`, num: true, render: (r) => yuan(r.fee).toFixed(2) },
+    { key: 'slip', title: `滑点(${cur})`, num: true, render: (r) => yuan(r.slippage).toFixed(2) },
     { key: 'tag', title: '来源', render: (r) => <span className="tag">{r.tag}</span> },
   ]
   return (

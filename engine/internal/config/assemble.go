@@ -270,7 +270,11 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 		}
 		exits = append(exits, er)
 	}
-	strat, params, err := buildStrategy(c.Strategy)
+	led, err := c.buildLedger(ds.Universe)
+	if err != nil {
+		return nil, err
+	}
+	strat, params, err := buildStrategy(c.Strategy, market.AllowsShort())
 	if err != nil {
 		return nil, err
 	}
@@ -295,7 +299,7 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 		Broker: trading.NewBroker(market, fee, slip, trading.BrokerConfig{
 			VolumeCapPPM: c.Broker.VolumeCapPPM, AllowPartialFill: allowPartial,
 		}),
-		Ledger: trading.NewPortfolio(c.Portfolio.InitialCashCents),
+		Ledger: led,
 		Sizer:  sizer,
 		Risk:   chain,
 		Exits:  exits,
@@ -433,23 +437,28 @@ func parseStatus(s string) (int, error) {
 	return 0, fmt.Errorf("未知的 universe.status %q，可选：all / listed / delisted", s)
 }
 
-// checkMarketRules 拦下「用 A 股规则跑非 A 股标的」。
+// checkMarketRules 拦下「市场规则与标的对不上」。
 //
 // 数据层是市场无关的（C9），交易规则层不是。A 股规则带着 T+1、涨跌停、
-// 印花税、252 日年化；把它套到加密货币上**不会报任何错**，只会静默给出
-// 一份看着很正常的假结果 —— 这比崩溃危险得多。
+// 印花税、243 日年化；加密规则是 T+0、无涨跌停、365 日年化。
+// 套错了**不会报任何错**，只会静默给出一份看着很正常的假结果 ——
+// 这比崩溃危险得多。
 //
-// 加密的规则实现（T+0、无涨跌停、365 日年化、资金费率）还没写，
-// 所以这里宁可拒绝。等 CryptoMarket 落地后，这个函数改成查表即可。
+// CryptoMarket 落地后这里不再一刀切拒绝，而是**按标的所属市场查表**：
+// 规则实现与标的池里的市场对不上才拒。
 func checkMarketRules(uni *mktdata.Universe, ids []mktdata.InstrumentID, impl string) error {
-	if strings.ToLower(strings.TrimSpace(impl)) != "ashare" {
-		return nil
+	want := map[string]mktdata.Market{
+		"ashare": mktdata.MarketAShare,
+		"crypto": mktdata.MarketCrypto,
+	}[strings.ToLower(strings.TrimSpace(impl))]
+	if want == mktdata.MarketUnknown {
+		return nil // 未知的规则实现由 registry 报错，不在这里重复
 	}
 	counts := make(map[mktdata.Market]int, 2)
 	var sample string
 	for _, id := range ids {
 		in := uni.Get(id)
-		if in == nil || in.Market == mktdata.MarketAShare {
+		if in == nil || in.Market == want {
 			continue
 		}
 		if counts[in.Market] == 0 {
@@ -465,10 +474,33 @@ func checkMarketRules(uni *mktdata.Universe, ids []mktdata.InstrumentID, impl st
 		parts = append(parts, fmt.Sprintf("%s %d 个", m, n))
 	}
 	sort.Strings(parts)
-	return fmt.Errorf("market.impl=\"ashare\" 但标的池里有非 A 股标的（%s，如 %s）—— "+
-		"A 股规则含 T+1、涨跌停、印花税，套到其他市场会静默给出错误结果。"+
-		"请用 universe.market 限定市场；对应市场的规则实现尚未提供",
-		strings.Join(parts, "、"), sample)
+	return fmt.Errorf("market.impl=%q 但标的池里有别的市场的标的（%s，如 %s）—— "+
+		"交易规则（T+1 / 涨跌停 / 年化系数）套错市场会静默给出错误结果。"+
+		"请用 universe.market 限定市场，并把 market.impl 改成对应的实现",
+		impl, strings.Join(parts, "、"), sample)
+}
+
+// buildLedger 按配置选账本。
+//
+// **A 股用现货、加密用逐仓双向**，默认值在 config.defaultLedger 里。
+// 两者都实现 Ledger，引擎不知道区别 —— 这正是 v0.3.2 把账本抽成接口的目的。
+func (c *Config) buildLedger(uni *mktdata.Universe) (trading.Ledger, error) {
+	valuer := func(id mktdata.InstrumentID, price, qty int64) int64 {
+		return trading.NotionalCents(uni.Get(id), price, qty)
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Portfolio.Ledger)) {
+	case "", "spot":
+		pf := trading.NewPortfolio(c.Portfolio.InitialCashCents)
+		pf.SetValuer(valuer)
+		return pf, nil
+	case "margin":
+		ml := trading.NewMarginLedger(c.Portfolio.InitialCashCents,
+			c.Portfolio.Leverage, c.Portfolio.MaintMarginPPM)
+		ml.SetValuer(valuer)
+		return ml, nil
+	}
+	return nil, fmt.Errorf("未知的 portfolio.ledger %q，可选：spot / margin",
+		c.Portfolio.Ledger)
 }
 
 func parseMarkets(ss []string) (map[mktdata.Market]bool, error) {
@@ -585,7 +617,7 @@ func rawOrEmpty(raw []byte) string {
 // 组合策略返回空 —— 各源的参数由 Composite 自己在 Init 时分发下去，
 // 因为一份 Params 装不下 N 个源的参数，硬装就得靠前缀，
 // 那会让源看到一个和自己声明不一样的参数名。
-func buildStrategy(m Module) (eng.Strategy, spec.Params, error) {
+func buildStrategy(m Module, hedge bool) (eng.Strategy, spec.Params, error) {
 	if m.Impl != compositeImpl {
 		s, err := eng.Strategies.Build(m.Impl, nil)
 		if err != nil {
@@ -617,6 +649,17 @@ func buildStrategy(m Module) (eng.Strategy, spec.Params, error) {
 		if err != nil {
 			return nil, nil, fmt.Errorf("strategy.sources[%d]: %w", i, err)
 		}
+		// 组合的源同样可以是结构化配置的策略（规则树）——
+		// 一多一空两棵树用 union 组起来，就是双向
+		if cs, ok := s.(eng.ConfigurableStrategy); ok {
+			if err := cs.Configure(src.Params); err != nil {
+				return nil, nil, fmt.Errorf("strategy.sources[%d].params: %w", i, err)
+			}
+			sources = append(sources, eng.Source{
+				Name: src.Impl, Strategy: s, Params: spec.Params{},
+			})
+			continue
+		}
 		specs, _ := eng.Strategies.Specs(src.Impl)
 		p, err := decodeStrategyParams(specs, src.Params)
 		if err != nil {
@@ -624,7 +667,7 @@ func buildStrategy(m Module) (eng.Strategy, spec.Params, error) {
 		}
 		sources = append(sources, eng.Source{Name: src.Impl, Strategy: s, Params: p})
 	}
-	comp, err := eng.NewComposite(mode, sources)
+	comp, err := eng.NewComposite(mode, sources, hedge)
 	if err != nil {
 		return nil, nil, fmt.Errorf("strategy: %w", err)
 	}

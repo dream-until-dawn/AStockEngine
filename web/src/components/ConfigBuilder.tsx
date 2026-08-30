@@ -35,6 +35,13 @@ export default function ConfigBuilder({
   const [cat, setCat] = useState<ModuleCatalog | null>(null)
   const [err, setErr] = useState('')
 
+  // 计价货币随市场变。**这不只是个标签**：加密的初始资金默认 1,000 USDT、
+  // A 股默认 20,000 元，把 20000 当成 USDT 填进去，回测会以 20 倍的
+  // 本金起跑，而报告上每个数字都看着正常
+  const isCrypto = (cfg.data?.market ?? 'ashare') === 'crypto'
+  const cur = isCrypto ? 'USDT' : '元'
+  const defCash = isCrypto ? 100_000 : 2_000_000
+
   useEffect(() => {
     runApi.modules().then(setCat, (e) => setErr(String(e?.message ?? e)))
   }, [])
@@ -162,18 +169,34 @@ export default function ConfigBuilder({
 
       <Section title="账户与引擎">
         <div className="filters">
-          <Field label="初始资金（元）">
+          <Field label={`初始资金（${cur}）`}>
             <input
-              value={(cfg.portfolio?.initial_cash_cents ?? 0) / 100}
+              value={(cfg.portfolio?.initial_cash_cents ?? defCash) / 100}
               onChange={(e) => set('portfolio.initial_cash_cents',
                 Math.round(Number(e.target.value || 0) * 100))}
               style={{ width: 130 }} />
           </Field>
-          <Field label="红利税（ppm）">
-            <input value={cfg.portfolio?.dividend_tax_ppm ?? 0}
-              onChange={(e) => set('portfolio.dividend_tax_ppm', num(e.target.value))}
-              style={{ width: 100 }} />
-          </Field>
+          {!isCrypto && (
+            <Field label="红利税（ppm）">
+              <input value={cfg.portfolio?.dividend_tax_ppm ?? 0}
+                onChange={(e) => set('portfolio.dividend_tax_ppm', num(e.target.value))}
+                style={{ width: 100 }} />
+            </Field>
+          )}
+          {isCrypto && (
+            <>
+              <Field label="杠杆（倍）">
+                <input value={cfg.portfolio?.leverage ?? 1}
+                  onChange={(e) => set('portfolio.leverage', num(e.target.value))}
+                  style={{ width: 80 }} />
+              </Field>
+              <Field label="维持保证金率（ppm）">
+                <input value={cfg.portfolio?.maint_margin_ppm ?? 5000}
+                  onChange={(e) => set('portfolio.maint_margin_ppm', num(e.target.value))}
+                  style={{ width: 100 }} />
+              </Field>
+            </>
+          )}
           <Field label="指标复权基准">
             <select value={cfg.engine?.indicator_adj ?? 'hfq'}
               onChange={(e) => set('engine.indicator_adj', e.target.value)}>
@@ -188,6 +211,15 @@ export default function ConfigBuilder({
           </Field>
         </div>
         <p className="note">{cat.notes.indicator_adj}</p>
+        {isCrypto && (
+          <p className="note">
+            加密永续固定<strong>逐仓 + 双向持仓</strong>：每个仓位有自己的一份保证金，
+            爆仓只吃掉那一份、不牵连余额与其他仓位；同一标的可同时持多与持空，
+            各自独立记账、独立爆仓。杠杆越高保证金越少，
+            也就越容易在一次回撤里被强平 —— 强平会出现在结果页的账本告警里。
+            红利税不适用（永续没有分红送配）。
+          </p>
+        )}
       </Section>
 
       <Section title="绩效与记录">

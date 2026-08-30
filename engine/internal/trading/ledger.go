@@ -127,13 +127,23 @@ type Liquidation struct {
 	Qty  int64
 	// Price 强平成交价（定点）
 	Price int64
-	// Reason 人读的原因，如「维持保证金率 3.2% 低于 5%」
+	// NotionalCents 被强平仓位的名义额（计价币种最小单位）。
+	//
+	// **数量与价格都是定点的**，脱离标的的 scale 读不出意义
+	// （加密的 253000000 是 2.53 张，不是 2.53 亿）。
+	// 名义额不需要 scale 就能读，所以它才是消息里该出现的量。
+	NotionalCents int64
+	// LostMarginCents 这次强平损失掉的保证金。逐仓下它就是这个仓位
+	// 亏掉的全部 —— 不倒扣余额
+	LostMarginCents int64
+	// Reason 人读的原因，如「逐仓权益 −11.24 低于维持保证金 0.78」
 	Reason string
 }
 
 func (l Liquidation) String() string {
-	return fmt.Sprintf("%d 强平 %d：%s %d 股 @ %d（%s）",
-		l.At.TradingDay, l.Instrument, l.Side, l.Qty, l.Price, l.Reason)
+	return fmt.Sprintf("%d 强平标的 %d：%s 仓位，名义额 %.2f，损失保证金 %.2f（%s）",
+		l.At.TradingDay, l.Instrument, sideWord(l.Side),
+		cents(l.NotionalCents), cents(l.LostMarginCents), l.Reason)
 }
 
 // 编译期确认现货账本满足接口。少一个方法就在这里报错。

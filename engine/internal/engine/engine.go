@@ -161,6 +161,13 @@ func New(d Deps, s Strategy, cfg Config) (*Engine, error) {
 	if e.cfg.Params == nil {
 		e.cfg.Params = Params{}
 	}
+	// 账本按市价重估持仓时要知道标的的 scale 与合约乘数。
+	// **不注入的话会退回 A 股口径**，在加密上差十几个数量级
+	if pf, ok := d.Ledger.(*trading.Portfolio); ok {
+		pf.SetValuer(func(id mktdata.InstrumentID, price, qty int64) int64 {
+			return trading.NotionalCents(d.Universe.Get(id), price, qty)
+		})
+	}
 	e.ctx = &stepCtx{e: e}
 	if err := s.Init(e); err != nil {
 		return nil, fmt.Errorf("策略 %s 初始化失败: %w", s.Name(), err)

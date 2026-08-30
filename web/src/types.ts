@@ -227,8 +227,15 @@ export type CurvePoint = {
 export type RunFill = {
   d: number; id: number; symbol: string; name: string
   side: 'buy' | 'sell'
+  /** 平仓单。双向市场下「卖」有两个意思，没有它读不出是平多还是开空 */
+  reduce: boolean
+  /** 人读的开平方向：开多 / 平多 / 开空 / 平空；单向市场下是「买」「卖」 */
+  leg: string
   price: number; qty: number; amount: number
   fee: number; slippage: number; tag: string
+  /** 这一行自己的定点标度 —— **不要用全局 scale**，加密的与 A 股差几个数量级 */
+  priceScale: number
+  qtyScale: number
 }
 
 export type RunReject = {
@@ -242,10 +249,31 @@ export type RoundTrip = {
   openDay: number; closeDay: number
   qty: number; cost: number; proceed: number; pnl: number
   holdDays: number; fromBonus: boolean
+  /** 这一行自己的数量标度：加密 1e8，A 股 1 */
+  qtyScale: number
+  /** 这是一轮做空 —— 高开低平才是赚 */
+  short: boolean
+}
+
+// MarketInfo 本次回测所在市场的展示口径，由服务端从 Market 取。
+//
+// **前端不要按市场名自己查表**：漏了一个市场只会安静地印出「元」，
+// 而加密账户的余额不是元 —— 单位错的数字看上去完全正常。
+export type MarketInfo = {
+  impl: string
+  /** 计价单位，如「元」「USDT」 */
+  money: string
+  /** 数量单位，如「股」「张」 */
+  qty: string
+  /** 双向持仓：成交要区分开多/开空/平多/平空 */
+  hedge: boolean
+  /** 年化系数：A 股约 243、加密 365 */
+  annualDays: number
 }
 
 export type RunResult = {
   name: string
+  market: MarketInfo
   config: unknown
   stats: {
     steps: number; durationMs: number; instruments: number
