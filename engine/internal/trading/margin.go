@@ -247,6 +247,29 @@ func (m *MarginLedger) slot(side Side) map[mktdata.InstrumentID]*MarginPos {
 	return m.short
 }
 
+// CostBasisCents 逐仓：可用余额 + 各仓位占用的保证金。
+//
+// **占用的是保证金而不是名义额** —— 逐仓下真正投出去的钱就是那份保证金，
+// 名义额是杠杆放大出来的敞口，不是本金。
+func (m *MarginLedger) CostBasisCents() int64 {
+	v := m.cash
+	for _, p := range m.long {
+		v += p.MarginCents
+	}
+	for _, p := range m.short {
+		v += p.MarginCents
+	}
+	return v
+}
+
+// AffordOpen 逐仓：保证金 + 摩擦不得超过**可用余额**。
+//
+// 注意分母是余额而不是购买力：购买力已经把杠杆乘进去了，
+// 而摩擦是实打实从余额里出的，不吃杠杆。
+func (m *MarginLedger) AffordOpen(amountCents, frictionCents int64) bool {
+	return m.marginFor(amountCents)+frictionCents <= m.cash
+}
+
 // CanFill 判断一笔成交是否可行。
 func (m *MarginLedger) CanFill(f Fill) (RejectReason, string, bool) {
 	side, opening := m.posFor(f.Order)

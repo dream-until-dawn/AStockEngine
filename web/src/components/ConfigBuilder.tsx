@@ -59,8 +59,62 @@ export default function ConfigBuilder({
   // 两处都在「往一份 JSON 里定点写值」，没有理由是两套写法
   const set = (path: string, v: unknown) => onChange(setPath(cfg, path, v))
 
+  // 换市场是**换一整套**：行情分区、交易规则、费率、账本、计价货币、
+  // 初始资金、基准标的 —— 它们互相咬合，只改其中一个就是一份跑不起来
+  // （或者更糟：跑得起来但口径不对）的配置。
+  //
+  // **不支持跨市场回测**：A 股 T+1 单向、加密 T+0 双向 365 天年化，
+  // 两套规则没法同时套在一个账户上。所以这里是单选而不是多选。
+  const switchMarket = (m: string) => {
+    const crypto = m === 'crypto'
+    let next = setPath(cfg, 'data.market', m)
+    next = setPath(next, 'market', { impl: crypto ? 'crypto' : 'ashare' })
+    next = setPath(next, 'fee', {
+      impl: 'config',
+      params: { path: crypto ? 'crypto_okx.json' : 'ashare_default.json' },
+    })
+    next = setPath(next, 'portfolio.ledger', crypto ? 'margin' : 'spot')
+    next = setPath(next, 'portfolio.initial_cash_cents', crypto ? 100_000 : 2_000_000)
+    next = setPath(next, 'metrics.benchmark', crypto ? 'BTC-USDT-SWAP' : '')
+    // 标的池按市场清掉：A 股的代码在加密分区里一只都命中不了，
+    // 留着只会得到一个空池子和一份「零成交」的报告
+    next = setPath(next, 'data.universe', crypto ? { market: ['crypto'] } : { market: ['ashare'] })
+    if (!crypto) {
+      next = setPath(next, 'portfolio.leverage', 1)
+    }
+    onChange(next)
+  }
+
   return (
     <div style={{ display: 'grid', gap: 12 }}>
+      <Section title="市场">
+        <div className="filters">
+          <Field label="市场">
+            <select value={marketImpl} onChange={(e) => switchMarket(
+              e.target.value === 'crypto' ? 'crypto' : 'ashare')}>
+              {cat.market.map((m) => (
+                <option key={m.name} value={m.name}>
+                  {m.name}（{m.desc}）
+                </option>
+              ))}
+            </select>
+          </Field>
+          <Field label="计价货币">
+            <input value={cur} readOnly style={{ width: 80 }} />
+          </Field>
+          <Field label="双向持仓">
+            <input type="checkbox" checked={allowsShort} readOnly />
+          </Field>
+        </div>
+        <p className="note">
+          <strong>不支持跨市场回测</strong>：A 股是 T+1、单向、有涨跌停、
+          年化按日历数出来约 243 天；加密永续是 T+0、双向、无涨跌停、一年 365 天。
+          两套规则没法同时套在一个账户上，所以这里是单选。
+          换市场会**连带换掉**行情分区、交易规则、费率、账本、初始资金、
+          基准标的与标的池 —— 它们互相咬合，只改一个会得到一份口径不对的配置。
+        </p>
+      </Section>
+
       <Section title="数据与标的池">
         <div className="filters">
           <Field label="起始交易日">
@@ -76,13 +130,6 @@ export default function ConfigBuilder({
               onChange={(e) => set('data.to', num(e.target.value))}
               placeholder="0" style={{ width: 120 }}
             />
-          </Field>
-          <Field label="行情分区">
-            <select value={cfg.data?.market ?? 'ashare'}
-              onChange={(e) => set('data.market', e.target.value)}>
-              <option value="ashare">ashare</option>
-              <option value="crypto">crypto</option>
-            </select>
           </Field>
         </div>
         <p className="note">
@@ -102,7 +149,8 @@ export default function ConfigBuilder({
       <Section title="策略">
         <StrategySlot
           cat={cat}
-          value={(cfg.strategy ?? { impl: '' }) as ModuleValue}
+          // 没配策略时默认规则树 —— 绝大多数决策都用它表达
+          value={(cfg.strategy ?? { impl: 'rule_tree', params: blankRuleTree() }) as ModuleValue}
           onChange={(v) => set('strategy', v)}
           allowsShort={allowsShort}
         />
@@ -326,7 +374,7 @@ function StrategySlot({
         <Field label="实现">
           <select value={value.impl}
             onChange={(e) => onChange(switchImpl(cat.strategy, value, e.target.value))}>
-            <ImplOptions list={cat.strategy} />
+            <ImplOptions list={cat.strategy} current={value.impl} />
             {/* composite 不在 registry 里 —— 它是装配层的东西，
                 由 sources 与 mode 描述，没有自己的 ParamSpec */}
             <option value="composite">composite（多决策源组合）</option>
@@ -418,7 +466,7 @@ function StrategySlot({
                   {!hedgePair && (
                     <select value={s.impl}
                       onChange={(e) => setSrc(switchImpl(cat.strategy, s, e.target.value))}>
-                      <ImplOptions list={cat.strategy} />
+                      <ImplOptions list={cat.strategy} current={s.impl} />
                     </select>
                   )}
                   {/* 双向的这一对是固定的：增删改序都会把它变成别的东西，
@@ -489,7 +537,7 @@ function ModuleSlot({
         {label && <span className="k" style={{ minWidth: 68 }}>{label}</span>}
         <select value={value.impl}
           onChange={(e) => onChange(switchImpl(list, value, e.target.value))}>
-          <ImplOptions list={list} />
+          <ImplOptions list={list} current={value.impl} />
         </select>
       </div>
       <ParamForm
@@ -536,7 +584,7 @@ function FeeSlot({
         <span className="k" style={{ minWidth: 68 }}>费率</span>
         <select value={value.impl}
           onChange={(e) => onChange(switchImpl(cat.fee, value, e.target.value))}>
-          <ImplOptions list={cat.fee} />
+          <ImplOptions list={cat.fee} current={value.impl} />
         </select>
         {isConfig && (
           <select value={String(params.path ?? '')}
@@ -685,7 +733,7 @@ function RuleChain({
             <select value={r.impl}
               onChange={(e) => onChange(value.map((x, j) =>
                 j === i ? switchImpl(list, x, e.target.value) : x))}>
-              <ImplOptions list={list} />
+              <ImplOptions list={list} current={r.impl} />
             </select>
             <button disabled={i === 0}
               onClick={() => onChange(swap(value, i, i - 1))}>↑</button>
@@ -870,12 +918,17 @@ function specsOf(list: ModuleSpec[], impl: string): ParamSpec[] {
  * 英文名要留着 —— 它是配置 JSON 里真正写的东西，也是文档与报错里
  * 出现的名字。只显示中文会让用户在 JSON 里对不上号。
  */
-function ImplOptions({ list }: { list: ModuleSpec[] }) {
+// ImplOptions 实现选单。
+//
+// **legacy 的默认不显示**，但当前配置正在用的那个一定要显示 ——
+// 否则打开一份旧配置时选单会显示成另一个实现，一保存就把它悄悄换掉了。
+function ImplOptions({ list, current }: { list: ModuleSpec[]; current?: string }) {
+  const shown = list.filter((m) => !m.legacy || m.name === current)
   return (
     <>
-      {list.map((m) => (
+      {shown.map((m) => (
         <option key={m.name} value={m.name}>
-          {m.name}{m.desc ? `（${m.desc}）` : ''}
+          {m.name}{m.desc ? `（${m.desc}）` : ''}{m.legacy ? ' ⚠ 旧实现' : ''}
         </option>
       ))}
     </>
@@ -911,7 +964,12 @@ function switchImpl(list: ModuleSpec[], cur: ModuleValue, impl: string): ModuleV
   if (impl === 'composite') {
     next.params = undefined
     next.mode = cur.mode ?? 'union'
-    next.sources = cur.sources ?? []
+    // 组合默认给两个规则树源 —— 空 sources 的组合装配时会直接报错，
+    // 而「加了组合却什么都没发生」比报错更难懂
+    next.sources = cur.sources?.length ? cur.sources : [
+      { impl: 'rule_tree', params: blankRuleTree() as any },
+      { impl: 'rule_tree', params: blankRuleTree() as any },
+    ]
   }
   return next
 }

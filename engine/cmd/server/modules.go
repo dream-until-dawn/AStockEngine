@@ -52,6 +52,12 @@ type moduleDTO struct {
 	// AllowsShort 支不支持做空。决定「仅做空」「双向持仓」
 	// 两个模式要不要出现在选单里
 	AllowsShort bool `json:"allowsShort,omitempty"`
+	// Legacy 旧实现：仍能跑（既有配置在用），但**装配器不再提供**。
+	//
+	// 不从注册表里删掉，是因为删了既有配置就直接报错；
+	// 也不放进选单，是因为它们已经不是推荐做法。
+	// JSON 仍是逃生口 —— 手写照样能用。
+	Legacy bool `json:"legacy,omitempty"`
 	// Money / QtyUnit 计价与数量单位，如 元/股、USDT/张
 	Money   string `json:"money,omitempty"`
 	QtyUnit string `json:"qtyUnit,omitempty"`
@@ -86,8 +92,12 @@ func collect(
 // handleModules 列出全部可用模块与它们的参数规格。
 func (s *Store) handleModules(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, map[string]any{
-		"strategy": collect(eng.Strategies.Names(), eng.Strategies.Specs, eng.Strategies.Desc),
-		"sizer":    collect(trading.Sizers.Names(), trading.Sizers.Specs, trading.Sizers.Desc),
+		"strategy": markLegacy(
+			collect(eng.Strategies.Names(), eng.Strategies.Specs, eng.Strategies.Desc),
+			primaryStrategies),
+		"sizer": markLegacy(
+			collect(trading.Sizers.Names(), trading.Sizers.Specs, trading.Sizers.Desc),
+			primarySizers),
 		"risk":     collect(trading.Risks.Names(), trading.Risks.Specs, trading.Risks.Desc),
 		"exit":     collect(trading.Exits.Names(), trading.Exits.Specs, trading.Exits.Desc),
 		"slippage": collect(trading.Slippages.Names(), trading.Slippages.Specs, trading.Slippages.Desc),
@@ -275,4 +285,36 @@ func marketCatalog() []moduleDTO {
 		out[i].Money, out[i].QtyUnit = money, qty
 	}
 	return out
+}
+
+// primaryStrategies 装配器里提供的策略实现。
+//
+// **只有三项**：规则树表达绝大多数决策（选指标、拼条件、组成买入/有效/卖出
+// 三棵树），网格是它表达不了的那一类（非信号驱动、按价格区间挂单），
+// 组合把多个决策源合起来。
+//
+// 其余的 macd_cross / ma_cross / rsi_reversion / donchian_breakout /
+// buy_and_hold 都是**规则树的特例**，当初是硬编码写死的。留在注册表里
+// 让既有配置能跑，但不再放进选单 —— 同样的逻辑用规则树拼得出来，
+// 而且拼出来的能改。
+var primaryStrategies = map[string]bool{
+	"rule_tree": true,
+	"grid":      true,
+}
+
+// primarySizers 装配器里提供的仓位方法。
+//
+// 定额下注的两个（fixed_cash / fixed_qty）不再提供 —— 回测里几乎总是
+// 要复利复投，而定额会让「20 年的收益」变成「20 年里每次都赌同样多」。
+var primarySizers = map[string]bool{
+	"equal_weight":      true,
+	"pct_equity":        true,
+	"strength_weighted": true,
+}
+
+func markLegacy(items []moduleDTO, primary map[string]bool) []moduleDTO {
+	for i := range items {
+		items[i].Legacy = !primary[items[i].Name]
+	}
+	return items
 }

@@ -743,6 +743,20 @@ func (c *stepCtx) InitialCashCents() int64 { return c.e.cfg.InitialCashCents }
 func (c *stepCtx) PeakEquityCents() int64  { return c.e.peakEquity }
 func (c *stepCtx) Market() trading.Market  { return c.e.market }
 
+// FrictionCents 用**与真正撮合同一套** Fee/Slippage 估这笔成交的摩擦。
+//
+// Sizer 定量时要先把这笔钱留出来 —— 不留的话算出的数量刚好花光资金，
+// 撮合必然因为那点手续费整单被拒。
+func (c *stepCtx) FrictionCents(
+	inst *mktdata.Instrument, side trading.Side, qty, amountCents int64,
+) int64 {
+	bar, ok := c.e.cur.Bar(inst.ID)
+	if !ok {
+		return 0
+	}
+	return c.e.broker.FrictionCents(inst, side, c.time.TradingDay, qty, amountCents, bar)
+}
+
 func (c *stepCtx) Available(id mktdata.InstrumentID) int64 {
 	return c.e.led.Available(id, c.time.TsClose)
 }

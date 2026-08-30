@@ -19,6 +19,8 @@ type fakeSizeCtx struct {
 	avail   map[mktdata.InstrumentID]int64
 	mkt     Market
 	peak    int64
+	// frictionPPM 每笔成交的摩擦占成交额的百万分之一。0 = 不收
+	frictionPPM int64
 	// led 显式指定账本。为空时用 pf —— 大多数用例只关心现货，
 	// 但双向的用例要塞一个 MarginLedger 进来
 	led Ledger
@@ -35,6 +37,16 @@ func (c *fakeSizeCtx) InitialCashCents() int64 { return c.initial }
 func (c *fakeSizeCtx) PeakEquityCents() int64  { return c.peak }
 func (c *fakeSizeCtx) Pending() []PendingOrder { return c.pending }
 func (c *fakeSizeCtx) Market() Market          { return c.mkt }
+
+// friction 每笔成交的摩擦（分）。默认 0 —— 大多数用例算的是
+// 「预算怎么切」，把手续费混进来只会让断言里的数字没法心算。
+// 专门测「预算要覆盖摩擦」的用例把它设成非零。
+func (c *fakeSizeCtx) FrictionCents(_ *mktdata.Instrument, _ Side, _, amountCents int64) int64 {
+	if c.frictionPPM <= 0 {
+		return 0
+	}
+	return roundHalfUp(amountCents*c.frictionPPM, 1_000_000)
+}
 
 func (c *fakeSizeCtx) Time() mktdata.TimePoint {
 	return mktdata.TimePoint{TradingDay: 20250102}

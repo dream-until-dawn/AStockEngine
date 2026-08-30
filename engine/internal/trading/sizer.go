@@ -3,6 +3,7 @@ package trading
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/mktdata"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/registry"
@@ -71,6 +72,13 @@ type SizeContext interface {
 	Instrument(id mktdata.InstrumentID) *mktdata.Instrument
 	Pending() []PendingOrder
 	Market() Market
+	// FrictionCents 这笔成交要付出的摩擦（费用 + 滑点）。
+	//
+	// **定量时必须先把它留出来**：不留的话算出的数量刚好花光可用资金，
+	// 撮合时 `金额 + 费用 + 滑点 > 购买力`，整单被拒 ——
+	// 表现为「按 100% 权益下注反而一笔都开不出来」，而且报的是
+	// 「现金不足」，看不出差的其实只是手续费那一点。
+	FrictionCents(inst *mktdata.Instrument, side Side, qty, amountCents int64) int64
 }
 
 // Sizer 把信号转成订单。
@@ -159,11 +167,125 @@ func entrySide(sig Signal, ctx SizeContext) Side {
 	return SideBuy
 }
 
+// sizeBase 按基准口径取出可分配的资金总量。
+//
+//	cost    已投入本金（现金 + 持仓成本）= 权益 − 未实现盈亏
+//	equity  当前权益（浮盈立刻用于加仓）
+//	initial 初始资金（定额下注，不复利）
+//
+// **默认是 cost**：10000 切 10 份、每份 1000，先买 5 只；这 5 只涨到
+// 11000 之后再买 5 只，仍然是每份 1000 而不是 1100 ——
+// 浮盈还没落袋，拿它加仓等于用没到手的钱下注。
+// 已实现的盈亏照常滚进去（它已经在现金里了）。
+func sizeBase(ctx SizeContext, base string) int64 {
+	switch base {
+	case "equity":
+		return ctx.EquityCents()
+	case "initial":
+		return ctx.InitialCashCents()
+	default:
+		return ctx.Ledger().CostBasisCents()
+	}
+}
+
+// rankEntries 把建仓候选按指定口径排序。
+//
+// # 为什么需要它
+//
+// 同一天有 20 只标的发出买入信号，而只剩 3 个空位时，
+// 从前拿到的是**标的 ID 最小的 3 只** —— 那是数据的顺序，不是任何策略。
+//
+//	amount  当日成交额大的优先（默认）
+//	volume  当日成交量大的优先
+//	signal  策略给出的顺序，不重排
+//
+// **默认按成交额而不是成交量**：成交量是「多少股 / 多少张」，
+// 跨标的不可比 —— 100 股 300 元的股票与 100 股 3 元的股票是同一个成交量，
+// 而流动性差 100 倍。成交额已经把价格乘进去了，是同一量纲。
+// 想按成交量排就把 order_by 设成 volume。
+//
+// 排序**必须稳定**，且同值时按 ID 兜底 —— 否则同一份配置两次跑出的
+// 顺序不同，C5 就在这里失守。
+func rankEntries(sigs []Signal, ctx SizeContext, orderBy string) []Signal {
+	if orderBy == "signal" || len(sigs) < 2 {
+		return sigs
+	}
+	key := func(sig Signal) int64 {
+		b, ok := ctx.Bar(sig.Instrument)
+		if !ok {
+			return 0
+		}
+		if orderBy == "volume" {
+			return b.Volume
+		}
+		return b.Amount
+	}
+	out := make([]Signal, len(sigs))
+	copy(out, sigs)
+	sort.SliceStable(out, func(i, j int) bool {
+		ki, kj := key(out[i]), key(out[j])
+		if ki != kj {
+			return ki > kj
+		}
+		return out[i].Instrument < out[j].Instrument
+	})
+	return out
+}
+
+// splitEntries 先把清仓 / 策略定量的信号处理掉，再把剩下的建仓候选排好序。
+//
+// **清仓排在建仓之前**：卖出释放的资金正是买入要用的。
+// 反过来的话，同一天里「卖 A 买 B」会因为 A 的钱还没回来而买不进 B。
+func splitEntries(
+	sigs []Signal, ctx SizeContext, orderBy string,
+) (done []Order, entries []Signal) {
+
+	done = make([]Order, 0, len(sigs))
+	entries = make([]Signal, 0, len(sigs))
+	for _, sig := range sigs {
+		if o, ok, handled := dispatch(sig, ctx); handled {
+			if ok {
+				done = append(done, o)
+			}
+			continue
+		}
+		entries = append(entries, sig)
+	}
+	return done, rankEntries(entries, ctx, orderBy)
+}
+
 // buyQty 按预算折算数量并交给 Market 规整。
 //
 // 规整必须走 Market：100 股整数倍、零股卖出这些规则属于市场而非仓位方法，
 // 不该在每个 Sizer 里各写一遍（远期加密货币的最小单位完全不同）。
+//
+// # 预算要覆盖「金额 + 摩擦」，不只是金额
+//
+// 撮合时校验的是 `金额 + 费用 + 滑点 ≤ 购买力`。若定量只按金额算，
+// 预算等于全部权益时（`pct_equity` 设 100%）算出的数量刚好花光资金，
+// 撮合必然因为那点手续费而整单被拒，报「现金不足」——
+// 看不出差的只是手续费。
+//
+// 摩擦几乎都与金额成正比，所以按比例缩一次就很接近；
+// 再逐次退让几档兜住印花税那种有下限的规则。
 func buyQty(ctx SizeContext, id mktdata.InstrumentID, budgetCents int64) (int64, bool) {
+	return buyQtyFit(ctx, id, budgetCents, false)
+}
+
+// buyQtyFit 同上，fitCash 为真时**再按账户实际拿得出的钱缩一次**。
+//
+// 两件事必须分开，它们的性质完全不同：
+//
+//	预算覆盖摩擦   —— 修的是「算漏了手续费」，本来就该这样
+//	按可用资金缩量 —— 把「钱不够就不买」改成「钱不够就少买」，
+//	                 这是一条**仓位政策**，不是 bug
+//
+// 后者影响很大：实测 macd_cross 从 +17.85% 变成 −17.01%（成交 1833 → 1929）——
+// 因为本来会被拒掉的单子现在变成了小一号的成交。所以它默认关闭，
+// 由 `fit_cash` 显式打开。
+func buyQtyFit(
+	ctx SizeContext, id mktdata.InstrumentID, budgetCents int64, fitCash bool,
+) (int64, bool) {
 	bar, ok := ctx.Bar(id)
 	if !ok || bar.Suspended() || bar.Close <= 0 {
 		return 0, false
@@ -172,15 +294,49 @@ func buyQty(ctx SizeContext, id mktdata.InstrumentID, budgetCents int64) (int64,
 	if inst == nil {
 		return 0, false
 	}
-	// 按**标的自己的 scale 与合约乘数**折算，且走 128 位 ——
-	// 写死 ×10 是 A 股口径，在加密上算出来的数量差十几个数量级，
-	// 然后被 NormalizeQty 判成 0，信号就这么静默消失了
-	raw := QtyForCents(inst, bar.Close, budgetCents)
-	if raw <= 0 {
+	if budgetCents <= 0 {
 		return 0, false
 	}
 	held := ctx.Ledger().Exposure(id).Long
-	return ctx.Market().NormalizeQty(inst, raw, SideBuy, held)
+
+	// 先按不含摩擦的预算试一版，再往下收敛到「含摩擦也放得下」
+	target := budgetCents
+	for i := 0; i < 6; i++ {
+		// 按**标的自己的 scale 与合约乘数**折算，且走 128 位 ——
+		// 写死 ×10 是 A 股口径，在加密上算出来的数量差十几个数量级，
+		// 然后被 NormalizeQty 判成 0，信号就这么静默消失了
+		raw := QtyForCents(inst, bar.Close, target)
+		if raw <= 0 {
+			return 0, false
+		}
+		qty, ok := ctx.Market().NormalizeQty(inst, raw, SideBuy, held)
+		if !ok || qty <= 0 {
+			return 0, false
+		}
+		amount := NotionalCents(inst, bar.Close, qty)
+		friction := ctx.FrictionCents(inst, SideBuy, qty, amount)
+		fits := amount+friction <= budgetCents
+		if fits && (!fitCash || ctx.Ledger().AffordOpen(amount, friction)) {
+			return qty, true
+		}
+		// 放不下：把目标按「预算 ÷ 实际要花的钱」缩一次。
+		// 比例缩不动时（规整到同一档）再硬退一格，避免原地打转
+		limit := budgetCents
+		if fitCash {
+			if bp := ctx.Ledger().BuyingPowerCents(); bp < limit {
+				limit = bp
+			}
+		}
+		next := MulDiv(target, limit, amount+friction)
+		if next >= target {
+			next = target - target/64 - 1
+		}
+		target = next
+		if target <= 0 {
+			return 0, false
+		}
+	}
+	return 0, false
 }
 
 // exitOrder 把清仓信号变成平仓单。
@@ -276,9 +432,21 @@ func dispatch(sig Signal, ctx SizeContext) (Order, bool, bool) {
 var equalWeightSpecs = []spec.ParamSpec{
 	{Name: "slots", Kind: spec.ParamInt, Default: 10, Min: 1, Max: 500, Step: 1,
 		Desc: "把资金等分成多少份，同时也是最多持有的标的数"},
-	{Name: "base", Kind: spec.ParamString, DefaultStr: "initial",
-		Options: []string{"initial", "equity"},
-		Desc:    "每份的计算基准：initial=初始资金（定额下注），equity=当前权益（复利）"},
+	{Name: "base", Kind: spec.ParamString, DefaultStr: "cost",
+		Options: []string{"cost", "equity", "initial"},
+		Desc: "每份的计算基准：" +
+			"cost=已投入本金（现金 + 持仓成本，浮盈不放大后续仓位）；" +
+			"equity=当前权益（浮盈立刻用于加仓）；" +
+			"initial=初始资金（定额下注，不复利 —— 旧配置在用，不建议新用）"},
+	{Name: "order_by", Kind: spec.ParamString, DefaultStr: "amount",
+		Options: []string{"amount", "volume", "signal"},
+		Desc: "候选多于空位时先给谁：" +
+			"amount=当日成交额大的优先（默认，流动性口径）；" +
+			"volume=当日成交量大的优先；" +
+			"signal=按策略给出的顺序"},
+	{Name: "fit_cash", Kind: spec.ParamBool, Default: 0, Min: 0, Max: 1, Step: 1,
+		Desc: "资金不够时缩量买入（开）还是整单放弃（关，默认）。" +
+			"打开后本会被「现金不足」拒掉的单子会变成小一号的成交，成交数与结果都会明显变化"},
 }
 
 // EqualWeight 等权：把基准资金切成 slots 份，每个建仓信号占一份。
@@ -290,17 +458,16 @@ var equalWeightSpecs = []spec.ParamSpec{
 //
 // 两者都是真实的仓位政策，没有哪个「更正确」，所以做成显式参数而非默认行为。
 type EqualWeight struct {
-	slots int
-	base  string
+	slots   int
+	base    string
+	orderBy string
+	fitCash bool
 }
 
 func (s *EqualWeight) Name() string { return "equal_weight" }
 
 func (s *EqualWeight) Size(sigs []Signal, ctx SizeContext) []Order {
-	budget := ctx.InitialCashCents()
-	if s.base == "equity" {
-		budget = ctx.EquityCents()
-	}
+	budget := sizeBase(ctx, s.base)
 	// **预算不足只挡建仓，不挡清仓。** 早期版本在这里直接 return nil，
 	// 结果权益归零的账户连卖都卖不出去 —— 由 TestSizerExitUsesAvailable 发现。
 	// 卖出从来不需要预算。
@@ -309,24 +476,18 @@ func (s *EqualWeight) Size(sigs []Signal, ctx SizeContext) []Order {
 		slotCents = budget / int64(s.slots)
 	}
 
+	out, entries := splitEntries(sigs, ctx, s.orderBy)
 	occ := occupancy(ctx)
 	used := occ.len()
-	out := make([]Order, 0, len(sigs))
 
-	for _, sig := range sigs {
-		if o, ok, handled := dispatch(sig, ctx); handled {
-			if ok {
-				out = append(out, o)
-			}
-			continue
-		}
+	for _, sig := range entries {
 		// 建仓方向：单向市场恒为买，双向市场跟随信号（Enter + 卖 = 开空）
 		side := entrySide(sig, ctx)
 		// 建仓：预算不足、已在场、仓位已满，三者任一即跳过
 		if slotCents <= 0 || occ.has(sig.Instrument, side) || used >= s.slots {
 			continue
 		}
-		qty, ok := buyQty(ctx, sig.Instrument, slotCents)
+		qty, ok := buyQtyFit(ctx, sig.Instrument, slotCents, s.fitCash)
 		if !ok {
 			continue
 		}
@@ -358,16 +519,10 @@ type FixedCash struct {
 func (s *FixedCash) Name() string { return "fixed_cash" }
 
 func (s *FixedCash) Size(sigs []Signal, ctx SizeContext) []Order {
+	out, entries := splitEntries(sigs, ctx, "amount")
 	occ := occupancy(ctx)
 	used := occ.len()
-	out := make([]Order, 0, len(sigs))
-	for _, sig := range sigs {
-		if o, ok, handled := dispatch(sig, ctx); handled {
-			if ok {
-				out = append(out, o)
-			}
-			continue
-		}
+	for _, sig := range entries {
 		// 建仓方向：单向市场恒为买，双向市场跟随信号（Enter + 卖 = 开空）
 		side := entrySide(sig, ctx)
 		if occ.has(sig.Instrument, side) {
@@ -408,16 +563,10 @@ type FixedQty struct {
 func (s *FixedQty) Name() string { return "fixed_qty" }
 
 func (s *FixedQty) Size(sigs []Signal, ctx SizeContext) []Order {
+	out, entries := splitEntries(sigs, ctx, "amount")
 	occ := occupancy(ctx)
 	used := occ.len()
-	out := make([]Order, 0, len(sigs))
-	for _, sig := range sigs {
-		if o, ok, handled := dispatch(sig, ctx); handled {
-			if ok {
-				out = append(out, o)
-			}
-			continue
-		}
+	for _, sig := range entries {
 		// 建仓方向：单向市场恒为买，双向市场跟随信号（Enter + 卖 = 开空）
 		side := entrySide(sig, ctx)
 		if occ.has(sig.Instrument, side) {
@@ -452,33 +601,41 @@ var pctEquitySpecs = []spec.ParamSpec{
 		Desc: "每笔占当前权益的百分比"},
 	{Name: "max_positions", Kind: spec.ParamInt, Default: 0, Min: 0, Max: 5000, Step: 1,
 		Desc: "最多同时持有多少只，0 表示不限"},
+	{Name: "base", Kind: spec.ParamString, DefaultStr: "cost",
+		Options: []string{"cost", "equity"},
+		Desc: "百分比的基准：cost=已投入本金（浮盈不放大后续仓位）；" +
+			"equity=当前权益（浮盈立刻用于加仓）"},
+	{Name: "order_by", Kind: spec.ParamString, DefaultStr: "amount",
+		Options: []string{"amount", "volume", "signal"},
+		Desc: "候选多于空位时先给谁：amount=当日成交额大的优先（默认）；" +
+			"volume=当日成交量大的优先；signal=按策略给出的顺序"},
+	{Name: "fit_cash", Kind: spec.ParamBool, Default: 0, Min: 0, Max: 1, Step: 1,
+		Desc: "资金不够时缩量买入（开）还是整单放弃（关，默认）。" +
+			"打开后本会被「现金不足」拒掉的单子会变成小一号的成交，成交数与结果都会明显变化"},
 }
 
-// PctEquity 每笔占当前权益的固定比例。与 equal_weight base=equity 的区别在于
-// 它不受「份数」约束 —— 可以叠到超过 100%（会被现金不足自然挡住）。
+// PctEquity 每笔占基准资金的固定比例。与 equal_weight 的区别在于
+// 它不受「份数」约束 —— 可以叠到超过 100%（会被资金不足自然挡住）。
 type PctEquity struct {
 	ppm          int64 // pct 转成百万分之一，避免浮点参与金额计算
 	maxPositions int
+	base         string
+	orderBy      string
+	fitCash      bool
 }
 
 func (s *PctEquity) Name() string { return "pct_equity" }
 
 func (s *PctEquity) Size(sigs []Signal, ctx SizeContext) []Order {
-	// 同 EqualWeight：权益为零也必须能卖
+	// 同 EqualWeight：资金为零也必须能卖
 	budget := int64(0)
-	if eq := ctx.EquityCents(); eq > 0 {
-		budget = eq * s.ppm / 1_000_000
+	if b := sizeBase(ctx, s.base); b > 0 {
+		budget = MulDiv(b, s.ppm, 1_000_000)
 	}
+	out, entries := splitEntries(sigs, ctx, s.orderBy)
 	occ := occupancy(ctx)
 	used := occ.len()
-	out := make([]Order, 0, len(sigs))
-	for _, sig := range sigs {
-		if o, ok, handled := dispatch(sig, ctx); handled {
-			if ok {
-				out = append(out, o)
-			}
-			continue
-		}
+	for _, sig := range entries {
 		// 建仓方向：单向市场恒为买，双向市场跟随信号（Enter + 卖 = 开空）
 		side := entrySide(sig, ctx)
 		if budget <= 0 || occ.has(sig.Instrument, side) {
@@ -487,7 +644,7 @@ func (s *PctEquity) Size(sigs []Signal, ctx SizeContext) []Order {
 		if s.maxPositions > 0 && used >= s.maxPositions {
 			continue
 		}
-		qty, ok := buyQty(ctx, sig.Instrument, budget)
+		qty, ok := buyQtyFit(ctx, sig.Instrument, budget, s.fitCash)
 		if !ok {
 			continue
 		}
@@ -508,6 +665,10 @@ var strengthWeightedSpecs = []spec.ParamSpec{
 		Desc: "本步全部建仓信号合计投入权益的百分比"},
 	{Name: "min_strength", Kind: spec.ParamFloat, Default: 0, Min: 0, Max: 1, Step: 0.01,
 		Desc: "低于此信心的信号直接丢弃"},
+	{Name: "base", Kind: spec.ParamString, DefaultStr: "cost",
+		Options: []string{"cost", "equity"},
+		Desc: "总预算的基准：cost=已投入本金（浮盈不放大后续仓位）；" +
+			"equity=当前权益（浮盈立刻用于加仓）"},
 }
 
 // StrengthWeighted 按信心分配：本步的建仓信号按 Strength 归一化瓜分总预算。
@@ -517,25 +678,21 @@ var strengthWeightedSpecs = []spec.ParamSpec{
 type StrengthWeighted struct {
 	totalPPM    int64
 	minStrength float64
+	base        string
 }
 
 func (s *StrengthWeighted) Name() string { return "strength_weighted" }
 
 func (s *StrengthWeighted) Size(sigs []Signal, ctx SizeContext) []Order {
-	eq := ctx.EquityCents()
+	eq := sizeBase(ctx, s.base)
+	// 按信心瓜分总预算，与「谁排前面」无关 —— 所以不排序
+	out, candidates := splitEntries(sigs, ctx, "signal")
 	occ := occupancy(ctx)
-	out := make([]Order, 0, len(sigs))
 
-	// 先把非建仓的处理掉，同时统计建仓信号的信心之和
+	// 统计建仓信号的信心之和
 	var sum float64
-	enters := make([]Signal, 0, len(sigs))
-	for _, sig := range sigs {
-		if o, ok, handled := dispatch(sig, ctx); handled {
-			if ok {
-				out = append(out, o)
-			}
-			continue
-		}
+	enters := make([]Signal, 0, len(candidates))
+	for _, sig := range candidates {
 		// 建仓方向：单向市场恒为买，双向市场跟随信号（Enter + 卖 = 开空）
 		side := entrySide(sig, ctx)
 		if occ.has(sig.Instrument, side) || sig.Strength < s.minStrength {
@@ -583,10 +740,20 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
-			return &EqualWeight{slots: p.Int("slots", 10), base: base}, nil
+			ob, err := registry.DecodeString(equalWeightSpecs, raw, "order_by")
+			if err != nil {
+				return nil, err
+			}
+			return &EqualWeight{
+				slots: p.Int("slots", 10), base: base, orderBy: ob,
+				fitCash: p.Bool("fit_cash", false),
+			}, nil
 		})
 
-	Sizers.Register("fixed_cash", "每笔投入固定金额", fixedCashSpecs,
+	// fixed_cash / fixed_qty 是**定额下注**，不复利。
+	// 装配器里已经不再提供（见 modules.go 的 legacy 标记）——
+	// 留在注册表里只为让既有配置还能跑
+	Sizers.Register("fixed_cash", "每笔投入固定金额（定额下注，不复利；旧配置在用）", fixedCashSpecs,
 		func(raw json.RawMessage) (Sizer, error) {
 			p, err := registry.DecodeParams(fixedCashSpecs, raw)
 			if err != nil {
@@ -599,7 +766,7 @@ func init() {
 			return &FixedCash{cents: c, maxPositions: p.Int("max_positions", 0)}, nil
 		})
 
-	Sizers.Register("fixed_qty", "每笔固定股数 / 份数", fixedQtySpecs,
+	Sizers.Register("fixed_qty", "每笔固定股数 / 份数（定额下注，不复利；旧配置在用）", fixedQtySpecs,
 		func(raw json.RawMessage) (Sizer, error) {
 			p, err := registry.DecodeParams(fixedQtySpecs, raw)
 			if err != nil {
@@ -610,13 +777,22 @@ func init() {
 			}, nil
 		})
 
-	Sizers.Register("pct_equity", "每笔投入当前权益的固定百分比（随盈亏复利）", pctEquitySpecs,
+	Sizers.Register("pct_equity", "每笔投入基准资金的固定百分比（复利）", pctEquitySpecs,
 		func(raw json.RawMessage) (Sizer, error) {
 			p, err := registry.DecodeParams(pctEquitySpecs, raw)
 			if err != nil {
 				return nil, err
 			}
+			base, err := registry.DecodeString(pctEquitySpecs, raw, "base")
+			if err != nil {
+				return nil, err
+			}
+			ob, err := registry.DecodeString(pctEquitySpecs, raw, "order_by")
+			if err != nil {
+				return nil, err
+			}
 			return &PctEquity{
+				base: base, orderBy: ob, fitCash: p.Bool("fit_cash", false),
 				ppm:          int64(p.Float("pct", 10) * 10_000),
 				maxPositions: p.Int("max_positions", 0),
 			}, nil
@@ -628,7 +804,12 @@ func init() {
 			if err != nil {
 				return nil, err
 			}
+			base, err := registry.DecodeString(strengthWeightedSpecs, raw, "base")
+			if err != nil {
+				return nil, err
+			}
 			return &StrengthWeighted{
+				base:        base,
 				totalPPM:    int64(p.Float("total_pct", 100) * 10_000),
 				minStrength: p.Float("min_strength", 0),
 			}, nil

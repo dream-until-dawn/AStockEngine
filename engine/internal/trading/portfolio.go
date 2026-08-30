@@ -175,6 +175,22 @@ func (pf *Portfolio) Available(id mktdata.InstrumentID, nowMs int64) int64 {
 	return 0
 }
 
+// CostBasisCents 现货：现金 + 各持仓的买入成本。
+func (pf *Portfolio) CostBasisCents() int64 {
+	v := pf.cash
+	for _, p := range pf.positions {
+		if p.Total > 0 {
+			v += p.CostCents
+		}
+	}
+	return v
+}
+
+// AffordOpen 现货：金额 + 摩擦不得超过可动用资金。
+func (pf *Portfolio) AffordOpen(amountCents, frictionCents int64) bool {
+	return amountCents+frictionCents <= pf.BuyingPowerCents()
+}
+
 // CanFill 在记账之前判断这笔成交能否落地。
 //
 // 撮合器问它而不是自己看现金 —— 「买得起吗」的答案取决于账户类型，

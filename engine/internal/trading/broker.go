@@ -226,6 +226,28 @@ type Broker struct {
 	Cfg      BrokerConfig
 }
 
+// FrictionCents 估算一笔成交要付出的摩擦（费用 + 滑点）。
+//
+// **给 Sizer 用的**：定量时必须先把这笔钱留出来，否则算出的数量
+// 刚好花光可用资金，撮合时 `金额 + 费用 + 滑点 > 购买力`，
+// 整单被拒 —— 表现为「按 100% 权益下注反而一笔都开不出来」。
+//
+// 用的是与真正撮合**同一套** Fee/Slippage 实例，所以不是估算而是精算
+// （唯一的差别是撮合时的成交价可能与这里传的参考价不同）。
+func (br *Broker) FrictionCents(
+	inst *mktdata.Instrument, side Side, day int32,
+	qty, amountCents int64, b mktdata.Bar,
+) int64 {
+	if qty <= 0 || amountCents <= 0 {
+		return 0
+	}
+	fee := br.Fee.Calc(FeeRequest{
+		Instrument: inst, Side: side, Liquidity: LiquidityTaker,
+		Qty: qty, AmountCents: amountCents, TradingDay: day,
+	})
+	return fee.Total + br.Slippage.CostCents(side, amountCents, b)
+}
+
 // NewBroker 装配撮合器。
 func NewBroker(m Market, f Fee, s Slippage, cfg BrokerConfig) *Broker {
 	if s == nil {

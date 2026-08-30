@@ -38,6 +38,16 @@ type Ledger interface {
 	BuyingPowerCents() int64
 	// RealizedCents 累计已实现盈亏
 	RealizedCents() int64
+	// CostBasisCents 现金 + 已投入到持仓里的成本 = **权益扣掉未实现盈亏**。
+	//
+	// 它回答的是「我这个账户一共投出去过多少钱」，而不是「现在值多少」。
+	//
+	// 用途是仓位定量：按它切份，浮盈**不会**放大后续仓位。
+	// 10000 切 10 份、每份 1000，先买 5 只；这 5 只涨到 11000 之后
+	// 再买 5 只，仍然是每份 1000 而不是 1100 ——
+	// 浮盈还没落袋，拿它加仓等于用没到手的钱下注。
+	// 已实现的盈亏则照常滚进去（它已经在现金里了）。
+	CostBasisCents() int64
 	// EquityCents 按给定标记价重估的总权益
 	EquityCents(marks map[mktdata.InstrumentID]int64) int64
 
@@ -60,6 +70,16 @@ type Ledger interface {
 	// 抽到账本里而不是留在 Broker：「买得起吗」的答案取决于账户类型，
 	// Broker 不该知道现货与保证金的区别。
 	CanFill(f Fill) (reason RejectReason, detail string, ok bool)
+	// AffordOpen 报告「这么大的名义额 + 这么多摩擦，开得起吗」。
+	//
+	// 与 CanFill 同一套判据，但**不需要先造出一笔成交** —— Sizer 定量时
+	// 就要问它。抽在账本里而不是让 Sizer 自己算，理由与 CanFill 一样：
+	// 现货是「金额 + 摩擦 ≤ 现金」，逐仓是「名义额 ÷ 杠杆 + 摩擦 ≤ 现金」，
+	// 两者形状不同，Sizer 不该知道这个区别。
+	//
+	// 不问的话，按 100% 权益下注会算出一个刚好花光**权益**的数量，
+	// 而能动用的其实只有**现金** —— 撮合时整单被拒，报「现金不足」。
+	AffordOpen(amountCents, frictionCents int64) bool
 
 	// ---- 记账 ----
 

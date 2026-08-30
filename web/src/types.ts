@@ -469,6 +469,13 @@ export interface ModuleSpec {
    * 硬编码会在加第三个市场时安静地漏掉它。
    */
   allowsShort?: boolean
+  /**
+   * 旧实现：仍能跑（既有配置在用），但装配器不再提供。
+   *
+   * 不从注册表删掉是因为删了既有配置直接报错；不放进选单是因为
+   * 它们已经不是推荐做法。手写 JSON 仍是逃生口。
+   */
+  legacy?: boolean
   /** 计价单位，如「元」「USDT」 */
   money?: string
   /** 数量单位，如「股」「张」 */
