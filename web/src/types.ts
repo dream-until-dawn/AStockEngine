@@ -580,3 +580,121 @@ export interface RuleTreeCfg {
   valid?: TreeNode | null
   sell: TreeNode | null
 }
+
+// ---- 海选（v0.5.1）----
+//
+// 字段顺序就是该读的顺序：**先看这次海选有没有意义**（noise + verdict），
+// 再看轴（margins），最后才谈区域（plateaus）。
+// 不先量噪声就排名，等于把噪声当结论。
+
+export interface SweepBrief {
+  id: string
+  name: string
+  base: string
+  createdAt: string
+  params: number
+  windows: number
+  annualDays: number
+  /** false = 这个目录没有清单（v0.5.1 之前跑的），只能列出、分析不了 */
+  analyzable: boolean
+}
+
+export interface SweepNoise {
+  /** 同一组参数在无意义扰动下的收益标准差（小数，0.01 = 1 个百分点） */
+  stdDev: number
+  range: number
+  samples: number
+  repeats: number
+}
+
+export interface SweepVerdict {
+  spread: number
+  noise: number
+  ratio: number
+  /** false 时**不该出排名** —— 整张网格都是同一片平地 */
+  meaningful: boolean
+  params: number
+}
+
+export interface SweepAttribution {
+  liquidations: number
+  haltExits: number
+  stopExits: number
+  avgFrictionRatio: number
+  avgOpenCostRatio: number
+  virtualTrips: number
+  /** 实仓逐轮收益率 − 虚拟逐轮收益率，为正才说明那棵有效性树该留 */
+  avgVirtualEdge: number
+  hasVirtual: boolean
+}
+
+export interface SweepMargin {
+  axis: string
+  values: { label: string; median: number; count: number }[]
+  spread: number
+  /** 跨度小于噪声基线 —— 这个轴分辨不出来 */
+  inert: boolean
+}
+
+export interface SweepPlateau {
+  centerId: number
+  params: string
+  neighbors: number
+  median: number
+  q1: number
+  q3: number
+  iqr: number
+  posRatio: number
+  samples: number
+  score: number
+  /** IQR ÷ 噪声基线。**≈1 是好事** —— 邻居之间的差异不超过噪声，这片是平的 */
+  flatVsNoise: number
+}
+
+export interface SweepTop {
+  paramId: number
+  params: string
+  median: number
+  q1: number
+  q3: number
+  posRatio: number
+  windows: number
+  /** 各窗口的样本外收益，用来画逐窗分布 */
+  oos: number[]
+}
+
+export interface SweepAnalysis {
+  sweepId: string
+  name: string
+  rows: number
+  failed: number
+  gated: number
+  params: number
+  windows: number
+  failBy?: Record<string, number>
+  gateBy?: Record<string, number>
+  thinParams: number
+  /** 窗口覆盖不足的比例过高 —— 下面每个数字都建在一个偏窄的子集上 */
+  thinWarn: boolean
+  noise: SweepNoise
+  verdict: SweepVerdict
+  attribution: SweepAttribution
+  margins: SweepMargin[]
+  plateaus: SweepPlateau[]
+  plateauNote?: string
+  top: SweepTop[]
+}
+
+export interface SweepDetail {
+  analysis: SweepAnalysis
+  manifest: {
+    base: string
+    createdAt: string
+    annualDays: number
+    windows: { Index: number; ISFrom: number; ISTo: number; OOSFrom: number; OOSTo: number }[]
+    gate: { min_round_trips: number } & Record<string, unknown>
+    rank: string
+    walkForward: Record<string, unknown>
+    noiseProbe: Record<string, unknown>
+  }
+}

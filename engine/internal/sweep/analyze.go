@@ -105,13 +105,13 @@ func (g *GridGeom) Neighbors(id int32) []int32 {
 // Noise 是噪声基线。
 type Noise struct {
 	// StdDev 同一组参数在无意义扰动下的收益标准差（小数，0.01 = 1pp）
-	StdDev float64
+	StdDev float64 `json:"stdDev"`
 	// Range 极差
-	Range float64
+	Range float64 `json:"range"`
 	// Samples 参与统计的 (参数组, 窗口) 组数
-	Samples int
+	Samples int `json:"samples"`
 	// Repeats 每组重复了几次
-	Repeats int
+	Repeats int `json:"repeats"`
 }
 
 // MeasureNoise 由探针行算出噪声基线。
@@ -275,14 +275,14 @@ func Aggregate(rows []Result, gate Gate, rank string) map[int32]*ParamAgg {
 // Verdict 回答「这次海选有没有意义」。
 type Verdict struct {
 	// Spread 全网格的逐参数 OOS 中位数的标准差
-	Spread float64
-	Noise  float64
+	Spread float64 `json:"spread"`
+	Noise  float64 `json:"noise"`
 	// Ratio = Spread / Noise
-	Ratio float64
+	Ratio float64 `json:"ratio"`
 	// Meaningful 为 false 时**不该出高原排名** ——
 	// 整张网格都是同一片平地，「找到了高原」是幻觉
-	Meaningful bool
-	Params     int
+	Meaningful bool `json:"meaningful"`
+	Params     int  `json:"params"`
 }
 
 // MeaningfulThreshold 判定阈值。
@@ -316,22 +316,23 @@ func Judge(aggs map[int32]*ParamAgg, n Noise) Verdict {
 
 // Plateau 是一片邻域整体表现良好的区域。
 type Plateau struct {
-	CenterID int32
-	Params   string
+	CenterID int32  `json:"centerId"`
+	Params   string `json:"params"`
 	// Neighbors 邻居数（含自己）
-	Neighbors int
+	Neighbors int `json:"neighbors"`
 	// Median / Q1 / Q3 在**邻域的全部 (邻居 × 窗口) 样本**上算
-	Median   float64
-	Q1, Q3   float64
-	IQR      float64
-	PosRatio float64
-	Samples  int
+	Median   float64 `json:"median"`
+	Q1       float64 `json:"q1"`
+	Q3       float64 `json:"q3"`
+	IQR      float64 `json:"iqr"`
+	PosRatio float64 `json:"posRatio"`
+	Samples  int     `json:"samples"`
 	// Score 邻域内 Score 的中位数，排序用
-	Score float64
+	Score float64 `json:"score"`
 	// FlatVsNoise = IQR / 噪声基线。**≈1 是好事** ——
 	// 说明邻居之间的差异不超过噪声，这片区域是平的。
 	// 远大于 1 说明邻居之间有真实差异，那就不是高原
-	FlatVsNoise float64
+	FlatVsNoise float64 `json:"flatVsNoise"`
 }
 
 // PlateauCriteria 高原判据。

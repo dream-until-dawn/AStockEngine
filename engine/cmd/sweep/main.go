@@ -190,6 +190,22 @@ func main() {
 	//
 	// **窗口串行、参数组并发**，不能反过来。反过来会让每个 worker
 	// 各自持有一份不同区间的子集（实测 358 MB），8 个就是 2.8 GB。
+	// 清单与分片放在一起 —— **没有它结果目录读不懂**：
+	// 分析要用到硬门槛、排序口径与参数集，而这些只在海选配置里。
+	// 命令行靠 -config 再传一遍，Web 没有那个机会，它只知道目录名
+	mf := &sweep.Manifest{
+		SweepID: sweepID, Name: sc.Name, Base: sc.BasePath(),
+		Config: sc, Windows: windows, AnnualDays: annual,
+	}
+	for _, ps := range sets {
+		mf.Params = append(mf.Params, sweep.ManifestParam{
+			ID: ps.ID, FP: ps.FP, Values: ps.Values,
+		})
+	}
+	if err := sweep.WriteManifest(outDir, mf); err != nil {
+		fatal(err)
+	}
+
 	runStart := time.Now()
 	for _, w := range windows {
 		if done[w.Index] {

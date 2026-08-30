@@ -3,6 +3,7 @@ import { api } from './api'
 import { ErrBox, Loading, useAsync } from './components/ui'
 import Overview from './views/Overview'
 import Backtest from './views/Backtest'
+import Sweep from './views/Sweep'
 import Debug from './views/Debug'
 import Instruments from './views/Instruments'
 import Kline from './views/Kline'
@@ -11,7 +12,7 @@ import Factors from './views/Factors'
 import CorpActions from './views/CorpActions'
 import type { Meta } from './types'
 
-// 路由用 hash，不引路由库：视图就六个，参数就一个 id。
+// 路由用 hash，不引路由库：视图就这几个，参数就一个 id。
 // 少一个依赖，也让 URL 可以直接手改（核对时经常这么干）。
 function useHash(): string {
   const [h, setH] = useState(() => location.hash.slice(1) || '/overview')
@@ -27,6 +28,7 @@ const NAV = [
   { path: '/overview', label: '概览' },
   { path: '/backtest', label: '回测' },
   { path: '/debug', label: '单步调试' },
+  { path: '/sweep', label: '海选' },
   { path: '/instruments', label: '标的列表' },
   { path: '/calendar', label: '交易日历' },
   { path: '/factors', label: '复权因子' },
@@ -84,6 +86,7 @@ function Route({ hash, meta }: { hash: string; meta: Meta }) {
   if (k) return <Kline key={k[1]} id={k[1]} meta={meta} />
   if (hash.startsWith('/backtest')) return <Backtest meta={meta} />
   if (hash.startsWith('/debug')) return <Debug meta={meta} />
+  if (hash.startsWith('/sweep')) return <Sweep />
   if (hash.startsWith('/instruments')) return <Instruments meta={meta} />
   if (hash.startsWith('/calendar')) return <CalendarView />
   if (hash.startsWith('/factors')) return <Factors meta={meta} />

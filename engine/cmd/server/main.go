@@ -66,6 +66,11 @@ func main() {
 	mux.HandleFunc("POST /api/backtest", store.handleBacktest)
 	mux.HandleFunc("POST /api/universe", store.handleUniverse)
 	// 模块目录：前端据此自动生成表单。**前端不得自己维护一份清单**
+	// 海选：只读跑完的结果。跑由 cmd/sweep 负责 ——
+	// 一次几秒到几分钟且吃满 CPU，塞进 HTTP 请求一刷新就能顶住
+	mux.HandleFunc("GET /api/sweeps", store.handleSweepList)
+	mux.HandleFunc("GET /api/sweeps/{id}", store.handleSweepDetail)
+
 	mux.HandleFunc("GET /api/modules", store.handleModules)
 	mux.HandleFunc("GET /api/fees", store.handleFees)
 
