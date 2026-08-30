@@ -63,6 +63,22 @@ func printReport(r metrics.Result) {
 		fmt.Printf("  未平仓        %d 只，开仓金额 %.2f %s，不计入胜率\n",
 			t.OpenPositions, cents(t.OpenCostCents), money)
 	}
+	if len(t.FillsByLeg) > 0 {
+		// **「一笔空头都没开」在收益曲线上看不出来。** 实测踩过一次：
+		// 所有 Sizer 都硬编码买入方向，做空网格跑出来是
+		// 开多 170 / 平多 0 / 开空 0 / 平空 166 —— 报告一切正常，
+		// 而策略实际跑的根本不是它写的那个东西。
+		//
+		// 双向策略更要看这四个数：只有它能证明两条腿都真的在动
+		fmt.Print("  成交腿        ")
+		for i, k := range []string{"开多", "平多", "开空", "平空"} {
+			if i > 0 {
+				fmt.Print("    ")
+			}
+			fmt.Printf("%s %d", k, t.FillsByLeg[k])
+		}
+		fmt.Println()
+	}
 	if len(t.CloseBy) > 0 {
 		// **这一轮是怎么结束的**：正常卖出信号、止损、止盈、熔断清仓、
 		// 被强平 —— 几种结局对「策略行不行」的意义完全不同，

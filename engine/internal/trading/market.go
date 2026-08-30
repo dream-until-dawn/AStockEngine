@@ -333,6 +333,22 @@ type PosLeg struct {
 	Opening bool
 }
 
+// String 人读的开平方向：开多 / 平多 / 开空 / 平空。
+//
+// 单向市场里 Short 恒为 false，于是它退化成「开多 / 平多」——
+// 那正是 A 股该看到的两个词。
+func (l PosLeg) String() string {
+	switch {
+	case l.Short && l.Opening:
+		return "开空"
+	case l.Short:
+		return "平空"
+	case l.Opening:
+		return "开多"
+	}
+	return "平多"
+}
+
 // LegOf 由「买卖方向 + 是否平仓 + 市场是否双向」推出仓位槽与开平。
 //
 // 双向：

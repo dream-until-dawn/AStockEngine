@@ -1,0 +1,50 @@
+{
+  "name": "加密永续 · 做多网格 · 标的 × 窗口叉乘",
+  "base": "base/crypto_grid.json",
+  "per_symbol": [
+    "BTC-USDT-SWAP",
+    "ETH-USDT-SWAP"
+  ],
+  "grid": {
+    "strategy.params.levels": [
+      3,
+      5,
+      8
+    ],
+    "strategy.params.step_pct": [
+      5,
+      8,
+      12,
+      18,
+      25
+    ],
+    "strategy.params.stop_levels": [
+      0,
+      2,
+      4
+    ],
+    "strategy.params.long": [
+      1
+    ],
+    "strategy.params.short": [
+      0
+    ]
+  },
+  "walk_forward": {
+    "enabled": true,
+    "is_years": 0.25,
+    "oos_years": 1.5,
+    "step_years": 0.5,
+    "min_windows": 6
+  },
+  "noise_probe": {
+    "points": 5,
+    "repeats": 5,
+    "perturb_pct": 0.1
+  },
+  "gate": {
+    "min_round_trips": 5
+  },
+  "metric": "excess",
+  "rank": "excess_over_maxdd"
+}

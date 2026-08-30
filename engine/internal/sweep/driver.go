@@ -199,6 +199,12 @@ func runOne(ds *config.DataSet, j Job, dir, sweepID, dataFP string) Result {
 // Window 是一个 Walk-Forward 窗口。
 type Window struct {
 	Index int16
+	// Symbol 非空时这个窗口属于某一只标的。
+	//
+	// per_symbol 与 walk_forward 同时开时，重复维度是**标的 × 时间窗口**
+	// 的叉乘 —— 加密只有两只永续，光靠标的撑不起横截面，
+	// 光靠窗口又答不了「换一只币还成立吗」，两个叉起来才有 20 来个样本
+	Symbol string
 	// DataFrom 含预热前缀的数据起点；ISFrom 才是开始交易的日子
 	DataFrom int32
 	ISFrom   int32

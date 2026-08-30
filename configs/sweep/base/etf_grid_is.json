@@ -116,7 +116,8 @@
       "levels": 5,
       "step_pct": 5,
       "stop_levels": 2,
-      "short": 0
+      "short": 0,
+      "long": 1
     }
   },
   "sizer": {

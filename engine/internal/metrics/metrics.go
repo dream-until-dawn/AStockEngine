@@ -103,6 +103,15 @@ type TradeStats struct {
 	// 「策略行不行」的意义完全不同，只报一个胜率是看不出来的。
 	// 尤其是强平：它不是策略的决定，是市场施加的
 	CloseBy map[string]int `json:"close_by,omitempty"`
+
+	// FillsByLeg 按开平方向分组的**成交笔数**（开多 / 平多 / 开空 / 平空）。
+	//
+	// **「一笔空头都没开」在收益曲线上看不出来。** 这个会话里踩过一次：
+	// 所有 Sizer 都硬编码 SideBuy，做空网格跑出来
+	// 开多 170 / 平多 0 / 开空 0 / 平空 166 —— 报告一切正常，
+	// 而策略实际跑的根本不是它写的那个东西。
+	// 数一遍腿是唯一能一眼看破这件事的量
+	FillsByLeg map[string]int `json:"fills_by_leg,omitempty"`
 }
 
 // BenchmarkStats 是相对基准的统计。
@@ -240,6 +249,10 @@ func computeTrades(fills []trading.Fill, hedge bool) TradeStats {
 	var st TradeStats
 	st.RoundTrips = len(trips)
 	st.CloseBy = make(map[string]int, 4)
+	st.FillsByLeg = make(map[string]int, 4)
+	for _, f := range fills {
+		st.FillsByLeg[trading.LegOf(f.Side, f.Reduce, hedge).String()]++
+	}
 	var holdSum, retSum float64
 	var retN int
 	for _, t := range trips {

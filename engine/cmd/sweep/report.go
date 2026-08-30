@@ -34,7 +34,12 @@ func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
 	// 重复维度的名字：跨窗口问「换个时期还成立吗」，跨标的问
 	// 「换一只标的还成立吗」—— 用同一个词会让人把两者读混
 	unit := "窗口"
-	if len(sc.PerSymbol) > 0 {
+	switch {
+	case len(sc.PerSymbol) > 0 && sc.WalkForward.Enabled:
+		// 叉乘之后一个样本是「某只标的的某一段时间」，
+		// 叫「标的」或「窗口」都只说了一半
+		unit = "样本"
+	case len(sc.PerSymbol) > 0:
 		unit = "标的"
 	}
 	// mlabel 每个数字到底是什么。**按标的海选时是超额而不是绝对收益** ——
@@ -227,30 +232,64 @@ func printPerSymbol(
 	if len(sc.PerSymbol) == 0 {
 		return
 	}
-	// paramID → 窗口号 → 该标的上的结果
-	byParam := map[int32]map[int16]float64{}
+	// 每只标的占连续的 k 个窗口下标（叉乘时 k = 每只标的的窗口数，
+	// 不叉乘时 k = 1）。**不能假定「窗口号 == 标的下标」** ——
+	// 叉乘之后那个等式不再成立，而错了只是把结果贴到别的标的名下
+	idx := map[int16]bool{}
+	for _, r := range rows {
+		if r.Probe == 0 && r.Phase == 1 {
+			idx[r.Window] = true
+		}
+	}
+	k := len(idx) / len(sc.PerSymbol)
+	if k < 1 {
+		k = 1
+	}
+	symOf := func(w int16) int {
+		i := int(w) / k
+		if i >= len(sc.PerSymbol) {
+			i = len(sc.PerSymbol) - 1
+		}
+		return i
+	}
+
+	// paramID → 标的下标 → 该标的上的结果（叉乘时对同一标的的多个窗口取中位数）
+	raw := map[int32]map[int][]float64{}
 	// 每只标的的买入持有收益。**这一列不能省**：超额是两个收益的差，
 	// 而九年里 4~5 倍的行情会让这个差达到几百个百分点 ——
 	// 「−413%」孤零零地印出来读起来像亏了 4 倍，
 	// 实际是「买入持有 +420%，这套网格约 +6%」
-	bench := map[int16]float64{}
+	benchRaw := map[int][]float64{}
 	for _, r := range rows {
 		if r.Probe != 0 || r.Err != "" || r.Phase != 1 {
 			continue
 		}
-		m := byParam[r.ParamID]
+		si := symOf(r.Window)
+		m := raw[r.ParamID]
 		if m == nil {
-			m = map[int16]float64{}
-			byParam[r.ParamID] = m
+			m = map[int][]float64{}
+			raw[r.ParamID] = m
 		}
+		v := r.TotalReturn
 		if sc.MetricOf() == sweep.MetricExcess {
-			m[r.Window] = r.ExcessReturn
-		} else {
-			m[r.Window] = r.TotalReturn
+			v = r.ExcessReturn
 		}
+		m[si] = append(m[si], v)
 		if r.HasBenchmark {
-			bench[r.Window] = r.TotalReturn - r.ExcessReturn
+			benchRaw[si] = append(benchRaw[si], r.TotalReturn-r.ExcessReturn)
 		}
+	}
+	byParam := map[int32]map[int16]float64{}
+	for pid, m := range raw {
+		out := map[int16]float64{}
+		for si, vs := range m {
+			out[int16(si)] = median(vs)
+		}
+		byParam[pid] = out
+	}
+	bench := map[int16]float64{}
+	for si, vs := range benchRaw {
+		bench[int16(si)] = median(vs)
 	}
 
 	// 候选：高原中心优先（它们才是「区域」而不是尖峰），

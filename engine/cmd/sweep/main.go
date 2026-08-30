@@ -131,22 +131,47 @@ func main() {
 	// 答的是「换一只标的还成立吗」，而不是「换一个时期还成立吗」。
 	var windows []sweep.Window
 	if len(sc.PerSymbol) > 0 {
-		if len(sc.PerSymbol) < sweep.DefaultMinWindows {
-			fatal(fmt.Errorf("按标的海选只给了 %d 只标的，少于下限 %d —— "+
-				"三五只标的上的中位数与四分位距没有意义，"+
-				"而报告照样会印出一个中位数",
-				len(sc.PerSymbol), sweep.DefaultMinWindows))
+		if sc.WalkForward.Enabled {
+			// **标的 × 时间窗口的叉乘。** 标的太少时（加密只有两只永续）
+			// 光靠标的撑不起横截面；而只切时间又答不了「换一只币还成立吗」。
+			// 叉起来两个问题一起问，样本数也够了
+			base, err := sweep.MakeWindows(days, sc.WalkForward, annual)
+			if err != nil {
+				fatal(err)
+			}
+			for _, sym := range sc.PerSymbol {
+				for _, w := range base {
+					// Index 就地重编：它同时是结果分片名与续跑的键，
+					// 叉乘之后必须唯一
+					w.Index, w.Symbol = int16(len(windows)), sym
+					windows = append(windows, w)
+				}
+			}
+			fmt.Printf("按「标的 × 窗口」海选：%d 只 × %d 个窗口 = %d 个样本\n",
+				len(sc.PerSymbol), len(base), len(windows))
+			fmt.Printf("  标的 %v\n", sc.PerSymbol)
+			fmt.Printf("  窗口 OOS %.2f 年 / 步进 %.2f 年，每份样本跑 %d~%d 这一段\n",
+				sc.WalkForward.OOSYears, sc.WalkForward.StepYears,
+				base[0].OOSFrom, base[0].OOSTo)
+		} else {
+			for i := range sc.PerSymbol {
+				windows = append(windows, sweep.Window{
+					Index: int16(i), Symbol: sc.PerSymbol[i], DataFrom: days[0],
+					OOSFrom: days[0], OOSTo: days[len(days)-1],
+				})
+			}
+			fmt.Printf("按标的海选 %d 只（不切时间窗口）：%v\n",
+				len(sc.PerSymbol), sc.PerSymbol)
+			fmt.Printf("  每只跑整段 %d~%d，基准是它自己\n",
+				days[0], days[len(days)-1])
 		}
-		for i := range sc.PerSymbol {
-			windows = append(windows, sweep.Window{
-				Index: int16(i), DataFrom: days[0],
-				OOSFrom: days[0], OOSTo: days[len(days)-1],
-			})
+		// 下限卡的是**样本数**而不是标的数：三五个样本上的中位数与
+		// 四分位距没有意义，而报告照样会印出一个中位数
+		if len(windows) < sweep.DefaultMinWindows {
+			fatal(fmt.Errorf("按标的海选只切出 %d 个样本，少于下限 %d —— "+
+				"标的太少就同时开 walk_forward，让它与时间窗口叉乘",
+				len(windows), sweep.DefaultMinWindows))
 		}
-		fmt.Printf("按标的海选 %d 只（不切时间窗口）：%v\n",
-			len(sc.PerSymbol), sc.PerSymbol)
-		fmt.Printf("  每只跑整段 %d~%d，基准是它自己\n",
-			days[0], days[len(days)-1])
 		goto sized
 	}
 	windows, err = sweep.MakeWindows(days, sc.WalkForward, annual)
@@ -237,10 +262,7 @@ sized:
 		if done[w.Index] {
 			continue
 		}
-		sym := ""
-		if len(sc.PerSymbol) > 0 && int(w.Index) < len(sc.PerSymbol) {
-			sym = sc.PerSymbol[w.Index]
-		}
+		sym := w.Symbol
 		jobs := buildJobs(sets, probes, w, sc, sym)
 		wds := narrowFor(ds, baseCfg, w, sym)
 

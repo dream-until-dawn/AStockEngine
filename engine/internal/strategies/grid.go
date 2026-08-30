@@ -9,15 +9,13 @@ import (
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 )
 
-// Grid 网格策略：0 线之上每涨一格减一份，之下每跌一格加一份。
+// Grid 网格策略：维护一组价位，价格穿过就调仓。三种模式。
 //
-// # 一张网长什么样（单边 5 格）
+// # 做多网格（单边 5 格）
 //
-//	       价格          档位   持仓
+//	       价格          档位   多头持仓
 //	+5 格  base×1.25      +5    0/10   ← 空仓，以此价重建整张网
-//	+1 格  base×1.05      +1    4/10
 //	 0 线  base            0    5/10   ← 建仓时就在这里，持一半
-//	−1 格  base×0.95      −1    6/10
 //	−5 格  base×0.75      −5   10/10   ← 满仓
 //	−7 格  base×0.65     止损    0/10   ← 全平，以此价重建
 //
@@ -25,9 +23,31 @@ import (
 // 是为了在跌到底之前每一格都有份可加、涨上去之前每一格都有份可减 ——
 // 否则「网格」就只是一次买入加一次卖出。
 //
-// **止损线在满仓格之下再几格**，不在满仓那一格：−levels 是满仓位而不是
-// 离场位，在那里止损的话，网格从来没有机会「跌到底再涨回来」，
-// 而那正是它赚钱的方式。
+// 做空网格是它的镜像：越涨越空、跌回来平。
+//
+// # 双向网格（long + short 同时打开）
+//
+//	       价格          档位   持仓
+//	+7 格                止损    ——    ← 全平，以此价重建
+//	+5 格  base×1.25      +5    满仓空
+//	 0 线  base            0    **空仓**
+//	−5 格  base×0.75      −5    满仓多
+//	−7 格                止损    ——    ← 全平，以此价重建
+//
+// **资金每边分 levels 份，0 线一分钱都不占。** 它不需要「0 线持一半」
+// 那个安排：往下有多头可加、往上有空头可开，两个方向本来就都有子弹。
+// 两端都是满仓（一端满多、一端满空），所以它**没有空仓端可重建** ——
+// 两边各有一条止损线兜底。
+//
+// 代价是穿越 0 线要平掉一条腿再开另一条，那是两笔手续费。
+// 只在允许做空的市场可用（如加密永续）。
+//
+// # 几何与策略是分开的
+//
+// `displacement` 只答「站在第几条线上」（跌为负、涨为正，与模式无关），
+// `legTargets` 只答「这条线该持多少」。**上一个 bug 正是这两件事
+// 混在一个函数里造成的**：几何按模式翻符号，策略按另一套符号算权重，
+// 两边各自的单元测试都是绿的，而合起来整张网跑成了追涨杀跌。
 //
 // # 靠 SignalTarget 表达「加一格 / 减一格」
 //
@@ -63,9 +83,18 @@ type Grid struct {
 	anchor map[mktdata.InstrumentID]int64
 	// level 当前档位：0 表示空仓，n 表示已穿过第 n 格
 	level map[mktdata.InstrumentID]int
-	// short 做空方向的网格：**价格每涨一格开一份空**，跌回来平掉。
-	// 只在允许做空的市场有意义
-	short bool
+	// long / short 两条腿各自开不开。三种合法组合：
+	//
+	//	long        越跌越买、涨回来卖。资金分 2L 份，0 线持一半
+	//	short       越涨越空、跌回来平。同上，镜像
+	//	long+short  **双向网格**：0 线空仓，跌了做多、涨了做空。
+	//	            资金每边分 L 份，任一时刻只有一边有仓
+	//
+	// 拆成两个 bool 而不是一个 mode 枚举：策略拿到的参数是
+	// map[string]float64（字符串到不了这里），而 0/1/2 那种数字模式
+	// 在配置里没法读。两个开关在 JSON 里是 "long": 1, "short": 1，
+	// 一眼就知道是什么
+	long, short bool
 	// stopLevels 止损线在 −(levels + stopLevels) 格。0 表示不设止损。
 	//
 	// **必须在 −levels 之下**：−levels 是满仓位，不是离场位 ——
@@ -95,9 +124,11 @@ func (s *Grid) Specs() []eng.ParamSpec {
 		{Name: "stop_levels", Kind: eng.ParamInt, Default: 2, Min: 0, Max: 50, Step: 1,
 			Desc: "止损线在满仓格之下再几格（0=不止损）。" +
 				"触发后全平并以当时价格重建整张网"},
+		{Name: "long", Kind: eng.ParamBool, Default: 1, Min: 0, Max: 1, Step: 1,
+			Desc: "做多腿：越跌越买、涨回来卖"},
 		{Name: "short", Kind: eng.ParamBool, Default: 0, Min: 0, Max: 1, Step: 1,
-			Desc: "做空网格：越涨越空、跌回来平。" +
-				"关=越跌越买、涨回来平。做空只在允许做空的市场可用（如加密永续）"},
+			Desc: "做空腿：越涨越空、跌回来平。只在允许做空的市场可用（如加密永续）。" +
+				"与 long 同时打开就是**双向网格**：0 线空仓，跌了做多、涨了做空"},
 	}
 }
 
@@ -113,7 +144,12 @@ func (s *Grid) Init(ic eng.InitContext) error {
 	if s.levels < 1 {
 		s.levels = 1
 	}
+	s.long = p.Bool("long", true)
 	s.short = p.Bool("short", false)
+	if !s.long && !s.short {
+		return fmt.Errorf("long 与 short 至少要开一个 —— 两条腿都关掉的网格" +
+			"不会发出任何信号，而那看上去和「策略没机会出手」一模一样")
+	}
 	s.stopLevels = p.Int("stop_levels", 2)
 	stepPct := p.Float("step_pct", 5)
 	if stepPct <= 0 {
@@ -141,22 +177,22 @@ func (s *Grid) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 		}
 		base, seen := s.anchor[id]
 		if !seen {
-			// 第一次见到：以此为 0 线，并**立刻建半仓**。
+			// 第一次见到：以此为 0 线建网。
 			// **基准价用不复权价** —— 网格是对着真实价位挂的，
 			// 而 ctx.Bar 给的就是原始价（复权价只喂指标）
 			s.anchor[id], s.level[id] = bar.Close, 0
-			sigs = append(sigs, s.target(id, 0, "grid_open"))
+			sigs = append(sigs, s.targets(id, 0, "grid_open")...)
 			continue
 		}
 
-		// 跌破止损线：全平，并以当前价重建整张网。
+		// 越过止损线：全平，并以当前价重建整张网。
 		//
-		// **止损线在 −levels 之下**（再往下 stopLevels 格）：
-		// −levels 是满仓位，不是离场位。在满仓那一格就止损的话，
-		// 网格从来没有机会「跌到底再涨回来」—— 那正是它赚钱的方式
+		// **止损线在满仓格之外**（再远 stopLevels 格）：满仓格是仓位而不是
+		// 离场位。在满仓那一格就止损的话，网格从来没有机会「跌到底再涨回来」
+		// —— 那正是它赚钱的方式
 		if s.stopped(base, bar.Close) {
 			// **把基准价删掉而不是就地改成现价**：删掉之后下一根 bar 会走
-			// 「第一次见到」那条分支，以那根的收盘价重新定 0 线并重建半仓 ——
+			// 「第一次见到」那条分支，以那根的收盘价重新定 0 线并重建 ——
 			// 这才是「全平重新建网」。
 			//
 			// 就地改成现价的话档位也是 0、目标也是 0，下一根 want == level
@@ -164,129 +200,176 @@ func (s *Grid) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 			// 网**再也没被建起来过**
 			delete(s.anchor, id)
 			delete(s.level, id)
-			sigs = append(sigs, eng.Signal{
-				Instrument: id, Kind: eng.SignalExit, Side: s.closeSide(),
-				Tag: "grid_stop",
-			})
+			sigs = append(sigs, s.exits(id, "grid_stop")...)
 			continue
 		}
 
-		want := s.targetLevel(base, bar.Close)
-		if want == s.level[id] {
+		d := s.displacement(base, bar.Close)
+		if d == s.level[id] {
 			continue
 		}
-		s.level[id] = want
+		s.level[id] = d
 
-		// 涨到 +levels：仓位已经归零，**以此为新的 0 线重建**。
-		// 不重建的话这张网就永远挂在一个远低于现价的位置上，再也不动
-		if want >= s.levels {
+		// 走到空仓的那一端：**以此为新的 0 线重建**。
+		// 不重建的话这张网就永远挂在一个远离现价的位置上，再也不动。
+		//
+		// 双向网格两端都是满仓（一端满多、一端满空），没有空仓端，
+		// 所以它不重建 —— 两端各自由止损线兜底
+		if s.rebases(d) {
 			s.anchor[id], s.level[id] = bar.Close, 0
-			sigs = append(sigs, s.target(id, 0, "grid_rebase"))
+			sigs = append(sigs, s.targets(id, 0, "grid_rebase")...)
 			continue
 		}
-		sigs = append(sigs, s.target(id, want, fmt.Sprintf("grid_L%+d", want)))
+		sigs = append(sigs, s.targets(id, d, fmt.Sprintf("grid_L%+d", d))...)
 	}
 	return sigs, nil
 }
 
-// target 生成一条「持到第 n 格对应比例」的调仓信号。
+// exits 平掉本模式用到的每一条腿。
+func (s *Grid) exits(id mktdata.InstrumentID, tag string) []eng.Signal {
+	var out []eng.Signal
+	if s.long {
+		out = append(out, eng.Signal{
+			Instrument: id, Kind: eng.SignalExit, Side: trading.SideSell, Tag: tag})
+	}
+	if s.short {
+		out = append(out, eng.Signal{
+			Instrument: id, Kind: eng.SignalExit, Side: trading.SideBuy, Tag: tag})
+	}
+	return out
+}
+
+// rebases 这个档位是不是「空仓端」，要以现价重建整张网。
+func (s *Grid) rebases(d int) bool {
+	if s.long && s.short {
+		return false // 双向两端都是满仓，没有空仓端
+	}
+	if s.short {
+		return d <= -s.levels // 做空网格在下方空仓
+	}
+	return d >= s.levels // 做多网格在上方空仓
+}
+
+// legTargets 由档位算出多空两条腿各自的目标仓位比例。
 //
-// # 份数怎么算
+// # 单向（只开一条腿）：资金分 2L 份，0 线持一半
 //
-// 单边 levels 格 → 上下共 2×levels 格，资金分成 2×levels 份。
-// 0 线持一半，每跌一格加一份，每涨一格减一份：
-//
-//	n = −levels  →  满仓（2L/2L）
-//	n = 0        →  半仓（L/2L）
-//	n = +levels  →  空仓（0/2L）
+//	d = −L  →  满仓（2L/2L）      d = 0  →  半仓（L/2L）
+//	d = +L  →  空仓（0/2L）
 //
 // 分一半而不是全仓建仓，是为了**在跌到底之前每一格都有份可加、
 // 涨上去之前每一格都有份可减** —— 否则「网格」就只是一次买入。
-func (s *Grid) target(id mktdata.InstrumentID, n int, tag string) eng.Signal {
-	w := float64(s.levels-n) / float64(2*s.levels)
-	if w < 0 {
-		w = 0
+// 做空腿整个镜像。
+//
+// # 双向：资金**每边分 L 份**，0 线空仓
+//
+//	d = −L  →  满仓多      d = 0  →  不持仓      d = +L  →  满仓空
+//
+// 双向不需要「0 线持一半」那个安排：往下有多头可加、往上有空头可开，
+// 两个方向本来就都有子弹。它换来的是**0 线附近不占用任何资金**，
+// 代价是穿越 0 线时要平掉一条腿再开另一条 —— 那是两笔手续费。
+func (s *Grid) legTargets(d int) (longW, shortW float64) {
+	L := float64(s.levels)
+	if s.long && s.short {
+		if d < 0 {
+			longW = float64(-d) / L
+		} else if d > 0 {
+			shortW = float64(d) / L
+		}
+		return clamp01(longW), clamp01(shortW)
 	}
-	if w > 1 {
-		w = 1
+	if s.short {
+		return 0, clamp01(float64(s.levels+d) / (2 * L))
 	}
-	return eng.Signal{
-		Instrument: id, Kind: eng.SignalTarget, Side: s.openSide(),
-		Weight: w, Tag: tag,
-	}
+	return clamp01(float64(s.levels-d) / (2 * L)), 0
 }
 
-// stopped 判断是否跌破（做空则是涨破）止损线。
+// targets 把档位变成信号：本模式用到的每条腿各一条 SignalTarget。
 //
-// 止损线在 **−(levels + stopLevels)** 格。stopLevels ≤ 0 表示不设止损。
+// **两条腿要分别发。** Sizer 的 targetOrder 一次只看一条腿
+// （按 side 取 Exposure.Long 或 .Short），发一条信号只能把一边调到位。
+// 双向网格穿越 0 线时要「平掉多头 + 开出空头」，那正是两条信号的事。
+func (s *Grid) targets(id mktdata.InstrumentID, d int, tag string) []eng.Signal {
+	lw, sw := s.legTargets(d)
+	var out []eng.Signal
+	if s.long {
+		out = append(out, eng.Signal{
+			Instrument: id, Kind: eng.SignalTarget, Side: trading.SideBuy,
+			Weight: lw, Tag: tag})
+	}
+	if s.short {
+		out = append(out, eng.Signal{
+			Instrument: id, Kind: eng.SignalTarget, Side: trading.SideSell,
+			Weight: sw, Tag: tag})
+	}
+	return out
+}
+
+func clamp01(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 1 {
+		return 1
+	}
+	return v
+}
+
+// stopped 判断是否越过了止损线。
+//
+// 止损线在**满仓格之外**再 stopLevels 格。stopLevels ≤ 0 表示不设止损。
+// 单向只有一条（做多在下方、做空在上方）；**双向两边各一条** ——
+// 双向的两端都是满仓，哪边穿出去都是同一件事。
 func (s *Grid) stopped(base, price int64) bool {
 	if s.stopLevels <= 0 || base <= 0 {
 		return false
 	}
 	n := int64(s.levels + s.stopLevels)
-	if s.short {
-		return price >= base*(1_000_000+n*s.stepPPM)/1_000_000
+	down := price <= base*(1_000_000-n*s.stepPPM)/1_000_000
+	up := price >= base*(1_000_000+n*s.stepPPM)/1_000_000
+	switch {
+	case s.long && s.short:
+		return down || up
+	case s.short:
+		return up
+	default:
+		return down
 	}
-	return price <= base*(1_000_000-n*s.stepPPM)/1_000_000
 }
 
-// openSide / closeSide 开平方向。做空网格整个反过来。
-func (s *Grid) openSide() trading.Side {
-	if s.short {
-		return trading.SideSell
-	}
-	return trading.SideBuy
-}
-
-func (s *Grid) closeSide() trading.Side {
-	if s.short {
-		return trading.SideBuy
-	}
-	return trading.SideSell
-}
-
-// targetLevel 由基准价与现价算出应处的档位。
+// displacement 现价相对基准价跨过了几格。**跌为负、涨为正，与模式无关。**
 //
-// # 符号约定：负 = 加仓方向，正 = 减仓方向
+// # 为什么它不认识模式
 //
-// 做多网格里「跌」是加仓方向，所以跌 3 格是 **−3**；做空网格整个镜像，
-// 「涨」才是加仓方向，涨 3 格才是 −3。这样 target() 的
-// `w = (levels−n) / 2·levels` 对两个方向是同一个公式。
+// 它只回答几何问题：现在站在第几条线上。「这条线该持多少仓」是
+// legTargets 的事。**上一个 bug 正是这两件事混在一个函数里造成的** ——
+// 那时它按模式翻符号，做多返回 +3 表示跌了 3 格，而算权重的那半边
+// 认为 +3 是「涨上去该减仓」，整张网跑成了越跌卖得越多的追涨杀跌。
+// 两个函数各自都有单元测试、各自都是绿的，因为它们用的是**相反**的
+// 符号约定，而没有任何一个测试同时看见两边。
 //
-// **这个符号曾经反过，代价是整个网格跑成了追涨杀跌。**
-// 当时 targetLevel 对做多返回 +3 表示跌了 3 格，而 target() 认为 +3 是
-// 「涨上去该减仓」—— 于是越跌卖得越多。两个函数各自都有单元测试、
-// 各自都过，因为**从来没有一个测试把它们串起来**。
-// 现在 TestGridFallingPriceBuysMore 就是那个串起来的测试。
+// 拆开之后这类错误无处可藏：几何只有一种符号，策略只读它。
 //
 // 用**乘法比较**而不是先算涨跌幅再比：定点整数下先除会丢精度，
 // 而档位判断错一格就是一次多余的交易。
-func (s *Grid) targetLevel(base, price int64) int {
+func (s *Grid) displacement(base, price int64) int {
 	if base <= 0 {
 		return 0
-	}
-	// up / down：价格朝这个方向走时档位取什么符号。
-	// 做多是「跌了要加仓」，做空是「涨了要加仓」—— 只有这一行的差别
-	up, down := 1, -1
-	if s.short {
-		up, down = -1, 1
 	}
 	if price > base {
 		for n := s.levels; n >= 1; n-- {
 			// price >= base × (1 + n×step)
-			thr := base * (1_000_000 + int64(n)*s.stepPPM) / 1_000_000
-			if price >= thr {
-				return up * n
+			if price >= base*(1_000_000+int64(n)*s.stepPPM)/1_000_000 {
+				return n
 			}
 		}
 		return 0
 	}
 	if price < base {
 		for n := s.levels; n >= 1; n-- {
-			// price <= base × (1 - n×step)
-			thr := base * (1_000_000 - int64(n)*s.stepPPM) / 1_000_000
-			if price <= thr {
-				return down * n
+			// price <= base × (1 − n×step)
+			if price <= base*(1_000_000-int64(n)*s.stepPPM)/1_000_000 {
+				return -n
 			}
 		}
 	}
