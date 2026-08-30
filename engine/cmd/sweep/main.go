@@ -9,6 +9,12 @@
 // —— 极差 18.95 个百分点。在这个量级下，
 // 「参数组 A 收益 12%、B 收益 5%，选 A」是纯粹的随机数。
 //
+// **已在 v0.8 新口径下重测**（定量基准 cost、候选按成交额排、定量留摩擦）：
+// A 股 slots=10 极差降到 **8.99 个百分点**、标准差 3.32；slots=100 则是
+// 0.55 / 0.19。量级小了一半以上，但结论一条没变 ——
+// 噪声仍然大到足以吞掉多数参数差异，而且仍然随 slots 急剧下降。
+// 上面那组原始数字是当时那次测量的记录，保留原样。
+//
 // 所以本程序**先量噪声，再判断这次海选有没有意义，最后才谈区域**：
 //
 //  1. 噪声基线：几个代表点各跑几次无意义扰动
@@ -33,7 +39,7 @@ import (
 
 	// 策略与交易模块靠 init() 注册，不导入就一个都认不出来
 	_ "github.com/dream-until-dawn/AStockEngine/engine/internal/strategies"
-	_ "github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 )
 
 func main() {
@@ -103,8 +109,15 @@ func main() {
 	}
 	loadDur := time.Since(t0)
 	days := sweep.TradingDays(ds.Columns)
+	// 年化系数**必须问市场**，不能写死查 A 股日历。
+	//
+	// 加密在 calendar 表里没有行，查出来是 A 股的 242.44，而正确值是 365 ——
+	// 相差 50%，切窗的年数、OOS 的年化收益全都跟着错，且不报任何错。
+	// 这与 ComputeMetrics 里那条是同一个坑，海选这边有自己的一份拷贝。
 	annual := 243.0
-	if ds.Calendar != nil {
+	if mkt, err := trading.Markets.Build(baseCfg.Market.Impl, baseCfg.Market.Params); err == nil {
+		annual = mkt.AnnualDays(ds.Calendar, days[0], days[len(days)-1])
+	} else if ds.Calendar != nil {
 		annual = ds.Calendar.TradingDaysPerYear(
 			mktdata.MarketAShare, days[0], days[len(days)-1])
 	}
@@ -124,7 +137,7 @@ func main() {
 		}}
 		fmt.Println("Walk-Forward 未开启 —— 整段跑一次，window 记 −1")
 	} else {
-		fmt.Printf("Walk-Forward %d 个窗口（IS %.0f 年 / OOS %.0f 年 / 步进 %.0f 年，"+
+		fmt.Printf("Walk-Forward %d 个窗口（IS %.2f 年 / OOS %.2f 年 / 步进 %.2f 年，"+
 			"年化系数 %.2f 交易日）\n", len(windows),
 			sc.WalkForward.ISYears, sc.WalkForward.OOSYears,
 			sc.WalkForward.StepYears, annual)

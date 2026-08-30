@@ -47,10 +47,22 @@ func (j Job) buildConfig(dir string) (*config.Config, error) {
 	}
 	if j.TradeFrom != 0 {
 		// engine.trade_from 在基准配置里可能没写，setPath 只改已有字段，
-		// 所以这里直接往 engine 对象里塞
+		// 所以这里直接往 engine 对象里塞 —— **没有就建一个**。
+		//
+		// 从前这里是报错。而 `engine` 段是可选的（引擎自己有默认值），
+		// 于是任何一份没写它的配置都跑不了海选，报的还是
+		// 「基准配置缺少 engine 段」—— 实测一整批 8,687 次全挂在这一句上，
+		// 而那份配置作为普通回测跑得好好的。
+		//
+		// trade_from 是**海选自己要写的字段**，不是用户可能拼错的名字，
+		// 所以这里放宽是安全的：setPath 的严格性是防拼错，不适用于这里。
 		engObj, ok := obj["engine"].(map[string]any)
 		if !ok {
-			return nil, fmt.Errorf("基准配置缺少 engine 段")
+			if _, exists := obj["engine"]; exists {
+				return nil, fmt.Errorf("基准配置的 engine 不是对象")
+			}
+			engObj = map[string]any{}
+			obj["engine"] = engObj
 		}
 		engObj["trade_from"] = json.Number(fmt.Sprint(j.TradeFrom))
 	}
@@ -182,8 +194,9 @@ func MakeWindows(days []int32, wf WalkForward, annualDays float64) ([]Window, er
 		return nil, fmt.Errorf("窗口长度算出来是 0：is=%d oos=%d step=%d", is, oos, step)
 	}
 	if is+oos > len(days) {
-		return nil, fmt.Errorf("数据只有 %d 个交易日，装不下 IS %d + OOS %d 天",
-			len(days), is, oos)
+		return nil, fmt.Errorf("数据只有 %d 个交易日（约 %.2f 年），"+
+			"装不下 IS %d + OOS %d 天 —— 换更短的窗口参数，或换区间更长的市场",
+			len(days), float64(len(days))/annualDays, is, oos)
 	}
 
 	var out []Window
@@ -204,8 +217,32 @@ func MakeWindows(days []int32, wf WalkForward, annualDays float64) ([]Window, er
 	if len(out) == 0 {
 		return nil, fmt.Errorf("切不出任何窗口")
 	}
+	// 窗口数下限。**不是保守，是这套方法论的前提**：Walk-Forward 的产出是
+	// OOS 的中位数与四分位距，而三五个数算不出有意义的分布 ——
+	// 报告照样会印出一个中位数，看不出它只基于 3 个窗口。
+	min := wf.MinWindows
+	if min == 0 {
+		min = DefaultMinWindows
+	}
+	if len(out) < min {
+		return nil, fmt.Errorf(
+			"只切出 %d 个窗口，少于下限 %d —— 数据 %d 个交易日（约 %.2f 年），"+
+				"IS %.2f 年 / OOS %.2f 年 / 步进 %.2f 年。"+
+				"少于 %d 个窗口的 OOS 中位数与四分位距没有意义，"+
+				"报告却不会告诉你这一点。请调短窗口参数，"+
+				"或把 walk_forward.min_windows 显式调低（你得知道自己在放弃什么）",
+			len(out), min, len(days), float64(len(days))/annualDays,
+			wf.ISYears, wf.OOSYears, wf.StepYears, min)
+	}
 	return out, nil
 }
+
+// DefaultMinWindows 窗口数下限的默认值。
+//
+// 6 是个下限而不是目标：A 股 21.6 年按 IS3/OOS1/步1 有 18 个窗口，
+// 加密 6.66 年按 IS1.5/OOS0.5/步0.5 有 10 个。低于 6 的话，
+// 一两个窗口的运气就能主导中位数。
+const DefaultMinWindows = 6
 
 // TradingDays 取出数据里全部时点的交易日，升序。
 func TradingDays(col *mktdata.Columns) []int32 {

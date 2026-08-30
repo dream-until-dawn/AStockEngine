@@ -198,16 +198,34 @@ func ReadAll(dir string) ([]Result, error) {
 }
 
 // DoneWindows 扫描已有分片，返回哪些窗口已经跑完 —— 供续跑跳过。
+// DoneWindows 扫描已有分片，返回哪些窗口**成功**跑完 —— 供续跑跳过。
+//
+// **失败的行不算跑完。** 从前只看 `Probe == 0`，于是一批全军覆没的运行
+// （比如基准配置少了一段、网格路径写错）会被当成「已完成」，
+// 修好病因之后再跑只会得到一句「已完成 17 个窗口，跳过」，
+// 而报告里还是那批旧的失败 —— 人会以为没修好。
+//
+// 一个窗口里只要有失败的行，这个窗口就要重跑：失败往往是整批同因的，
+// 挑着补比整窗重跑更容易留下不一致的半截结果。
 func DoneWindows(dir string) map[int16]bool {
 	done := map[int16]bool{}
+	bad := map[int16]bool{}
 	rows, err := ReadAll(dir)
 	if err != nil {
 		return done
 	}
 	for _, r := range rows {
-		if r.Probe == 0 {
-			done[r.Window] = true
+		if r.Probe != 0 {
+			continue
 		}
+		if r.Err != "" {
+			bad[r.Window] = true
+			continue
+		}
+		done[r.Window] = true
+	}
+	for w := range bad {
+		delete(done, w)
 	}
 	return done
 }

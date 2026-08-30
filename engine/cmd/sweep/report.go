@@ -53,6 +53,7 @@ func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
 		fmt.Printf("，%d 次未过硬门槛（完整轮次 ≥ %d）", gated, sc.Gate.MinRoundTrips)
 	}
 	fmt.Println()
+	printFailures(rows)
 
 	// ---- 1. 噪声基线 ----
 	n := sweep.MeasureNoise(rows)
@@ -86,7 +87,8 @@ func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
 		fmt.Println("     这不是失败：便宜地知道「这条路走不通」，")
 		fmt.Println("     比拿着一个不可信的第一名去实盘便宜得多。")
 		fmt.Println("\n     可以试的方向：换取值范围、换标的池、换策略族，")
-		fmt.Println("     或先把噪声压下去（实测 slots 10→100 时噪声从 18.95 降到 4.48 个百分点）。")
+		fmt.Println("     或先把噪声压下去 —— 实测 A 股 slots 10→100，" +
+			"极差从 8.99 降到 0.55 个百分点（v0.8 新口径下重测）。")
 		printTopAnyway(aggs, sc, "上面已判定这个排名不可分辨")
 		return
 	}
@@ -172,4 +174,40 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// printFailures 按原因把失败归类印出来。
+//
+// **只报一个「8262 次失败」等于什么都没说** —— 全批失败通常是同一个原因
+// （一个写错的网格路径、一个装配不出来的组合），而那个原因就在
+// 结果行的 Err 字段里躺着。不印出来的话，人得自己去翻 parquet。
+func printFailures(rows []sweep.Result) {
+	by := map[string]int{}
+	for _, r := range rows {
+		if r.Err != "" {
+			by[r.Err]++
+		}
+	}
+	if len(by) == 0 {
+		return
+	}
+	keys := make([]string, 0, len(by))
+	for k := range by {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool { return by[keys[i]] > by[keys[j]] })
+
+	fmt.Println()
+	fmt.Println("=== 失败原因 ===")
+	for i, k := range keys {
+		if i >= 5 {
+			fmt.Printf("  …… 另有 %d 种原因\n", len(keys)-5)
+			break
+		}
+		msg := k
+		if len(msg) > 220 {
+			msg = msg[:220] + "…"
+		}
+		fmt.Printf("  %6d 次  %s\n", by[k], msg)
+	}
 }

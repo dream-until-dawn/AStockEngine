@@ -6,6 +6,12 @@
 // 跑 5 次的总收益是 −29.66% / −46.50% / −27.55% / −31.39% / −27.85%
 // —— 极差 **18.95 个百分点**，标准差 7.09。
 //
+// **已在 v0.8 新口径下重测**（定量基准 cost、候选按成交额排、定量留摩擦）：
+// A 股 slots=10 极差降到 **8.99 个百分点**、标准差 3.32；slots=100 则是
+// 0.55 / 0.19。量级小了一半以上，但结论一条没变 ——
+// 噪声仍然大到足以吞掉多数参数差异，而且仍然随 slots 急剧下降。
+// 上面那组原始数字是当时那次测量的记录，保留原样。
+//
 // 1000 元经济上毫无意义，但它改变每一单的取整，进而改变哪些单能成交，
 // 路径就此分叉。这就是**噪声基线**。
 //
@@ -65,6 +71,15 @@ type WalkForward struct {
 	// 引擎在 TradeFrom 之前只喂指标不交易 —— 否则每个窗口开头的
 	// 指标未就绪，会在 18 个窗口上造成一致的偏差（那不是噪声，是偏差）
 	WarmupDays int `json:"warmup_days"`
+	// MinWindows 切出来的窗口数下限，少于它直接报错。0 表示用默认值 6。
+	//
+	// **不是保守，是这套方法论的前提**：Walk-Forward 的产出是 OOS 的
+	// 中位数与四分位距，而三五个数算不出有意义的分布 ——
+	// 报告照样会印出一个中位数，看不出它只基于 3 个窗口。
+	//
+	// 实测：加密数据 2019-11 起共 6.66 年，按 A 股那套 IS3/OOS1/步1
+	// 只切得出 3 个窗口；换成 IS1.5/OOS0.5/步0.5 才有 10 个。
+	MinWindows int `json:"min_windows,omitempty"`
 	// Enabled 为 false 时整段跑一次，window 记 −1
 	Enabled bool `json:"enabled"`
 }
@@ -306,27 +321,129 @@ func decodeJSONObject(b []byte) (map[string]any, error) {
 
 // setPath 按点号路径写值。中间不是对象时报错而不是硬造 ——
 // 路径写错时应当立刻知道，而不是在配置里多出一个没人读的字段。
+// setPath 按点号路径往配置里写一个值。
+//
+// 支持数组下标：`strategy.params.indicators[0].params.short`。
+//
+// **规则树的参数全在数组里** —— 指标是一个列表、离场规则是一个列表。
+// 只认对象的话，网格够不着规则树的任何一个参数，
+// 而规则树正是现在的主力策略。
+//
+// 路径指不到就报错，**不新建字段** —— 新增多半是写错了名字，
+// 而写错名字的网格会安安静静地扫出一批一模一样的结果。
 func setPath(obj map[string]any, path string, val any) error {
-	parts := strings.Split(path, ".")
-	cur := obj
-	for i, p := range parts[:len(parts)-1] {
-		next, ok := cur[p]
-		if !ok {
-			return fmt.Errorf("基准配置里没有 %q", strings.Join(parts[:i+1], "."))
-		}
-		m, ok := next.(map[string]any)
-		if !ok {
-			return fmt.Errorf("%q 不是对象，无法继续往下写",
-				strings.Join(parts[:i+1], "."))
-		}
-		cur = m
+	steps, err := parsePath(path)
+	if err != nil {
+		return err
 	}
-	last := parts[len(parts)-1]
-	if _, ok := cur[last]; !ok {
+	var cur any = obj
+	for i, st := range steps[:len(steps)-1] {
+		cur, err = stepInto(cur, st)
+		if err != nil {
+			return fmt.Errorf("%q: %w", joinSteps(steps[:i+1]), err)
+		}
+	}
+	return setLeaf(cur, steps[len(steps)-1], val, path)
+}
+
+// pathStep 路径上的一段：要么是字段名，要么是数组下标。
+type pathStep struct {
+	key   string
+	index int
+	isIdx bool
+}
+
+// parsePath 把 `a.b[2].c` 拆成 a / b / [2] / c。
+func parsePath(path string) ([]pathStep, error) {
+	if path == "" {
+		return nil, fmt.Errorf("路径为空")
+	}
+	var out []pathStep
+	for _, seg := range strings.Split(path, ".") {
+		name, rest, hasIdx := strings.Cut(seg, "[")
+		if name != "" {
+			out = append(out, pathStep{key: name})
+		} else if !hasIdx {
+			return nil, fmt.Errorf("路径 %q 里有空的一段", path)
+		}
+		for hasIdx {
+			var num string
+			num, rest, _ = strings.Cut(rest, "]")
+			i, err := strconv.Atoi(num)
+			if err != nil {
+				return nil, fmt.Errorf("路径 %q 的下标 %q 不是整数", path, num)
+			}
+			if i < 0 {
+				return nil, fmt.Errorf("路径 %q 的下标不能为负", path)
+			}
+			out = append(out, pathStep{index: i, isIdx: true})
+			_, rest, hasIdx = strings.Cut(rest, "[")
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("路径 %q 解析不出任何一段", path)
+	}
+	return out, nil
+}
+
+func joinSteps(steps []pathStep) string {
+	var b strings.Builder
+	for i, st := range steps {
+		if st.isIdx {
+			fmt.Fprintf(&b, "[%d]", st.index)
+			continue
+		}
+		if i > 0 {
+			b.WriteByte('.')
+		}
+		b.WriteString(st.key)
+	}
+	return b.String()
+}
+
+func stepInto(cur any, st pathStep) (any, error) {
+	if st.isIdx {
+		arr, ok := cur.([]any)
+		if !ok {
+			return nil, fmt.Errorf("不是数组，取不了下标")
+		}
+		if st.index >= len(arr) {
+			return nil, fmt.Errorf("下标 %d 越界（长度 %d）", st.index, len(arr))
+		}
+		return arr[st.index], nil
+	}
+	m, ok := cur.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("不是对象，无法继续往下写")
+	}
+	v, ok := m[st.key]
+	if !ok {
+		return nil, fmt.Errorf("基准配置里没有这一段")
+	}
+	return v, nil
+}
+
+func setLeaf(cur any, st pathStep, val any, path string) error {
+	if st.isIdx {
+		arr, ok := cur.([]any)
+		if !ok {
+			return fmt.Errorf("%q 的父级不是数组", path)
+		}
+		if st.index >= len(arr) {
+			return fmt.Errorf("%q 下标越界（长度 %d）", path, len(arr))
+		}
+		arr[st.index] = val
+		return nil
+	}
+	m, ok := cur.(map[string]any)
+	if !ok {
+		return fmt.Errorf("%q 的父级不是对象", path)
+	}
+	if _, ok := m[st.key]; !ok {
 		return fmt.Errorf("基准配置里没有 %q —— "+
 			"网格只改已有的字段，不新增（新增多半是写错了名字）", path)
 	}
-	cur[last] = val
+	m[st.key] = val
 	return nil
 }
 

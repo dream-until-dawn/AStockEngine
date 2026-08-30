@@ -3,6 +3,7 @@ package sweep
 import (
 	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -387,3 +388,150 @@ func contains(s, sub string) bool {
 }
 
 func itoa(i int) string { return string(rune('0' + i)) }
+
+// ---- 数组下标 ----
+//
+// 规则树的参数全在数组里：指标是一个列表、离场规则是一个列表。
+// 只认对象的话，网格够不着规则树的任何一个参数 ——
+// 而规则树正是现在的主力策略。
+
+func mustJSON(t *testing.T, s string) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal([]byte(s), &m); err != nil {
+		t.Fatalf("造测试数据失败: %v", err)
+	}
+	return m
+}
+
+func TestSetPathArrayIndex(t *testing.T) {
+	obj := mustJSON(t, `{
+		"strategy": {"params": {
+			"indicators": [
+				{"name": "macd", "params": {"short": 12, "long": 26}},
+				{"name": "rsi",  "params": {"period": 14}}
+			],
+			"valid": {"right": {"value": 70}}
+		}},
+		"exit": [{"impl": "stop_loss", "params": {"pct": 10}}]
+	}`)
+
+	cases := []struct {
+		path string
+		val  any
+	}{
+		{"strategy.params.indicators[0].params.short", 8.0},
+		{"strategy.params.indicators[1].params.period", 21.0},
+		{"strategy.params.valid.right.value", 60.0},
+		{"exit[0].params.pct", 15.0},
+	}
+	for _, c := range cases {
+		if err := setPath(obj, c.path, c.val); err != nil {
+			t.Fatalf("%s: %v", c.path, err)
+		}
+	}
+	b, _ := json.Marshal(obj)
+	for _, want := range []string{`"short":8`, `"period":21`, `"value":60`, `"pct":15`} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("没写进去：想要 %s，得到 %s", want, b)
+		}
+	}
+}
+
+// TestSetPathRejectsBadPaths 路径指不到就报错，不新建字段。
+//
+// **写错名字的网格会安安静静地扫出一批一模一样的结果** ——
+// 那比报错难查得多。
+func TestSetPathRejectsBadPaths(t *testing.T) {
+	base := `{"a": {"b": [ {"c": 1} ]}, "s": "x"}`
+	cases := []struct {
+		path string
+		why  string
+	}{
+		{"a.b[9].c", "下标越界"},
+		{"a.b[0].zzz", "字段不存在"},
+		{"a.zzz.c", "中间一段不存在"},
+		{"s[0]", "不是数组却取下标"},
+		{"a.b.c", "数组却当对象取字段"},
+		{"a.b[x].c", "下标不是整数"},
+		{"a.b[-1].c", "负下标"},
+		{"", "空路径"},
+	}
+	for _, c := range cases {
+		obj := mustJSON(t, base)
+		if err := setPath(obj, c.path, 1.0); err == nil {
+			t.Errorf("%s（%s）应当报错，却通过了", c.path, c.why)
+		}
+	}
+}
+
+// TestSetPathLeavesSiblingsAlone 只改指到的那一个，不碰别的。
+func TestSetPathLeavesSiblingsAlone(t *testing.T) {
+	obj := mustJSON(t, `{"x": {"list": [{"v": 1}, {"v": 2}, {"v": 3}]}}`)
+	if err := setPath(obj, "x.list[1].v", 99.0); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(obj)
+	if got, want := string(b), `{"x":{"list":[{"v":1},{"v":99},{"v":3}]}}`; got != want {
+		t.Errorf("改多了或改错了：\n得到 %s\n想要 %s", got, want)
+	}
+}
+
+// ---- 窗口数下限 ----
+
+func daysFor(years float64, annual float64) []int32 {
+	n := int(years * annual)
+	out := make([]int32, n)
+	for i := range out {
+		out[i] = int32(20000101 + i) // 只要求递增且唯一，不必是真日期
+	}
+	return out
+}
+
+// TestMakeWindowsRefusesTooFew 窗口太少时**报错而不是照跑**。
+//
+// Walk-Forward 的产出是 OOS 的中位数与四分位距，三五个数算不出
+// 有意义的分布 —— 而报告照样会印出一个中位数，看不出它只基于 3 个窗口。
+//
+// 实测：加密数据 6.66 年，按 A 股那套 IS3/OOS1/步1 只切得出 3 个窗口。
+func TestMakeWindowsRefusesTooFew(t *testing.T) {
+	days := daysFor(6.66, 365) // 加密：2019-11 起约 6.66 年
+	wf := WalkForward{Enabled: true, ISYears: 3, OOSYears: 1, StepYears: 1}
+
+	got, err := MakeWindows(days, wf, 365)
+	if err == nil {
+		t.Fatalf("只切得出 %d 个窗口，应当报错", len(got))
+	}
+	if !strings.Contains(err.Error(), "min_windows") {
+		t.Errorf("错误信息该告诉用户怎么办，得到：%v", err)
+	}
+}
+
+// TestMakeWindowsCryptoParams 加密换一套窗口参数就够了。
+func TestMakeWindowsCryptoParams(t *testing.T) {
+	days := daysFor(6.66, 365)
+	wf := WalkForward{Enabled: true, ISYears: 1.5, OOSYears: 0.5, StepYears: 0.5}
+
+	got, err := MakeWindows(days, wf, 365)
+	if err != nil {
+		t.Fatalf("IS1.5/OOS0.5/步0.5 应当切得出足够的窗口：%v", err)
+	}
+	if len(got) < DefaultMinWindows {
+		t.Fatalf("只切出 %d 个窗口，想要至少 %d", len(got), DefaultMinWindows)
+	}
+	t.Logf("加密 6.66 年 · IS1.5/OOS0.5/步0.5 → %d 个窗口", len(got))
+}
+
+// TestMakeWindowsMinOverride 下限可以显式调低 —— 但得是显式的。
+func TestMakeWindowsMinOverride(t *testing.T) {
+	days := daysFor(6.66, 365)
+	wf := WalkForward{Enabled: true, ISYears: 3, OOSYears: 1, StepYears: 1,
+		MinWindows: 3}
+	got, err := MakeWindows(days, wf, 365)
+	if err != nil {
+		t.Fatalf("显式调低下限之后应当放行：%v", err)
+	}
+	if len(got) != 3 {
+		t.Errorf("切出 %d 个窗口，想要 3", len(got))
+	}
+}
