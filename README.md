@@ -143,6 +143,7 @@ engine/        Go 回测引擎
   internal/spec/        参数自描述（喂 Web 表单 / 海选网格 / 配置校验）
   internal/registry/    泛型容器：按名字取实现
   internal/config/      一份 JSON 描述一次运行 + 未计入成本的显式披露
+  internal/sweep/       策略海选：网格展开、并发驱动、噪声基线、高原判定
   internal/record/      三档记录（none / summary / full）
   internal/metrics/     绩效指标
   internal/fingerprint/ 结果指纹（C5）
@@ -165,6 +166,7 @@ docs/          设计文档
 | [ETL.md](docs/ETL.md) | 数据管道说明；**第 6 节「踩过的坑」是全项目信息密度最高的一节** |
 | [WEB.md](docs/WEB.md) | 数据核对台：接口、五个视图、七条设计决策 |
 | [DESIGN-v0.3-assembly.md](docs/DESIGN-v0.3-assembly.md) | 模块化装配：registry、Sizer/Risk、Metrics 的三个坑、结果指纹 |
+| [DESIGN-v0.5-selection.md](docs/DESIGN-v0.5-selection.md) | 策略海选：**噪声基线 19 个百分点**、为什么单点收益率不可比、高原判定 |
 | [DESIGN-v0.2-dataflow.md](docs/DESIGN-v0.2-dataflow.md) | 行情数据流设计评审 |
 | [DESIGN-v0.2-trading.md](docs/DESIGN-v0.2-trading.md) | 交易语义设计评审 |
 | [probe/REPORT-v0.0.md](docs/probe/REPORT-v0.0.md) | 技术选型的实测依据 |

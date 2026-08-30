@@ -607,6 +607,33 @@ CryptoMarket。`instruments.attrs.funding_rate` 现在记
 
 ---
 
+## 6.5 `results` —— 海选结果（v0.5）
+
+**路径**：`data/results/sweep={sweep_id}/window-*.parquet`
+**主键**：`(sweep_id, param_id, window, phase, probe)`
+**规模**：一次 216 组 × 18 窗的海选约 8,200 行 / 不到 2 MB
+
+一行 = 一次回测。列见 `engine/internal/sweep/result.go` 的 `Result`。
+几处与其他表不同的约定：
+
+| 约定 | 为什么 |
+|---|---|
+| **绩效列用 `DOUBLE` 不用定点** | 0.2 的「比率存 ppm」针对的是**引擎输入**（定点是为 C5）。这里是**输出**，永不回喂引擎；C5 由 `input_fp` / `output_fp` 保证，不由编码方式保证 |
+| **跑失败的行也留着**（`err` 非空） | 「这组参数在这个窗口跑不了」本身是一个发现，删掉等于藏起来 |
+| `param_id` 与 `param_fp` **两个都存** | 前者是本次海选内的序号（紧凑、可排序），后者跨海选稳定 —— 同一组参数在另一次海选里序号可能不同 |
+| `bench_covered` / `bench_total` **必须存** | 宽基 ETF 最早 2012 年，Walk-Forward 的前 7 个窗口**根本没有基准**。不存覆盖数，那几个窗口的 `excess_return=0` 会被当成真的超额 |
+| `probe` ≥ 1 是噪声探针 | 同一组参数、同一窗口，只把初始资金扰动 ±0.1% 的重复。**它不是结果，是量尺** |
+
+> **不引 DuckDB。** 8,200 行 × 33 列不到 2 MB，查询是过滤、排序、分组，
+> Go 里全量载入内存做只要几毫秒。而 Go 侧引 DuckDB 要 cgo，
+> 会打破当前纯 Go 的构建与交叉编译 —— 为「查 8,200 行」背上永久成本不划算。
+> Parquet 是开放格式，Python 侧要临时分析时
+> `duckdb.sql("select * from 'data/results/**/*.parquet'")` 一行就能读。
+
+高原评分**不落盘**，查询时算 —— 它依赖阈值，而阈值会调。
+
+---
+
 ## 7. `_manifest.json` —— 数据版本指纹
 
 **路径**：`data/meta/_manifest.json`
@@ -638,8 +665,7 @@ CryptoMarket。`instruments.attrs.funding_rate` 现在记
 
 | 表 | 版本 | 说明 |
 |---|---|---|
-| `results` | v0.5 | 海选结果，由 Go 写入。字段依赖 Metrics 模块的最终指标集，届时定义 |
-| `equity` | v0.5 | 净值曲线分片 |
+| `equity` | 未定 | 净值曲线分片。海选目前只存汇总指标，要看曲线得按 `input_fp` 重跑 |
 | `snapshot` | v0.4 | 引擎状态快照，非 Parquet（JSON / gob） |
 
 ### 8.1 加密货币当前不写的表

@@ -99,6 +99,9 @@ type EngineCfg struct {
 	// ImplySplitFromFactor 指针是为了区分「没写」与「显式写了 false」，
 	// 默认 true（约 6,770 个因子事件缺分红记录，不处理会失真）
 	ImplySplitFromFactor *bool `json:"imply_split_from_factor,omitempty"`
+	// TradeFrom 这一天之前只喂指标不交易（YYYYMMDD，0 表示不设限）。
+	// 供 Walk-Forward 的预热前缀使用，见 engine.Config.TradeFrom
+	TradeFrom int32 `json:"trade_from,omitempty"`
 }
 
 // MetricsCfg 绩效参数。

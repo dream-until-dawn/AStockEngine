@@ -296,6 +296,7 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 		InitialCashCents:     c.Portfolio.InitialCashCents,
 		DividendTaxPPM:       c.Portfolio.DividendTaxPPM,
 		ImplySplitFromFactor: implySplit,
+		TradeFrom:            c.Engine.TradeFrom,
 	})
 }
 

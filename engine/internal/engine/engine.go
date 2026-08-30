@@ -31,6 +31,15 @@ type Config struct {
 	// 完全不处理会让这些日期出现「价格跳变但账户没变」的失真。
 	// 这是有损近似，Portfolio 会逐条留痕。
 	ImplySplitFromFactor bool
+	// TradeFrom 这一天之前只喂指标不交易（YYYYMMDD，0 表示不设限）。
+	//
+	// 为 Walk-Forward 而加：窗口切开后每段开头的指标是**未预热**的
+	// （MACD(26) 要 26 根 bar 才就绪），不处理的话每个窗口的头一个月
+	// 被系统性地削掉信号 —— 那在 18 个窗口上是一致的**偏差**，不是噪声。
+	//
+	// 于是子集多裁一段预热前缀，前缀期内照常喂指标、处理公司行动、
+	// 撮合在途单，只是不产生新的信号与订单。
+	TradeFrom int32
 }
 
 // Engine 是回测的核心状态机。
@@ -251,19 +260,24 @@ func (e *Engine) Step() (mktdata.TimePoint, error) {
 		e.peakEquity = e.stepEquity
 	}
 
-	// 6. 策略 —— 只出信号
-	sigs, err := e.strategy.OnBar(e.ctx)
-	if err != nil {
-		return tp, fmt.Errorf("策略在 %d 报错: %w", tp.TradingDay, err)
+	// 6~8 只在 TradeFrom 之后执行。预热期照常走完 2~5
+	// （指标、公司行动、撮合、重估）—— 撮合也要走，否则预热期跨过来的
+	// 在途单会永远挂着
+	if e.cfg.TradeFrom == 0 || tp.TradingDay >= e.cfg.TradeFrom {
+		// 6. 策略 —— 只出信号
+		sigs, err := e.strategy.OnBar(e.ctx)
+		if err != nil {
+			return tp, fmt.Errorf("策略在 %d 报错: %w", tp.TradingDay, err)
+		}
+		e.signals = append(e.signals, sigs...)
+
+		// 7. Sizer 折算数量
+		orders := e.sizer.Size(sigs, e.ctx)
+		e.sized = append(e.sized, orders...)
+
+		// 8. Risk 把关、定价入队；可在本时点成交的立即撮合
+		e.enqueue(orders, tp)
 	}
-	e.signals = append(e.signals, sigs...)
-
-	// 7. Sizer 折算数量
-	orders := e.sizer.Size(sigs, e.ctx)
-	e.sized = append(e.sized, orders...)
-
-	// 8. Risk 把关、定价入队；可在本时点成交的立即撮合
-	e.enqueue(orders, tp)
 
 	// 9. 记录。**放在最后** —— 盘后定价的单会在第 8 步就成交，
 	//    提前记会漏掉它们

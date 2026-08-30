@@ -20,7 +20,6 @@ import (
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/config"
 	eng "github.com/dream-until-dawn/AStockEngine/engine/internal/engine"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/fingerprint"
-	"github.com/dream-until-dawn/AStockEngine/engine/internal/metrics"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/record"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 
@@ -181,7 +180,7 @@ func main() {
 		fmt.Println("  海选内层用 none 省内存；要看指标请改成 summary。")
 		fmt.Println()
 	} else {
-		printReport(computeMetrics(cfg, ds, rec, e.Market()))
+		printReport(config.ComputeMetrics(cfg, ds, rec, e.Market()))
 	}
 
 	if ds := discl; len(ds) > 0 {
@@ -287,34 +286,6 @@ func printModules() {
 	show("slippage", trading.Slippages.Names(), trading.Slippages.Specs)
 	show("fee", trading.Fees.Names(), trading.Fees.Specs)
 	show("strategy", eng.Strategies.Names(), eng.Strategies.Specs)
-}
-
-// computeMetrics 把记录喂给绩效模块。
-//
-// 年化系数**问 Market 要**，不是写死 252 —— 252 是美股惯例，
-// A 股由日历实测约 242.90 天，24×7 的加密是 365。
-func computeMetrics(cfg *config.Config, ds *config.DataSet, rec record.Recorder,
-	mkt trading.Market) metrics.Result {
-	m, _ := rec.(*record.Memory)
-	days, eq := m.Curve()
-	in := metrics.Input{
-		Curve:        metrics.Curve{Days: days, Equity: eq},
-		InitialCents: cfg.Portfolio.InitialCashCents,
-		Fills:        rec.Fills(),
-		RiskFreePPM:  cfg.Metrics.RiskFreePPM,
-	}
-	var from, to int32
-	if len(days) > 0 {
-		from, to = days[0], days[len(days)-1]
-	}
-	// 年化系数问 Market，不再写死 A 股 —— 见 trading.Market.AnnualDays
-	in.TradingDaysPerYear = mkt.AnnualDays(ds.Calendar, from, to)
-
-	if bd, be, ok := ds.BenchmarkCurve(); ok {
-		in.Benchmark = &metrics.Curve{Days: bd, Equity: be}
-		in.BenchmarkName = cfg.Metrics.Benchmark
-	}
-	return metrics.Compute(in)
 }
 
 func writeCurve(path string, curve []record.Step) error {
