@@ -168,7 +168,11 @@ func (r *Result) fillAttribution(e *eng.Engine, m metrics.Result) {
 	by := m.Trades.CloseBy
 	r.Liquidations = int32(by[trading.TagLiquidation])
 	r.HaltExits = int32(by["drawdown_halt"])
-	r.StopExits = int32(by["stop_loss"] + by["trailing_stop"])
+	// **策略自己的止损也要算进来。** 只数风控引擎那两个 tag 的话，
+	// 网格海选里「止损 0 轮」会一直挂着 —— 而那不是「止损没触发」，
+	// 是「这一列压根没在看网格的止损」。止损线定在哪是海选要回答的问题之一，
+	// 答不了的话那个轴就成了摆设
+	r.StopExits = int32(by["stop_loss"] + by["trailing_stop"] + by["grid_stop"])
 
 	if m.InitialCents > 0 {
 		r.FrictionRatio = float64(m.FeeCents+m.SlippageCents) / float64(m.InitialCents)

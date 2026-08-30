@@ -26,8 +26,25 @@ type Job struct {
 	From, To int32
 	// TradeFrom 这天之前只喂指标不交易
 	TradeFrom int32
-	// CashCents 非 0 时覆盖初始资金 —— 噪声探针靠它扰动
-	CashCents int64
+	// CashPPM 非 0 时把初始资金按百万分之 CashPPM 缩放 —— 噪声探针靠它扰动。
+	//
+	// **是倍率不是绝对值。** 从前这里是绝对的分数，而调用方写的是一个
+	// 硬编码的 100_000_000（100 万元）—— 于是基准配置写 10 万本金时，
+	// 噪声探针实际是在 100 万本金下跑的，量出来的基线根本不属于
+	// 它要去衡量的那批结果。A 股 5 元最低佣金下这两档差着一个数量级。
+	//
+	// 用倍率还顺带解决另一件事：初始资金本身可以是网格的一个轴
+	// （「本金够不够大」正是要扫的东西），绝对值会把那个轴覆盖掉
+	CashPPM int64
+	// Symbol 非空时把标的池换成这一只，并把基准也设成它自己。
+	//
+	// **这是「按标的海选」那个模式**：重复的维度不是时间窗口而是标的。
+	// 目标不是「在某只标的上最优」，而是「在任意一只上都还行」——
+	// 于是中位数与四分位距要在**标的之间**取，而不是在窗口之间取。
+	//
+	// 单标的的基准就是它自己：跟大盘比没有意义，
+	// 要答的是「这套网格参数比一直拿着强多少」
+	Symbol string
 }
 
 // buildConfig 把 Job 的区间与扰动写进参数组的配置。
@@ -37,6 +54,19 @@ func (j Job) buildConfig(dir string) (*config.Config, error) {
 		return nil, err
 	}
 	set := func(path string, v any) error { return setPath(obj, path, v) }
+	if j.Symbol != "" {
+		// 标的池整个换掉而不是往里加 —— 按标的海选时每次只跑一只
+		uni, _ := obj["data"].(map[string]any)
+		if uni == nil {
+			return nil, fmt.Errorf("基准配置缺少 data 段")
+		}
+		uni["universe"] = map[string]any{"symbols": []any{j.Symbol}}
+		if m, ok := obj["metrics"].(map[string]any); ok {
+			m["benchmark"] = j.Symbol
+		} else {
+			obj["metrics"] = map[string]any{"benchmark": j.Symbol}
+		}
+	}
 	if j.From != 0 {
 		if err := set("data.from", json.Number(fmt.Sprint(j.From))); err != nil {
 			return nil, err
@@ -66,11 +96,17 @@ func (j Job) buildConfig(dir string) (*config.Config, error) {
 		}
 		engObj["trade_from"] = json.Number(fmt.Sprint(j.TradeFrom))
 	}
-	if j.CashCents != 0 {
-		if err := set("portfolio.initial_cash_cents",
-			json.Number(fmt.Sprint(j.CashCents))); err != nil {
-			return nil, err
+	if j.CashPPM != 0 {
+		pf, _ := obj["portfolio"].(map[string]any)
+		if pf == nil {
+			return nil, fmt.Errorf("基准配置缺少 portfolio 段")
 		}
+		cur, ok := toInt64(pf["initial_cash_cents"])
+		if !ok {
+			return nil, fmt.Errorf("portfolio.initial_cash_cents 不是整数")
+		}
+		pf["initial_cash_cents"] = json.Number(
+			fmt.Sprint(cur * j.CashPPM / 1_000_000))
 	}
 	b, err := json.Marshal(obj)
 	if err != nil {

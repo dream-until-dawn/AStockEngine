@@ -1,0 +1,75 @@
+{
+  "name": "A 股 ETF 网格 · 海选基准（池含全部候选，逐只由海选覆盖）",
+  "data": {
+    "root": "../../../data",
+    "market": "ashare",
+    "freq": "1d",
+    "from": 20170803,
+    "to": 0,
+    "universe": {
+      "symbols": [
+        "510050",
+        "510300",
+        "510500",
+        "512100",
+        "159915",
+        "512880",
+        "512800",
+        "512010",
+        "518880",
+        "159941",
+        "159920",
+        "513050"
+      ]
+    }
+  },
+  "market": {
+    "impl": "ashare"
+  },
+  "fee": {
+    "impl": "config",
+    "params": {
+      "path": "../../fee/ashare_default.json"
+    }
+  },
+  "slippage": {
+    "impl": "fixed_bps",
+    "params": {
+      "bps": 5
+    }
+  },
+  "portfolio": {
+    "initial_cash_cents": 10000000,
+    "ledger": "spot"
+  },
+  "broker": {
+    "volume_cap_ppm": 100000,
+    "allow_partial_fill": true
+  },
+  "metrics": {
+    "benchmark": "510050",
+    "risk_free_ppm": 0
+  },
+  "recorder": {
+    "level": "summary"
+  },
+  "strategy": {
+    "impl": "grid",
+    "params": {
+      "levels": 5,
+      "step_pct": 5,
+      "stop_levels": 2,
+      "short": 0
+    }
+  },
+  "sizer": {
+    "impl": "pct_equity",
+    "params": {
+      "pct": 95,
+      "base": "cost",
+      "max_positions": 1
+    }
+  },
+  "risk": [],
+  "exit": []
+}

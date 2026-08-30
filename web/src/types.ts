@@ -666,6 +666,20 @@ export interface SweepTop {
 export interface SweepAnalysis {
   sweepId: string
   name: string
+  /**
+   * 重复维度的名字：「窗口」或「标的」。
+   *
+   * 跨窗口问「换个时期还成立吗」，跨标的问「换一只标的还成立吗」——
+   * 用同一个词会让人把两者读混。
+   */
+  repeatLabel: string
+  /**
+   * 收益数字的口径：「收益」或「超额」。
+   *
+   * 按标的海选时是**超额**（相对买入持有同一只标的）。
+   * 把 −3.5% 的超额印成「收益」，就是把跑输买入持有显示成赚钱。
+   */
+  metricLabel: string
   rows: number
   failed: number
   gated: number
@@ -681,6 +695,8 @@ export interface SweepAnalysis {
   attribution: SweepAttribution
   margins: SweepMargin[]
   plateaus: SweepPlateau[]
+  /** 这次实际用的高原判据（按标的与按窗口两套不同，不能在前端写死） */
+  plateauCriteria?: string
   plateauNote?: string
   top: SweepTop[]
 }

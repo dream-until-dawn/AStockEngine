@@ -120,6 +120,10 @@ type Noise struct {
 // 对每个 (参数组, 窗口) 算一次标准差，然后**取中位数**汇总 ——
 // 用中位数不用均值：个别组的扰动可能碰上极端级联，
 // 让它把整个基线抬起来，会使后面的「不可分辨」判定过于宽松。
+//
+// **不需要区分绝对/超额口径**：一组探针是同一参数、同一标的、同一区间，
+// 基准收益在组内是常数，减掉常数不改变标准差与极差。
+// 所以这条基线对两种口径通用，Judge 的比值也就仍是同一个量纲。
 func MeasureNoise(rows []Result) Noise {
 	type key struct {
 		param  int32
@@ -195,8 +199,30 @@ type ParamAgg struct {
 	Gated int
 }
 
-// Aggregate 按参数组汇总正式行（Probe==0）。
-func Aggregate(rows []Result, gate Gate, rank string) map[int32]*ParamAgg {
+// 拿哪一列当「这一次的结果」。
+//
+// **按标的海选时必须用超额**：单标的网格的基准就是一直拿着这只标的，
+// 问题是「这套网格比买入持有强多少」。用绝对收益的话排出来的第一名
+// 是「哪只 ETF 九年涨得多」—— 那跟参数一点关系都没有。
+//
+// 实测的样子：绝对收益口径下 levels、step_pct、stop_levels 三个轴
+// 全都指向「少交易、多持有、别止损」，中位数 +33%；
+// 换成超额口径，同一批结果的中位数是 **−3.5%**，
+// 赢面 45% —— 也就是这套网格整体上跑输买入持有。
+const (
+	MetricTotal  = "total"  // 绝对收益
+	MetricExcess = "excess" // 超额收益（相对基准）
+)
+
+func metricOf(r Result, metric string) float64 {
+	if metric == MetricExcess {
+		return r.ExcessReturn
+	}
+	return r.TotalReturn
+}
+
+// Aggregate 按参数组汇总正式行（Probe==0）。metric 选 MetricTotal / MetricExcess。
+func Aggregate(rows []Result, gate Gate, rank, metric string) map[int32]*ParamAgg {
 	out := map[int32]*ParamAgg{}
 	get := func(r Result) *ParamAgg {
 		a, ok := out[r.ParamID]
@@ -217,14 +243,14 @@ func Aggregate(rows []Result, gate Gate, rank string) map[int32]*ParamAgg {
 			continue
 		}
 		if r.Phase == phaseIS {
-			a.IS = append(a.IS, r.TotalReturn)
+			a.IS = append(a.IS, metricOf(r, metric))
 			continue
 		}
 		if !r.Passes(gate) {
 			a.Gated++
 			continue
 		}
-		a.OOS = append(a.OOS, r.TotalReturn)
+		a.OOS = append(a.OOS, metricOf(r, metric))
 		scores[r.ParamID] = append(scores[r.ParamID], r.Score(rank))
 	}
 	// 一组参数至少要在**多少个窗口**里活下来，才配参与排名。
@@ -339,13 +365,37 @@ type Plateau struct {
 type PlateauCriteria struct {
 	MinNeighbors int
 	MinPosRatio  float64
-	// MaxFlatVsNoise IQR 相对噪声基线的上限
+	// MaxFlatVsNoise IQR 相对噪声基线的上限。**0 表示不卡这一条** ——
+	// 按标的海选时跨标的的离散天然就大，卡它等于永远过不了
 	MaxFlatVsNoise float64
 }
 
 // DefaultCriteria 见 DESIGN-v0.5-selection.md §6.2。
+//
+// 这一套是给**按时间窗口**的海选用的：同一组参数在不同时期的结果
+// 本来就该差不多，差太多说明它挑时候。所以 IQR 要压在噪声的几倍以内。
 func DefaultCriteria() PlateauCriteria {
 	return PlateauCriteria{MinNeighbors: 6, MinPosRatio: 0.6, MaxFlatVsNoise: 3.0}
+}
+
+// PerSymbolCriteria 是**按标的**海选用的判据。
+//
+// # 为什么不能用同一套
+//
+// 跨标的的离散**天然就大**：黄金 ETF 与创业板 ETF 九年下来收益差几倍，
+// 那是标的本身的差别，不是参数不稳。拿「IQR ≤ 3× 噪声」去卡，
+// 等于要求一组参数在黄金和创业板上给出几乎相同的收益 ——
+// 那永远过不了，而且过不了也说明不了任何事。
+//
+// 按标的问的是另一个问题：「换一只标的还成立吗」。它的直接度量是
+// **正的比例**（几乎每只都赚钱）与**下四分位**（最差的那批也不亏）——
+// 而不是「各只之间接近」。
+//
+//	MinPosRatio 0.75  四分之三以上的标的要赚钱
+//	MinQ1       0     下四分位也要非负 —— 最差那批标的不能亏
+//	MaxFlatVsNoise 0  关掉离散判据（理由如上）
+func PerSymbolCriteria() PlateauCriteria {
+	return PlateauCriteria{MinNeighbors: 4, MinPosRatio: 0.75, MaxFlatVsNoise: 0}
 }
 
 // FindPlateaus 找出满足判据的区域，按邻域 Score 中位数降序。
@@ -389,7 +439,11 @@ func FindPlateaus(
 		if p.Median <= 0 || p.PosRatio < c.MinPosRatio {
 			continue
 		}
-		if n.StdDev > 0 && p.FlatVsNoise > c.MaxFlatVsNoise {
+		// MaxFlatVsNoise = 0 表示关掉这条判据。
+		// 按标的海选时跨标的的离散天然就大（黄金 ETF 与创业板 ETF
+		// 九年下来收益差几倍，那是标的的差别不是参数不稳），
+		// 卡它等于永远过不了，而且过不了也说明不了任何事
+		if c.MaxFlatVsNoise > 0 && n.StdDev > 0 && p.FlatVsNoise > c.MaxFlatVsNoise {
 			continue // 邻居之间差异远大于噪声 —— 不是平地，是斜坡
 		}
 		out = append(out, p)

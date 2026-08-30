@@ -123,7 +123,7 @@ function Verdict({ a }: { a: SweepAnalysis }) {
         <div className="card">
           <div className="k">全网格散布</div>
           <div className="v">{ppAbs(v.spread)}%</div>
-          <div className="n">逐参数 OOS 中位数的标准差 · {v.params} 组参与</div>
+          <div className="n">逐参数{a.metricLabel}中位数的标准差 · {v.params} 组参与</div>
         </div>
         <div className="card">
           <div className="k">比值</div>
@@ -168,8 +168,8 @@ function GateHealth({
     <div className="panel" style={{ marginTop: 14 }}>
       <h3>② 门槛校准得对不对</h3>
       <p className="note">
-        硬门槛「每个样本外窗口的完整轮次 ≥ <strong>{gate.min_round_trips}</strong>」。
-        定得比典型窗口的轮次还高的话，绝大多数参数组会因窗口覆盖不足退出排名，
+        硬门槛「每个{a.repeatLabel}的完整轮次 ≥ <strong>{gate.min_round_trips}</strong>」。
+        定得比典型轮次还高的话，绝大多数参数组会因覆盖不足退出排名，
         而下面每个数字都只算在活下来的那个子集上。
       </p>
       <div className="cards">
@@ -185,17 +185,17 @@ function GateHealth({
           <div className={`v ${a.thinWarn ? 'down' : ''}`}>
             {a.thinParams} / {a.params}
           </div>
-          <div className="n">{pct.toFixed(0)}% · 窗口覆盖不足 60%</div>
+          <div className="n">{pct.toFixed(0)}% · {a.repeatLabel}覆盖不足 60%</div>
         </div>
         <div className="card">
-          <div className="k">窗口数</div>
+          <div className="k">{a.repeatLabel}数</div>
           <div className="v">{a.windows}</div>
           <div className="n">少于 6 个时中位数与四分位距没有意义</div>
         </div>
       </div>
       {a.thinWarn && (
         <div className="error" style={{ marginTop: 10 }}>
-          <strong>⚠ 这个比例偏高，门槛多半相对窗口长度定得太严。</strong>
+          <strong>⚠ 这个比例偏高，门槛多半相对单次回测长度定得太严。</strong>
           <div style={{ marginTop: 6 }}>
             下面的排名与逐维边际都只算在活下来的那些组上，
             <strong>是一个偏窄且未必有代表性的子集</strong>。
@@ -289,17 +289,17 @@ function Margins({ a }: { a: SweepAnalysis }) {
     <div className="panel" style={{ marginTop: 14 }}>
       <h3>④ 哪个轴有用</h3>
       <p className="note">
-        把参数按某一维的取值分组，各看各的 OOS 中位数。它答不了「哪片区域稳健」，
+        把参数按某一维的取值分组，各看各的{a.metricLabel}中位数。它答不了「哪片区域稳健」，
         但答得了「这个轴有没有用、往哪边用」——
         <strong>子树开关这类非数值轴只有这一个视图</strong>，高原分析对它们无能为力。
         跨度小于噪声基线（{ppAbs(a.noise.range)}%）的标成惰性。
       </p>
-      {a.margins.map((m) => <MarginRow key={m.axis} m={m} />)}
+      {a.margins.map((m) => <MarginRow key={m.axis} m={m} metricLabel={a.metricLabel} />)}
     </div>
   )
 }
 
-function MarginRow({ m }: { m: SweepMargin }) {
+function MarginRow({ m, metricLabel }: { m: SweepMargin; metricLabel: string }) {
   const meds = m.values.map((v) => v.median)
   const lo = Math.min(...meds)
   const hi = Math.max(...meds)
@@ -308,7 +308,7 @@ function MarginRow({ m }: { m: SweepMargin }) {
     <div style={{ marginTop: 12 }}>
       <div className="k">
         <span className="mono">{m.axis}</span>
-        <span className="muted"> —— 跨度 {ppAbs(m.spread)}%</span>
+        <span className="muted"> —— {metricLabel}中位数，跨度 {ppAbs(m.spread)}%</span>
         {m.inert && <span className="tag" style={{ marginLeft: 6 }}>惰性</span>}
       </div>
       <table style={{ width: '100%', marginTop: 4 }}>
@@ -360,7 +360,7 @@ function Plateaus({ a }: { a: SweepAnalysis }) {
               <div className="k">
                 #{i + 1} 邻居 {p.neighbors} 个 · 样本 {p.samples}
                 <span className={p.median >= 0 ? 'up' : 'down'} style={{ marginLeft: 10 }}>
-                  OOS 中位数 {pp(p.median)}%
+                  {a.metricLabel}中位数 {pp(p.median)}%
                 </span>
                 <span className="muted" style={{ marginLeft: 10 }}>
                   四分位 [{pp(p.q1)}, {pp(p.q3)}]% · 正的比例 {(p.posRatio * 100).toFixed(0)}%
@@ -374,8 +374,7 @@ function Plateaus({ a }: { a: SweepAnalysis }) {
       ) : (
         <>
           <p className="note">
-            没有区域同时满足全部判据（邻居 ≥ 6、邻域 OOS 中位数 &gt; 0、
-            正的比例 ≥ 60%、IQR ≤ 3× 噪声）。
+            没有区域同时满足{a.plateauCriteria ?? '全部判据'}。
             <strong>这是一个结论，不是一次失败</strong> ——
             说明网格里没有稳健的参数区域，排名第一那组多半是尖峰。
           </p>
@@ -385,14 +384,14 @@ function Plateaus({ a }: { a: SweepAnalysis }) {
           {a.plateauNote && !a.plateauNote.startsWith('没有区域') && (
             <p className="note">⚠ {a.plateauNote}</p>
           )}
-          <TopTable rows={a.top} />
+          <TopTable rows={a.top} a={a} />
         </>
       )}
     </div>
   )
 }
 
-function TopTable({ rows }: { rows: SweepTop[] }) {
+function TopTable({ rows, a }: { rows: SweepTop[]; a: SweepAnalysis }) {
   if (rows.length === 0) return null
   return (
     <>
@@ -403,11 +402,11 @@ function TopTable({ rows }: { rows: SweepTop[] }) {
       <table style={{ width: '100%', marginTop: 6 }}>
         <thead>
           <tr>
-            <th style={{ width: 90 }}>OOS 中位数</th>
+            <th style={{ width: 90 }}>{a.metricLabel}中位数</th>
             <th style={{ width: 120 }}>四分位</th>
             <th style={{ width: 70 }}>正的比例</th>
-            <th style={{ width: 60 }}>窗口</th>
-            <th style={{ width: 130 }}>逐窗</th>
+            <th style={{ width: 60 }}>{a.repeatLabel}</th>
+            <th style={{ width: 130 }}>逐{a.repeatLabel}</th>
             <th>参数</th>
           </tr>
         </thead>

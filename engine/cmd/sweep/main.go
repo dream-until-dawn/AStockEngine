@@ -125,7 +125,31 @@ func main() {
 		ds.Stats.Instruments, ds.Stats.Rows, len(days),
 		days[0], days[len(days)-1], loadDur.Round(time.Millisecond))
 
-	windows, err := sweep.MakeWindows(days, sc.WalkForward, annual)
+	// 按标的海选：重复的维度是**标的**而不是时间窗口。
+	//
+	// 每只标的一个「批次」，跑整段数据。中位数与四分位距因此在标的之间取 ——
+	// 答的是「换一只标的还成立吗」，而不是「换一个时期还成立吗」。
+	var windows []sweep.Window
+	if len(sc.PerSymbol) > 0 {
+		if len(sc.PerSymbol) < sweep.DefaultMinWindows {
+			fatal(fmt.Errorf("按标的海选只给了 %d 只标的，少于下限 %d —— "+
+				"三五只标的上的中位数与四分位距没有意义，"+
+				"而报告照样会印出一个中位数",
+				len(sc.PerSymbol), sweep.DefaultMinWindows))
+		}
+		for i := range sc.PerSymbol {
+			windows = append(windows, sweep.Window{
+				Index: int16(i), DataFrom: days[0],
+				OOSFrom: days[0], OOSTo: days[len(days)-1],
+			})
+		}
+		fmt.Printf("按标的海选 %d 只（不切时间窗口）：%v\n",
+			len(sc.PerSymbol), sc.PerSymbol)
+		fmt.Printf("  每只跑整段 %d~%d，基准是它自己\n",
+			days[0], days[len(days)-1])
+		goto sized
+	}
+	windows, err = sweep.MakeWindows(days, sc.WalkForward, annual)
 	if err != nil {
 		fatal(err)
 	}
@@ -148,10 +172,11 @@ func main() {
 			last.Index, last.ISFrom, last.ISTo, last.OOSFrom, last.OOSTo)
 	}
 
+sized:
 	// ---- 规模 ----
 	probes := probePoints(sets, sc.NoiseProbe)
 	perWindow := len(sets)
-	if sc.WalkForward.Enabled {
+	if sc.WalkForward.Enabled && len(sc.PerSymbol) == 0 {
 		perWindow *= 2 // IS + OOS
 	}
 	total := perWindow*len(windows) + len(probes)*sc.NoiseProbe.Repeats*len(windows)
@@ -196,6 +221,7 @@ func main() {
 	mf := &sweep.Manifest{
 		SweepID: sweepID, Name: sc.Name, Base: sc.BasePath(),
 		Config: sc, Windows: windows, AnnualDays: annual,
+		PerSymbol: sc.PerSymbol,
 	}
 	for _, ps := range sets {
 		mf.Params = append(mf.Params, sweep.ManifestParam{
@@ -211,8 +237,12 @@ func main() {
 		if done[w.Index] {
 			continue
 		}
-		jobs := buildJobs(sets, probes, w, sc)
-		wds := narrowFor(ds, baseCfg, w)
+		sym := ""
+		if len(sc.PerSymbol) > 0 && int(w.Index) < len(sc.PerSymbol) {
+			sym = sc.PerSymbol[w.Index]
+		}
+		jobs := buildJobs(sets, probes, w, sc, sym)
+		wds := narrowFor(ds, baseCfg, w, sym)
 
 		t := time.Now()
 		var fails int
@@ -245,17 +275,20 @@ func main() {
 
 // buildJobs 展开一个窗口内的全部 Job。
 func buildJobs(
-	sets []sweep.ParamSet, probes []sweep.ParamSet, w sweep.Window, sc *sweep.Config,
+	sets []sweep.ParamSet, probes []sweep.ParamSet, w sweep.Window,
+	sc *sweep.Config, sym string,
 ) []sweep.Job {
 	jobs := make([]sweep.Job, 0, len(sets)*2+len(probes)*sc.NoiseProbe.Repeats)
-	add := func(ps sweep.ParamSet, phase, probe int8, from, to, tradeFrom int32, cash int64) {
+	add := func(ps sweep.ParamSet, phase, probe int8, from, to, tradeFrom int32, cashPPM int64) {
 		jobs = append(jobs, sweep.Job{
 			Param: ps, Window: w.Index, Phase: phase, Probe: probe,
-			From: from, To: to, TradeFrom: tradeFrom, CashCents: cash,
+			From: from, To: to, TradeFrom: tradeFrom, CashPPM: cashPPM,
+			Symbol: sym,
 		})
 	}
+	perSymbol := sym != ""
 	for _, ps := range sets {
-		if sc.WalkForward.Enabled {
+		if sc.WalkForward.Enabled && !perSymbol {
 			add(ps, 0, 0, w.DataFrom, w.ISTo, w.ISFrom, 0)
 			// OOS 的数据从 DataFrom 起（含 IS 段做预热），
 			// 但 TradeFrom 是 OOSFrom —— 样本内那段只喂指标不交易。
@@ -269,9 +302,8 @@ func buildJobs(
 	// 噪声探针只跑 OOS —— 基线是用来跟 OOS 的散布比的
 	for _, ps := range probes {
 		for i := 1; i <= sc.NoiseProbe.Repeats; i++ {
-			cash := perturbCash(100_000_000, sc.NoiseProbe.PerturbPct, i,
-				sc.NoiseProbe.Repeats)
-			if sc.WalkForward.Enabled {
+			cash := perturbPPM(sc.NoiseProbe.PerturbPct, i, sc.NoiseProbe.Repeats)
+			if sc.WalkForward.Enabled && !perSymbol {
 				add(ps, 1, int8(i), w.DataFrom, w.OOSTo, w.OOSFrom, cash)
 			} else {
 				add(ps, 1, int8(i), w.OOSFrom, w.OOSTo, 0, cash)
@@ -281,19 +313,19 @@ func buildJobs(
 	return jobs
 }
 
-// perturbCash 把初始资金在 ±pct% 内均匀取第 i 个点。
+// perturbPPM 把初始资金的**倍率**在 ±pct% 内均匀取第 i 个点（百万分之一）。
 //
 // 用初始资金做扰动的理由：要的是「经济上无意义、但会改变执行路径」的量。
 // 引擎里没有随机数（C5），种子无从扰动；改起始日会改变样本区间，
 // 那是真差异；改滑点是改成本模型，属于参数。
 // 只有初始资金既不改规则也不改样本，只改每一单的取整。
-func perturbCash(base int64, pct float64, i, n int) int64 {
+func perturbPPM(pct float64, i, n int) int64 {
 	if n <= 1 {
-		return base
+		return 1_000_000
 	}
 	// i 从 1 到 n，映射到 [−pct, +pct]
 	frac := -1.0 + 2.0*float64(i-1)/float64(n-1)
-	return base + int64(float64(base)*pct/100.0*frac)
+	return 1_000_000 + int64(1_000_000*pct/100.0*frac)
 }
 
 // probePoints 选噪声探针的代表点：网格的首、尾、中，以及四分位处。
@@ -319,10 +351,22 @@ func probePoints(sets []sweep.ParamSet, np sweep.NoiseProbe) []sweep.ParamSet {
 }
 
 // narrowFor 为一个窗口裁一份子集，**整个窗口内的全部参数组共用它**。
-func narrowFor(ds *config.DataSet, base *config.Config, w sweep.Window) *config.DataSet {
+func narrowFor(
+	ds *config.DataSet, base *config.Config, w sweep.Window, sym string,
+) *config.DataSet {
+
 	ids, err := base.ResolveUniverse(ds.Universe, ds.Adjuster)
 	if err != nil {
 		return ds
+	}
+	var benchID mktdata.InstrumentID
+	if sym != "" {
+		// 按标的海选时只留这一只 —— 一个批次里全部参数组跑的都是它，
+		// 裁到一只之后每次回测快一个数量级
+		if in := ds.Universe.BySymbol(sym); in != nil {
+			ids = []mktdata.InstrumentID{in.ID}
+			benchID = in.ID
+		}
 	}
 	to := w.OOSTo
 	sub, err := ds.Columns.Subset(ids, w.DataFrom, to)
@@ -331,6 +375,24 @@ func narrowFor(ds *config.DataSet, base *config.Config, w sweep.Window) *config.
 	}
 	out := *ds // 浅拷贝：Columns 之外的字段本来就是只读共享的
 	out.Columns = sub
+	// **基准必须在这里换成这只标的自己。**
+	//
+	// 基准曲线是**载数据时一次性绑在 DataSet 上**的（LoadDataSet →
+	// SetBenchmark），每个 Job 的 metrics.benchmark 改的只是那份 JSON，
+	// 到不了这里 —— 于是 12 只 ETF 全都在跟基准配置里写的 510050 比。
+	//
+	// 实测的样子：12 只标的算出来的「基准收益」一模一样都是 +32.32%，
+	// 而 excess_return 因此全无意义。**它不报错，只是安静地答非所问**：
+	// 「这套网格比一直拿着这只 ETF 强多少」被悄悄换成了
+	// 「比一直拿着上证 50 强多少」。
+	//
+	// 这里是每批一份的浅拷贝，worker 只读，所以就地改是安全的。
+	if benchID != 0 {
+		out.HasBenchmark, out.BenchDays, out.BenchEquity = false, nil, nil
+		if !out.SetBenchmark(sub, benchID) {
+			return ds
+		}
+	}
 	return &out
 }
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"time"
 )
 
@@ -39,7 +40,11 @@ type Manifest struct {
 	Windows []Window `json:"windows"`
 	// AnnualDays 年化系数，按市场取出来的那个
 	AnnualDays float64 `json:"annual_days"`
-	CreatedAt  string  `json:"created_at"`
+	// PerSymbol 非空时这是一次**按标的海选**：重复的维度是标的而不是窗口。
+	// 报告与界面据此把「窗口」这个词换成「标的」——
+	// 两者的中位数意思完全不同，用同一个词会让人读错
+	PerSymbol []string `json:"per_symbol,omitempty"`
+	CreatedAt string   `json:"created_at"`
 }
 
 // ManifestParam 一组参数在清单里的样子。
@@ -103,6 +108,18 @@ type Analysis struct {
 	SweepID string `json:"sweepId"`
 	Name    string `json:"name"`
 
+	// RepeatLabel 重复维度的名字：「窗口」或「标的」。
+	//
+	// **两者的中位数意思完全不同**：跨窗口问「换个时期还成立吗」，
+	// 跨标的问「换一只标的还成立吗」。用同一个词会让人读错。
+	RepeatLabel string `json:"repeatLabel"`
+
+	// MetricLabel 每个收益数字是什么口径：「收益」或「超额」。
+	//
+	// **按标的海选时是超额**。把 −3.5% 的超额印成「收益」，
+	// 就是把一个跑输买入持有的结论显示成赚钱的结论
+	MetricLabel string `json:"metricLabel"`
+
 	Rows    int `json:"rows"`
 	Failed  int `json:"failed"`
 	Gated   int `json:"gated"`
@@ -126,6 +143,13 @@ type Analysis struct {
 
 	// Margins 逐维边际。**非数值轴只有这一个视图**
 	Margins []AxisMargin `json:"margins"`
+
+	// PlateauCriteria 这次实际用的判据，写成一句人话。
+	//
+	// **不能在前端写死。** 按标的海选与按窗口海选用的是两套判据
+	// （前者不卡离散度），前端印一句写死的「IQR ≤ 3× 噪声」，
+	// 就是在告诉人一个没被执行过的判据
+	PlateauCriteria string `json:"plateauCriteria,omitempty"`
 
 	// Plateaus 稳健区域。为空时 PlateauNote 说明为什么
 	Plateaus    []Plateau `json:"plateaus"`
@@ -188,9 +212,18 @@ type TopParam struct {
 // 顺序即可信度链条：不先量噪声，后面的排名就没有意义；
 // 判定说没意义时，再漂亮的排名也是幻觉。
 func Analyze(rows []Result, sets []ParamSet, sc *Config, sweepID, name string) Analysis {
+	mlabel := "收益"
+	if sc.MetricOf() == MetricExcess {
+		mlabel = "超额"
+	}
+	label := "窗口"
+	if len(sc.PerSymbol) > 0 {
+		label = "标的"
+	}
 	a := Analysis{
-		SweepID: sweepID, Name: name, Rows: len(rows),
-		FailBy: map[string]int{}, GateBy: map[string]int{},
+		SweepID: sweepID, Name: name, Rows: len(rows), RepeatLabel: label,
+		MetricLabel: mlabel,
+		FailBy:      map[string]int{}, GateBy: map[string]int{},
 		// 空切片而不是 nil —— nil 序列化成 JSON null，
 		// 前端每处都得先判空，漏一处就是一个运行时错误
 		Plateaus: []Plateau{}, Margins: []AxisMargin{}, Top: []TopParam{},
@@ -216,7 +249,7 @@ func Analyze(rows []Result, sets []ParamSet, sc *Config, sweepID, name string) A
 	a.Windows = len(wins)
 
 	a.Noise = MeasureNoise(rows)
-	aggs := Aggregate(rows, sc.Gate, sc.Rank)
+	aggs := Aggregate(rows, sc.Gate, sc.Rank, sc.MetricOf())
 	a.Params = len(aggs)
 	for _, g := range aggs {
 		if g.ThinCoverage {
@@ -248,7 +281,20 @@ func Analyze(rows []Result, sets []ParamSet, sc *Config, sweepID, name string) A
 	// **不能直接赋值** —— FindPlateaus 没找到时返回 nil，
 	// 会把上面初始化的空切片盖掉，序列化又变回 JSON null。
 	// 初始化非 nil 只在「没人再赋值」时才有效，这就是那个反例
-	if ps := FindPlateaus(geom, aggs, a.Noise, DefaultCriteria(), sc.Rank); ps != nil {
+	// 按标的海选换一套判据 —— 跨标的的离散天然就大，
+	// 用跨时间那套的「IQR ≤ 3× 噪声」永远过不了
+	crit := DefaultCriteria()
+	if len(sc.PerSymbol) > 0 {
+		crit = PerSymbolCriteria()
+	}
+	a.PlateauCriteria = fmt.Sprintf("邻居 ≥ %d、邻域中位数 > 0、正的比例 ≥ %.0f%%",
+		crit.MinNeighbors, crit.MinPosRatio*100)
+	if crit.MaxFlatVsNoise > 0 {
+		a.PlateauCriteria += fmt.Sprintf("、IQR ≤ %.1f× 噪声基线", crit.MaxFlatVsNoise)
+	} else {
+		a.PlateauCriteria += "（按标的海选，不卡离散度）"
+	}
+	if ps := FindPlateaus(geom, aggs, a.Noise, crit, sc.Rank); ps != nil {
 		a.Plateaus = ps
 	}
 	if len(a.Plateaus) == 0 {
@@ -293,6 +339,24 @@ func attribution(rows []Result) Attribution {
 //
 // 高原要「邻居」，邻居要求维度是有序的数。子树开关这类非数值轴
 // 会让几何反推整个失败 —— 边际视图不需要有序，是它们唯一的视图。
+// SortAxisKeys 数值轴按数排，非数值轴按字典序。
+//
+// 全按字典序的话 levels 会印成 **12, 3, 5, 8** —— 一个单调的轴看上去
+// 像在乱跳，而「往哪边调」正是逐维边际唯一要回答的问题。
+func SortAxisKeys(keys []string) {
+	for _, k := range keys {
+		if _, err := strconv.ParseFloat(k, 64); err != nil {
+			sort.Strings(keys)
+			return
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		a, _ := strconv.ParseFloat(keys[i], 64)
+		b, _ := strconv.ParseFloat(keys[j], 64)
+		return a < b
+	})
+}
+
 func axisMargins(aggs map[int32]*ParamAgg, sets []ParamSet, n Noise) []AxisMargin {
 	byID := make(map[int32]map[string]any, len(sets))
 	axes := map[string]bool{}
@@ -329,7 +393,7 @@ func axisMargins(aggs map[int32]*ParamAgg, sets []ParamSet, n Noise) []AxisMargi
 		for k := range groups {
 			keys = append(keys, k)
 		}
-		sort.Strings(keys)
+		SortAxisKeys(keys)
 
 		m := AxisMargin{Axis: ax}
 		lo, hi := 0.0, 0.0

@@ -31,8 +31,25 @@ func ppAbs(v float64) string {
 // **顺序就是结论的可信度链条**：不先量噪声，后面的排名就没有意义；
 // 判定说没意义时，再漂亮的排名也是幻觉。
 func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
+	// 重复维度的名字：跨窗口问「换个时期还成立吗」，跨标的问
+	// 「换一只标的还成立吗」—— 用同一个词会让人把两者读混
+	unit := "窗口"
+	if len(sc.PerSymbol) > 0 {
+		unit = "标的"
+	}
+	// mlabel 每个数字到底是什么。**按标的海选时是超额而不是绝对收益** ——
+	// 印成「收益 +33%」而实际是「比一直拿着这只 ETF 多 −3.5%」，
+	// 那是把一个亏损的结论印成了赚钱的结论
+	mlabel := "收益"
+	if sc.MetricOf() == sweep.MetricExcess {
+		mlabel = "超额"
+	}
 	fmt.Println()
 	fmt.Println("================ 海选结果 ================")
+	if mlabel == "超额" {
+		fmt.Println("下面所有的收益数字都是**超额**：这套参数比一直拿着同一只标的多赚多少。")
+		fmt.Println("正数才叫「这个策略有用」；绝对收益再高，跑不赢买入持有也没有意义。")
+	}
 
 	var failed, gated int
 	gateBy := map[string]int{}
@@ -66,15 +83,15 @@ func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
 		fmt.Println("  ⚠ 没有噪声探针数据 —— 无法判断任何差异是不是真的。")
 		fmt.Println("    在海选配置里给 noise_probe.points ≥ 2 且 repeats ≥ 2。")
 	} else {
-		fmt.Printf("  同一组参数、同一窗口，仅把初始资金扰动 ±%.2f%%，重复 %d 次：\n",
-			sc.NoiseProbe.PerturbPct, n.Repeats)
+		fmt.Printf("  同一组参数、同一%s，仅把初始资金扰动 ±%.2f%%，重复 %d 次：\n",
+			unit, sc.NoiseProbe.PerturbPct, n.Repeats)
 		fmt.Printf("  收益标准差 %s 个百分点，极差 %s 个百分点（%d 组样本）\n",
 			ppAbs(n.StdDev), ppAbs(n.Range), n.Samples)
 		fmt.Println("  这是「什么都没改」时结果本身的抖动 —— 小于它的差异不可分辨。")
 	}
 
 	// ---- 2. 这次海选有没有意义 ----
-	aggs := sweep.Aggregate(rows, sc.Gate, sc.Rank)
+	aggs := sweep.Aggregate(rows, sc.Gate, sc.Rank, sc.MetricOf())
 	v := sweep.Judge(aggs, n)
 	var thin, total int
 	for _, a := range aggs {
@@ -92,9 +109,9 @@ func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
 		// 把门槛降到 10 之后，同样两个轴都是活的。
 		// 那个错误结论没有任何地方报错，它只是看上去很确定。
 		fmt.Println()
-		fmt.Printf("  ⚠ %d / %d 组（%.0f%%）因窗口覆盖不足退出排名 —— "+
-			"这个比例偏高，\n     多半是硬门槛（完整轮次 ≥ %d）相对窗口长度定得太严。\n",
-			thin, total, float64(thin)/float64(total)*100, sc.Gate.MinRoundTrips)
+		fmt.Printf("  ⚠ %d / %d 组（%.0f%%）因%s覆盖不足退出排名 —— "+
+			"这个比例偏高，\n     多半是硬门槛（完整轮次 ≥ %d）相对单次回测长度定得太严。\n",
+			thin, total, float64(thin)/float64(total)*100, unit, sc.Gate.MinRoundTrips)
 		fmt.Println("     下面的排名与逐维边际都只算在活下来的那些组上，" +
 			"**是一个偏窄且未必有代表性的子集**。")
 		fmt.Println("     先看一次全样本回测的完整轮次 ÷ 年数，" +
@@ -106,9 +123,9 @@ func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
 		//
 		// 实测这一条把散布削掉三成到六成 —— 也就是说，之前那部分
 		// 「参数有影响」其实是一两个走运窗口贡献的
-		fmt.Printf("\n  %d / %d 组参数活下来的窗口不足 %.0f%%，不参与排名 ——\n"+
-			"  只在一两个窗口里过了门槛的话，它的 OOS 中位数就是那一两次的运气\n",
-			thin, total, float64(sweep.MinWindowCoveragePPM)/10_000)
+		fmt.Printf("\n  %d / %d 组参数活下来的%s不足 %.0f%%，不参与排名 ——\n"+
+			"  只在一两个%s里过了门槛的话，它的中位数就是那一两次的运气\n",
+			thin, total, unit, float64(sweep.MinWindowCoveragePPM)/10_000, unit)
 	}
 	fmt.Println("\n=== 2. 参数到底有没有影响 ===")
 	fmt.Printf("  全网格逐参数 OOS 中位数的标准差  %s 个百分点\n", ppAbs(v.Spread))
@@ -137,7 +154,7 @@ func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
 	// **放在高原之前**：高原要「邻居」，而邻居要求维度是有序的数。
 	// 子树开关这类非数值轴会让几何反推整个失败，
 	// 放在后面的话它们连一个数字都拿不到
-	printAxisMargins(aggs, sets)
+	printAxisMargins(aggs, sets, mlabel)
 
 	// ---- 4. 高原 ----
 	geom, err := sweep.BuildGrid(sets)
@@ -145,17 +162,34 @@ func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
 		fmt.Printf("\n  ⚠ 网格几何反推失败（%v）—— 跳过高原分析\n", err)
 		return
 	}
+	// 按标的海选时**必须换判据**：跨标的的离散天然就大 —— 黄金 ETF 与
+	// 创业板 ETF 九年下来收益差几倍，那是标的本身的差别，不是参数不稳。
+	// 拿「IQR ≤ 3× 噪声」去卡，等于要求同一组参数在黄金和创业板上给出
+	// 几乎相同的收益，那永远过不了，而且过不了也说明不了任何事。
 	crit := sweep.DefaultCriteria()
+	if len(sc.PerSymbol) > 0 {
+		crit = sweep.PerSymbolCriteria()
+	}
 	ps := sweep.FindPlateaus(geom, aggs, n, crit, sc.Rank)
 	fmt.Println("\n=== 3. 稳健参数区域 ===")
-	fmt.Printf("  判据：邻居 ≥ %d、邻域 OOS 中位数 > 0、正的比例 ≥ %.0f%%、"+
-		"IQR ≤ %.1f× 噪声基线\n", crit.MinNeighbors, crit.MinPosRatio*100,
-		crit.MaxFlatVsNoise)
+	if crit.MaxFlatVsNoise > 0 {
+		fmt.Printf("  判据：邻居 ≥ %d、邻域中位数 > 0、正的比例 ≥ %.0f%%、"+
+			"IQR ≤ %.1f× 噪声基线\n", crit.MinNeighbors, crit.MinPosRatio*100,
+			crit.MaxFlatVsNoise)
+	} else {
+		fmt.Printf("  判据：邻居 ≥ %d、邻域中位数 > 0、正的比例 ≥ %.0f%%\n",
+			crit.MinNeighbors, crit.MinPosRatio*100)
+		fmt.Printf("  （按%s海选，不卡离散度 —— 标的之间收益差几倍是标的的事，"+
+			"不是参数不稳）\n", unit)
+	}
 	if len(ps) == 0 {
 		fmt.Println("\n  没有区域同时满足这几条。")
 		fmt.Println("  **这是一个结论，不是一次失败** —— 说明网格里没有稳健的参数区域，")
 		fmt.Println("  排名第一那组多半是尖峰。")
 		printTopAnyway(aggs, sc, "没有一片区域够稳健，单点排名不可依赖")
+		// 逐标的表在这条路上**更该印**：没有稳健区域时，人下一步一定会去
+		// 看那几个排名靠前的单点，而那张表正是用来说明它们为什么靠不住的
+		printPerSymbol(rows, aggs, sc, nil)
 		return
 	}
 	fmt.Printf("\n  找到 %d 片区域，按邻域 %s 中位数降序（前 %d 片）：\n\n",
@@ -166,13 +200,148 @@ func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
 		}
 		fmt.Printf("  #%d  邻居 %d 个 / 样本 %d\n", i+1, p.Neighbors, p.Samples)
 		fmt.Printf("      中心参数 %s\n", p.Params)
-		fmt.Printf("      OOS 中位数 %s%%   四分位 [%s, %s]%%   正的比例 %.0f%%\n",
+		fmt.Printf("      中位数 %s%%   四分位 [%s, %s]%%   正的比例 %.0f%%\n",
 			pp(p.Median), pp(p.Q1), pp(p.Q3), p.PosRatio*100)
 		fmt.Printf("      IQR %s 个百分点 = %.2f× 噪声基线 %s\n\n",
 			ppAbs(p.IQR), p.FlatVsNoise, flatNote(p.FlatVsNoise))
 	}
 	fmt.Println("  **注意这里给的是区域不是排名。** 每片区域的中心参数只是坐标，")
 	fmt.Println("  真正的结论是「这一带整体表现如何」—— 单点估计在噪声下没有意义。")
+	printPerSymbol(rows, aggs, sc, ps)
+}
+
+// printPerSymbol 把最好的几组参数摊开成「每只标的一列」。
+//
+// # 为什么中位数不够
+//
+// 「在任意标的下都足够优秀」这句话，中位数答不了。中位数 +5% 可能是
+// 「12 只里每只都 +5%」，也可能是「6 只 +40%、6 只 −30%」——
+// 前者可以直接用，后者是在赌自己挑对了标的。
+//
+// 这张表把两者分开：**看的是最差那一只**。一组参数在 11 只上很好、
+// 在第 12 只上 −50%，它就不是一组「放到任意标的上都行」的参数。
+func printPerSymbol(
+	rows []sweep.Result, aggs map[int32]*sweep.ParamAgg,
+	sc *sweep.Config, ps []sweep.Plateau,
+) {
+	if len(sc.PerSymbol) == 0 {
+		return
+	}
+	// paramID → 窗口号 → 该标的上的结果
+	byParam := map[int32]map[int16]float64{}
+	// 每只标的的买入持有收益。**这一列不能省**：超额是两个收益的差，
+	// 而九年里 4~5 倍的行情会让这个差达到几百个百分点 ——
+	// 「−413%」孤零零地印出来读起来像亏了 4 倍，
+	// 实际是「买入持有 +420%，这套网格约 +6%」
+	bench := map[int16]float64{}
+	for _, r := range rows {
+		if r.Probe != 0 || r.Err != "" || r.Phase != 1 {
+			continue
+		}
+		m := byParam[r.ParamID]
+		if m == nil {
+			m = map[int16]float64{}
+			byParam[r.ParamID] = m
+		}
+		if sc.MetricOf() == sweep.MetricExcess {
+			m[r.Window] = r.ExcessReturn
+		} else {
+			m[r.Window] = r.TotalReturn
+		}
+		if r.HasBenchmark {
+			bench[r.Window] = r.TotalReturn - r.ExcessReturn
+		}
+	}
+
+	// 候选：高原中心优先（它们才是「区域」而不是尖峰），
+	// 没有高原就退回按分数取前几名 —— 那种时候这张表尤其要印
+	var cand []*sweep.ParamAgg
+	seen := map[int32]bool{}
+	for _, p := range ps {
+		for _, a := range aggs {
+			if a.Params == p.Params && !seen[a.ParamID] {
+				seen[a.ParamID] = true
+				cand = append(cand, a)
+			}
+		}
+		if len(cand) >= 5 {
+			break
+		}
+	}
+	if len(cand) == 0 {
+		list := make([]*sweep.ParamAgg, 0, len(aggs))
+		for _, a := range aggs {
+			if a.Windows > 0 && !a.ThinCoverage {
+				list = append(list, a)
+			}
+		}
+		sort.Slice(list, func(i, j int) bool {
+			if list[i].Score != list[j].Score {
+				return list[i].Score > list[j].Score
+			}
+			return list[i].ParamID < list[j].ParamID
+		})
+		for i, a := range list {
+			if i >= 5 {
+				break
+			}
+			cand = append(cand, a)
+		}
+	}
+	if len(cand) == 0 {
+		return
+	}
+
+	fmt.Println("\n=== 4. 逐标的：这套参数在每一只上分别怎么样 ===")
+	fmt.Println("  中位数会把「每只都还行」和「一半大赚一半大亏」印成同一个数字。")
+	fmt.Println("  **要看的是最差那一只** —— 它才是「放到任意标的上」的下限。")
+	fmt.Println()
+	fmt.Printf("  %-10s %10s", "标的", "买入持有")
+	for i := range cand {
+		fmt.Printf(" %9s", fmt.Sprintf("#%d", i+1))
+	}
+	fmt.Println()
+	for w, sym := range sc.PerSymbol {
+		fmt.Printf("  %-10s %9s%%", sym, pp(bench[int16(w)]))
+		for _, a := range cand {
+			if v, ok := byParam[a.ParamID][int16(w)]; ok {
+				fmt.Printf(" %8s%%", pp(v))
+			} else {
+				fmt.Printf(" %9s", "—")
+			}
+		}
+		fmt.Println()
+	}
+	fmt.Printf("  %-10s %10s", "最差", "")
+	for _, a := range cand {
+		worst, any := 0.0, false
+		for w := range sc.PerSymbol {
+			if v, ok := byParam[a.ParamID][int16(w)]; ok && (!any || v < worst) {
+				worst, any = v, true
+			}
+		}
+		if any {
+			fmt.Printf(" %8s%%", pp(worst))
+		} else {
+			fmt.Printf(" %9s", "—")
+		}
+	}
+	fmt.Println()
+	fmt.Printf("  %-10s %10s", "赢的只数", "")
+	for _, a := range cand {
+		win := 0
+		for w := range sc.PerSymbol {
+			if v, ok := byParam[a.ParamID][int16(w)]; ok && v > 0 {
+				win++
+			}
+		}
+		fmt.Printf(" %6d/%2d", win, len(sc.PerSymbol))
+	}
+	fmt.Println()
+	fmt.Println()
+	for i, a := range cand {
+		fmt.Printf("  #%d  %s\n", i+1, a.Params)
+	}
 }
 
 func flatNote(r float64) string {
@@ -204,13 +373,17 @@ func printTopAnyway(aggs map[int32]*sweep.ParamAgg, sc *sweep.Config, why string
 		}
 		return list[i].ParamID < list[j].ParamID
 	})
+	unit := "窗口"
+	if len(sc.PerSymbol) > 0 {
+		unit = "标的"
+	}
 	fmt.Printf("\n  （以下按分数排前 5，仅供参考 —— %s）\n", why)
 	for i, a := range list {
 		if i >= 5 {
 			break
 		}
-		fmt.Printf("    %s  OOS 中位数 %s%%  正的比例 %.0f%%  %d 窗口\n",
-			a.Params, pp(a.Median), a.PosRatio*100, a.Windows)
+		fmt.Printf("    %s  中位数 %s%%  正的比例 %.0f%%  %d 个%s\n",
+			a.Params, pp(a.Median), a.PosRatio*100, a.Windows, unit)
 	}
 }
 
@@ -339,7 +512,7 @@ func printAttribution(rows []sweep.Result, sc *sweep.Config) {
 //
 // 边际视图不需要有序：把参数按这一维的取值分组，各看各的中位数。
 // 它答不了「哪片区域稳健」，但答得了「这个轴有没有用、往哪边用」。
-func printAxisMargins(aggs map[int32]*sweep.ParamAgg, sets []sweep.ParamSet) {
+func printAxisMargins(aggs map[int32]*sweep.ParamAgg, sets []sweep.ParamSet, mlabel string) {
 	// 每组参数的取值表：param_id → {轴 → 取值}。
 	// ParamSet.Values 就是这张表，不必再从 JSON 解一遍
 	byID := map[int32]map[string]any{}
@@ -359,7 +532,7 @@ func printAxisMargins(aggs map[int32]*sweep.ParamAgg, sets []sweep.ParamSet) {
 	}
 	sort.Strings(names)
 
-	fmt.Println("\n=== 逐维边际（把参数按这一维分组，各看各的 OOS 中位数）===")
+	fmt.Printf("\n=== 逐维边际（把参数按这一维分组，各看各的%s中位数）===\n", mlabel)
 	fmt.Println("  它答不了「哪片区域稳健」，但答得了「这个轴有没有用、往哪边用」——")
 	fmt.Println("  子树开关这类非数值轴只有这一个视图，高原分析对它们无能为力。")
 	for _, ax := range names {
@@ -381,12 +554,12 @@ func printAxisMargins(aggs map[int32]*sweep.ParamAgg, sets []sweep.ParamSet) {
 		for k := range groups {
 			keys = append(keys, k)
 		}
-		sort.Strings(keys)
+		sweep.SortAxisKeys(keys)
 		fmt.Printf("\n  %s\n", ax)
 		for _, k := range keys {
 			v := groups[k]
-			fmt.Printf("    %-28s OOS 中位数 %s%%   （%d 组）\n",
-				k, pp(median(v)), len(v))
+			fmt.Printf("    %-28s %s中位数 %s%%   （%d 组）\n",
+				k, mlabel, pp(median(v)), len(v))
 		}
 	}
 }

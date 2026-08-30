@@ -29,6 +29,7 @@ package sweep
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -50,6 +51,16 @@ type Config struct {
 	// 有 670 万组，全撒一定能找出一组「历史上完美」的参数，而它一文不值。
 	// 先跑可辩护的粗网格，发现高原后再在高原附近加密。
 	Grid map[string]json.RawMessage `json:"grid"`
+	// PerSymbol 非空时切换到**按标的海选**：重复的维度是标的而不是时间窗口。
+	//
+	// 目标不同，所以判据也不同 —— 走时间窗口是问「这组参数在别的时期
+	// 还成立吗」，走标的是问「这组参数换一只标的还成立吗」。
+	// 网格策略要的是后者：它天然是单标的的，而人想知道的是
+	// 「有没有一套层数/间距/止损线，放到任意一只 ETF 上都还行」。
+	//
+	// 设了它就**不再切时间窗口**（walk_forward 会被忽略）——
+	// 两个维度同时重复会让样本数爆炸，而且分不清散布来自哪一边
+	PerSymbol []string `json:"per_symbol,omitempty"`
 	// Constraints 形如 "strategy.params.short < strategy.params.long"
 	Constraints []string    `json:"constraints,omitempty"`
 	WalkForward WalkForward `json:"walk_forward"`
@@ -58,8 +69,25 @@ type Config struct {
 	// Rank 排序指标。默认 excess_over_maxdd ——
 	// 按总收益排会选出高杠杆高回撤的东西
 	Rank string `json:"rank,omitempty"`
+	// Metric 汇总口径："total" 绝对收益 / "excess" 超额收益。
+	//
+	// **按标的海选时默认 excess**：基准就是这只标的自己，
+	// 问的是「这套参数比一直拿着强多少」。用绝对收益的话，
+	// 排出来的第一名只是「哪只标的涨得多」，与参数无关
+	Metric string `json:"metric,omitempty"`
 
 	dir string
+}
+
+// MetricOf 返回这次海选该用的汇总口径。
+func (c *Config) MetricOf() string {
+	if c.Metric != "" {
+		return c.Metric
+	}
+	if len(c.PerSymbol) > 0 {
+		return MetricExcess
+	}
+	return MetricTotal
 }
 
 // WalkForward 滚动验证的切窗方式。
@@ -554,6 +582,23 @@ func numOf(tok string, vals map[string]any) (float64, bool) {
 	}
 	f, err := strconv.ParseFloat(tok, 64)
 	return f, err == nil
+}
+
+// toInt64 取整数字段。**走 json.Number 而不是 float64** ——
+// 初始资金是「分」，10 亿以上的值过一趟 float64 就不再精确。
+func toInt64(v any) (int64, bool) {
+	switch x := v.(type) {
+	case json.Number:
+		n, err := x.Int64()
+		return n, err == nil
+	case int64:
+		return x, true
+	case int:
+		return int64(x), true
+	case float64:
+		return int64(x), x == math.Trunc(x)
+	}
+	return 0, false
 }
 
 func toFloat(v any) (float64, bool) {

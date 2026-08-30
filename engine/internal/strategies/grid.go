@@ -155,7 +155,15 @@ func (s *Grid) OnBar(ctx eng.StepContext) ([]eng.Signal, error) {
 		// −levels 是满仓位，不是离场位。在满仓那一格就止损的话，
 		// 网格从来没有机会「跌到底再涨回来」—— 那正是它赚钱的方式
 		if s.stopped(base, bar.Close) {
-			s.anchor[id], s.level[id] = bar.Close, 0
+			// **把基准价删掉而不是就地改成现价**：删掉之后下一根 bar 会走
+			// 「第一次见到」那条分支，以那根的收盘价重新定 0 线并重建半仓 ——
+			// 这才是「全平重新建网」。
+			//
+			// 就地改成现价的话档位也是 0、目标也是 0，下一根 want == level
+			// 直接 continue —— 仓位会一直空着，直到价格自己走出一格为止，
+			// 网**再也没被建起来过**
+			delete(s.anchor, id)
+			delete(s.level, id)
 			sigs = append(sigs, eng.Signal{
 				Instrument: id, Kind: eng.SignalExit, Side: s.closeSide(),
 				Tag: "grid_stop",
@@ -239,34 +247,47 @@ func (s *Grid) closeSide() trading.Side {
 
 // targetLevel 由基准价与现价算出应处的档位。
 //
+// # 符号约定：负 = 加仓方向，正 = 减仓方向
+//
+// 做多网格里「跌」是加仓方向，所以跌 3 格是 **−3**；做空网格整个镜像，
+// 「涨」才是加仓方向，涨 3 格才是 −3。这样 target() 的
+// `w = (levels−n) / 2·levels` 对两个方向是同一个公式。
+//
+// **这个符号曾经反过，代价是整个网格跑成了追涨杀跌。**
+// 当时 targetLevel 对做多返回 +3 表示跌了 3 格，而 target() 认为 +3 是
+// 「涨上去该减仓」—— 于是越跌卖得越多。两个函数各自都有单元测试、
+// 各自都过，因为**从来没有一个测试把它们串起来**。
+// 现在 TestGridFallingPriceBuysMore 就是那个串起来的测试。
+//
 // 用**乘法比较**而不是先算涨跌幅再比：定点整数下先除会丢精度，
 // 而档位判断错一格就是一次多余的交易。
 func (s *Grid) targetLevel(base, price int64) int {
 	if base <= 0 {
 		return 0
 	}
+	// up / down：价格朝这个方向走时档位取什么符号。
+	// 做多是「跌了要加仓」，做空是「涨了要加仓」—— 只有这一行的差别
+	up, down := 1, -1
 	if s.short {
-		// 做空：价格**涨**过第 n 格才开空
-		if price <= base {
-			return 0
-		}
+		up, down = -1, 1
+	}
+	if price > base {
 		for n := s.levels; n >= 1; n-- {
 			// price >= base × (1 + n×step)
 			thr := base * (1_000_000 + int64(n)*s.stepPPM) / 1_000_000
 			if price >= thr {
-				return n
+				return up * n
 			}
 		}
 		return 0
 	}
-	if price >= base {
-		return 0
-	}
-	for n := s.levels; n >= 1; n-- {
-		// price <= base × (1 - n×step)
-		thr := base * (1_000_000 - int64(n)*s.stepPPM) / 1_000_000
-		if price <= thr {
-			return n
+	if price < base {
+		for n := s.levels; n >= 1; n-- {
+			// price <= base × (1 - n×step)
+			thr := base * (1_000_000 - int64(n)*s.stepPPM) / 1_000_000
+			if price <= thr {
+				return down * n
+			}
 		}
 	}
 	return 0
