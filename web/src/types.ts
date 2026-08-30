@@ -422,6 +422,12 @@ export interface ModuleCatalog {
   market: ModuleSpec[]
   enums: Record<string, { code: string; label: string }[]>
   notes: Record<string, string>
+  /** 指标目录。规则树的条件从这里取可选列 */
+  indicator: IndicatorKind[]
+  /** 可用作条件左右侧的行情列 */
+  barFields: string[]
+  /** 比较符及其中文名 */
+  cmps: { code: string; label: string }[]
 }
 
 /** 配置里的一个模块槽位：选一个实现 + 给它一段参数。 */
@@ -455,4 +461,49 @@ export interface FeeFile {
   description?: string
   rules: FeeRule[]
   err?: string
+}
+
+// ---- 规则树（决策树策略）----
+//
+// 三棵树：是否买进 / 是否有效 / 是否卖出。
+// 买入 + 有效 → 真实开仓；买入 + 无效 → **虚拟持仓**（不动资金，
+// 但在卖出信号出现前不再触发买入）。
+
+/** IndicatorKind 指标目录里的一种指标。与 K 线视图的 IndicatorSpec 无关 */
+export interface IndicatorKind {
+  name: string
+  desc: string
+  /** 输出字段，如 KDJ 的 ["K","D","J"]。**条件的可选列由它决定** */
+  fields: string[]
+  specs: ParamSpec[]
+}
+
+/** 配置里声明的一个指标实例。name 是用户起的名字，条件按它引用 */
+export interface IndInstance {
+  name: string
+  kind: string
+  params?: Record<string, number>
+}
+
+export interface Operand {
+  kind: 'bar' | 'ind' | 'value'
+  field?: string
+  ind?: string
+  value?: number
+}
+
+/** 树节点：有 op 就是逻辑组，否则是条件 */
+export interface TreeNode {
+  op?: 'and' | 'or' | 'not'
+  children?: TreeNode[]
+  left?: Operand
+  cmp?: string
+  right?: Operand
+}
+
+export interface RuleTreeCfg {
+  indicators: IndInstance[]
+  buy: TreeNode | null
+  valid?: TreeNode | null
+  sell: TreeNode | null
 }

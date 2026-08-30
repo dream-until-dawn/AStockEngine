@@ -677,6 +677,25 @@ func (c *stepCtx) Indicator(id mktdata.InstrumentID, key string) (indicator.Indi
 	return ind, ok
 }
 
+// AdjBar 返回复权后的整根 bar。
+//
+// 与 AdjClose 同源，但条件表达式要用到 open / high / low，
+// 只给收盘价不够。前复权同样被拒 —— 理由见 AdjClose。
+func (c *stepCtx) AdjBar(id mktdata.InstrumentID, mode mktdata.AdjMode) (mktdata.Bar, bool) {
+	bar, ok := c.e.cur.Bar(id)
+	if !ok {
+		return mktdata.Bar{}, false
+	}
+	if mode == mktdata.AdjNone || c.e.adj == nil {
+		return bar, true
+	}
+	if mode == mktdata.AdjQFQ {
+		// 前复权锚定末日，用于决策即构成未来函数（C1）且不可复现（C5）
+		return mktdata.Bar{}, false
+	}
+	return c.e.adj.AdjustBar(id, bar, mode), true
+}
+
 func (c *stepCtx) AdjClose(id mktdata.InstrumentID, back int, mode mktdata.AdjMode) (int64, bool) {
 	if mode == mktdata.AdjQFQ {
 		return 0, false

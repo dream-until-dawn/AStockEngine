@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 
 	eng "github.com/dream-until-dawn/AStockEngine/engine/internal/engine"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/indicator"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/spec"
+	"github.com/dream-until-dawn/AStockEngine/engine/internal/strategies"
 	"github.com/dream-until-dawn/AStockEngine/engine/internal/trading"
 )
 
@@ -81,6 +83,13 @@ func (s *Store) handleModules(w http.ResponseWriter, _ *http.Request) {
 		"slippage": collect(trading.Slippages.Names(), trading.Slippages.Specs, trading.Slippages.Desc),
 		"fee":      collect(trading.Fees.Names(), trading.Fees.Specs, trading.Fees.Desc),
 		"market":   collect(trading.Markets.Names(), trading.Markets.Specs, trading.Markets.Desc),
+		// 指标目录：规则树的条件左右侧从这里取可选列。
+		// **选了哪些指标决定了有哪些列可选** —— 启用 KDJ 才会出现 K/D/J
+		"indicator": indicatorCatalog(),
+		// 规则树能用的行情列与比较符。写在服务端是同一个理由：
+		// 前端抄一份就会分叉
+		"barFields": strategies.BarFields,
+		"cmps":      cmpCatalog(),
 		// 下面几个不是 registry 里的模块，但表单要用到它们的取值域。
 		// 放在同一个响应里，前端就只需要一次请求
 		"enums": map[string]any{
@@ -193,4 +202,39 @@ func (s *Store) handleFees(w http.ResponseWriter, _ *http.Request) {
 		out = append(out, d)
 	}
 	writeJSON(w, map[string]any{"dir": dir, "files": out})
+}
+
+// indicatorCatalog 指标目录，比普通模块多一项 fields（输出字段）。
+//
+// **界面要在用户还没添加指标之前就知道「选 KDJ 会多出 K/D/J」**，
+// 所以字段名必须随目录一起给出，而不是等实例化之后问 Names()。
+func indicatorCatalog() []map[string]any {
+	names := indicator.Kinds()
+	out := make([]map[string]any, 0, len(names))
+	for _, n := range names {
+		specs, _ := indicator.Catalog.Specs(n)
+		dto := make([]paramSpecDTO, 0, len(specs))
+		for _, sp := range specs {
+			dto = append(dto, toSpecDTO(sp))
+		}
+		out = append(out, map[string]any{
+			"name": n, "desc": indicator.Catalog.Desc(n),
+			"fields": indicator.Fields(n), "specs": dto,
+		})
+	}
+	return out
+}
+
+// cmpCatalog 比较符及其中文名。
+func cmpCatalog() []map[string]string {
+	return []map[string]string{
+		{"code": "gt", "label": "大于"},
+		{"code": "gte", "label": "大于等于"},
+		{"code": "lt", "label": "小于"},
+		{"code": "lte", "label": "小于等于"},
+		{"code": "eq", "label": "等于"},
+		{"code": "ne", "label": "不等于"},
+		{"code": "cross_above", "label": "上穿（金叉）"},
+		{"code": "cross_below", "label": "下穿（死叉）"},
+	}
 }

@@ -591,6 +591,14 @@ func buildStrategy(m Module) (eng.Strategy, spec.Params, error) {
 		if err != nil {
 			return nil, nil, err
 		}
+		// 配置是**结构**（规则树）而不是标量的策略走这条路：
+		// 整段 JSON 交给它自己解析，并跳过标量参数校验 —— 它没有 ParamSpec
+		if cs, ok := s.(eng.ConfigurableStrategy); ok {
+			if err := cs.Configure(m.Params); err != nil {
+				return nil, nil, fmt.Errorf("strategy.params: %w", err)
+			}
+			return s, spec.Params{}, nil
+		}
 		specs, _ := eng.Strategies.Specs(m.Impl)
 		p, err := decodeStrategyParams(specs, m.Params)
 		if err != nil {

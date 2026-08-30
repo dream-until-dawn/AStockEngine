@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { runApi } from '../api'
+import RuleTreeEditor, { blankRuleTree } from './RuleTreeEditor'
 import UniversePicker from './UniversePicker'
 import type {
   FeeFile, FeeRule, Meta, ModuleCatalog, ModuleSpec, ModuleValue, ParamSpec, UniverseSpec,
@@ -229,6 +230,7 @@ function StrategySlot({
   onChange: (v: ModuleValue) => void
 }) {
   const isComposite = value.impl === 'composite'
+  const isTree = value.impl === 'rule_tree'
   const sources = value.sources ?? []
   return (
     <>
@@ -254,7 +256,17 @@ function StrategySlot({
         )}
       </div>
 
-      {!isComposite && (
+      {isTree && (
+        <div style={{ marginTop: 8 }}>
+          <RuleTreeEditor
+            cfg={asTree(value.params)}
+            onChange={(c) => onChange({ ...value, params: c as any })}
+            cat={cat}
+          />
+        </div>
+      )}
+
+      {!isComposite && !isTree && (
         <ParamForm
           specs={specsOf(cat.strategy, value.impl)}
           value={value.params ?? {}}
@@ -746,6 +758,11 @@ function defaults(specs: ParamSpec[]): Record<string, unknown> {
 function switchImpl(list: ModuleSpec[], cur: ModuleValue, impl: string): ModuleValue {
   if (cur.impl === impl) return cur
   const next: ModuleValue = { impl, params: defaults(specsOf(list, impl)) }
+  if (impl === 'rule_tree') {
+    // 规则树的配置是结构不是标量，给一份能直接跑的默认（MACD 金叉买死叉卖）
+    next.params = blankRuleTree() as any
+    return next
+  }
   if (impl === 'composite') {
     next.params = undefined
     next.mode = cur.mode ?? 'union'
@@ -782,4 +799,11 @@ function setPath(obj: Cfg, path: string, v: unknown): Cfg {
   }
   cur[parts[parts.length - 1]] = v
   return out
+}
+
+/** asTree 把 params 当规则树读；形状不对时给一份默认，避免编辑器崩在半路。 */
+function asTree(p: unknown): import('../types').RuleTreeCfg {
+  const t = p as import('../types').RuleTreeCfg | undefined
+  if (!t || !Array.isArray(t.indicators) || !t.buy) return blankRuleTree()
+  return t
 }

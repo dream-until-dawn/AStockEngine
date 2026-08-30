@@ -93,11 +93,27 @@ type StepContext interface {
 	// EquityCents 当前总权益（分），按本时点收盘价估值
 	EquityCents() int64
 
+	// AdjBar 按指定方式复权后的整根 bar。
+	//
+	// 规则树的条件里可以写 `close > ma20`，两侧**必须同基准** ——
+	// 拿原始价去和均线比，除权日会凭空产生一次穿越，而那不是行情是分红。
+	// 只给 AdjClose 不够：条件也能引用 open / high / low。
+	AdjBar(id mktdata.InstrumentID, mode mktdata.AdjMode) (mktdata.Bar, bool)
 	// AdjClose 按指定方式复权后的收盘价。
 	//
 	// **拒绝 AdjQFQ**：前复权锚定末日，用于决策即构成未来函数（C1）
 	// 且不可复现（C5）。它只允许出现在展示路径上。
 	AdjClose(id mktdata.InstrumentID, back int, mode mktdata.AdjMode) (int64, bool)
+}
+
+// ConfigurableStrategy 供**配置是结构而非标量**的策略实现。
+//
+// 普通策略的参数是 `map[string]float64`（由 ParamSpec 描述），
+// 规则树的配置是三棵树加一张指标表 —— 那不是标量，塞不进 Params。
+// 实现本接口的策略由装配层直接把整段 JSON 交过来自行解析，
+// **并且跳过标量参数的校验**（它没有 ParamSpec 可校验）。
+type ConfigurableStrategy interface {
+	Configure(raw json.RawMessage) error
 }
 
 // StatefulStrategy 供**确有跨步状态**的策略实现。

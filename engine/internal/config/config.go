@@ -287,8 +287,13 @@ func (c *Config) Validate() error {
 	if c.Data.Univers.Limit < 0 {
 		return fmt.Errorf("data.universe.limit 不能为负")
 	}
-	// 策略参数按 Specs 校验（组合策略的参数在各个源上，已由 validateComposite 查过）
-	if specs, ok := eng.Strategies.Specs(c.Strategy.Impl); ok {
+	// 策略参数按 Specs 校验（组合策略的参数在各个源上，已由 validateComposite 查过）。
+	//
+	// **配置是结构而非标量的策略跳过这一段**：规则树的 params 是
+	// 三棵树加一张指标表，按 map[string]float64 去解必然失败。
+	// 它的校验在 dryBuild 里由 Configure 自己做，而且查得更细
+	// （引用了不存在的指标、字段名写错、比较符不认识都会报出来）
+	if specs, ok := eng.Strategies.Specs(c.Strategy.Impl); ok && !c.strategyIsStructured() {
 		p, err := decodeStrategyParams(specs, c.Strategy.Params)
 		if err != nil {
 			return fmt.Errorf("strategy.params: %w", err)
@@ -333,8 +338,16 @@ func (c *Config) dryBuild() error {
 		}
 	}
 	if c.Strategy.Impl != compositeImpl {
-		if _, err := eng.Strategies.Build(c.Strategy.Impl, nil); err != nil {
+		st, err := eng.Strategies.Build(c.Strategy.Impl, nil)
+		if err != nil {
 			return fmt.Errorf("strategy: %w", err)
+		}
+		// 结构化配置（规则树）也要在这里查一遍 —— 引用了不存在的指标、
+		// 字段名写错、比较符不认识，都该在跑之前失败
+		if cs, ok := st.(eng.ConfigurableStrategy); ok {
+			if err := cs.Configure(c.Strategy.Params); err != nil {
+				return fmt.Errorf("strategy.params: %w", err)
+			}
 		}
 	}
 	return nil
@@ -394,6 +407,19 @@ func parseLevel(s string) (record.Level, error) {
 func (c *Config) Level() record.Level {
 	l, _ := parseLevel(c.Recorder.Level)
 	return l
+}
+
+// strategyIsStructured 报告当前策略的配置是不是「结构」而非标量。
+func (c *Config) strategyIsStructured() bool {
+	if c.Strategy.Impl == compositeImpl {
+		return false
+	}
+	st, err := eng.Strategies.Build(c.Strategy.Impl, nil)
+	if err != nil {
+		return false
+	}
+	_, ok := st.(eng.ConfigurableStrategy)
+	return ok
 }
 
 func decodeStrategyParams(specs []spec.ParamSpec, raw json.RawMessage) (spec.Params, error) {
