@@ -292,15 +292,10 @@ func (c *Config) Assemble(ds *DataSet) (*eng.Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 做空的策略只能配在允许做空的市场上。**必须在这里拦**：
-	// 放过去的话开空信号会被 Sizer 当成减仓、因无多头可减而丢掉，
-	// 一笔成交都不会有，报告上却看不出任何异常
-	if ss, ok := strat.(eng.ShortSeller); ok && ss.NeedsShort() && !market.AllowsShort() {
-		return nil, fmt.Errorf(
-			"策略要开空，但市场规则 %q 不支持做空 —— "+
-				"「仅做空」与「双向持仓」只在支持做空的市场（如 crypto）可用",
-			market.Name())
-	}
+	// 「做空策略不能配在不许做空的市场上」这条守卫**在 eng.New 里**，
+	// 不在这里。这里查过一次，而它是错的：网格这类策略的 short 开关是
+	// Init 时才写进去的，在装配阶段问 NeedsShort() 只能拿到零值 false。
+	// 实测那次静默失效见 engine.go 里那段注释。
 
 	allowPartial := true
 	if c.Broker.AllowPartialFill != nil {

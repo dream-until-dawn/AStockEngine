@@ -172,7 +172,37 @@ func New(d Deps, s Strategy, cfg Config) (*Engine, error) {
 	if err := s.Init(e); err != nil {
 		return nil, fmt.Errorf("策略 %s 初始化失败: %w", s.Name(), err)
 	}
+	if err := checkShortSupport(s, e.market); err != nil {
+		return nil, err
+	}
 	return e, nil
+}
+
+// checkShortSupport 做空的策略只能配在允许做空的市场上。
+//
+// **调用点必须在 Init 之后**，而它曾经在 Init 之前。
+// 多数策略的「要不要做空」是从参数里读出来的（网格的 short 开关），
+// 而参数是 Init 时才写进策略的 —— 在那之前问 NeedsShort()，
+// 拿到的是字段的零值 false，守卫等于不存在。
+//
+// 实测那次静默失效：做空网格配在 A 股上，**信号 606 条、成交 0 笔、
+// 拒单 0 笔、总收益 +0.00%**，全程零报错。开空信号被 Sizer 当成减仓，
+// 而手上没有多头可减，订单就那么没了。
+//
+// 规则树当时没暴露，因为它走 ConfigurableStrategy.Configure ——
+// 那个在装配时就调了。**一个守卫对一半的策略有效，比没有守卫更危险**：
+// 它让人以为这件事被管住了。
+//
+// 抽成独立函数是为了能不造行情就测它 —— 整个测试套件不依赖 data/。
+func checkShortSupport(s Strategy, m trading.Market) error {
+	ss, ok := s.(ShortSeller)
+	if !ok || !ss.NeedsShort() || m == nil || m.AllowsShort() {
+		return nil
+	}
+	return fmt.Errorf(
+		"策略 %s 要开空，但市场规则 %q 不支持做空 —— "+
+			"「仅做空」与「双向持仓」只在支持做空的市场（如 crypto）可用",
+		s.Name(), m.Name())
 }
 
 // ---- InitContext ----

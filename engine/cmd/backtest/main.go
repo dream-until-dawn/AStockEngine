@@ -275,7 +275,17 @@ func printModules() {
 	fmt.Printf("  slippage  %s\n", strings.Join(trading.Slippages.Names(), " / "))
 	fmt.Printf("  sizer     %s\n", strings.Join(trading.Sizers.Names(), " / "))
 	fmt.Printf("  risk      %s\n", strings.Join(trading.Risks.Names(), " / "))
-	fmt.Printf("  strategy  %s\n\n", strings.Join(eng.Strategies.Names(), " / "))
+	fmt.Printf("  strategy  %s\n", strings.Join(eng.Strategies.Names(), " / "))
+	// **离场规则也是一类模块。** 漏掉它的话，「-modules 列出全部可用模块」
+	// 这句话是假的 —— 而人会据此以为止损止盈根本没实现
+	fmt.Printf("  exit      %s\n", strings.Join(trading.Exits.Names(), " / "))
+	// composite 不在注册表里 —— 它由配置层直接装配（它要嵌套的 sources，
+	// 而注册表只认「一个名字 + 一段扁平参数」）。但读这份清单的人不知道
+	// 这个内情，看不见就会以为组合策略没实现，所以在这里点一句
+	fmt.Println("            另有 composite（组合策略，不在注册表里）：" +
+		"strategy.impl 填 composite，用 sources 列出各决策源，" +
+		"mode 取 union / confirm / veto")
+	fmt.Println()
 
 	show := func(kind string, names []string, get func(string) ([]eng.ParamSpec, bool)) {
 		for _, n := range names {
@@ -302,6 +312,7 @@ func printModules() {
 	show("slippage", trading.Slippages.Names(), trading.Slippages.Specs)
 	show("fee", trading.Fees.Names(), trading.Fees.Specs)
 	show("strategy", eng.Strategies.Names(), eng.Strategies.Specs)
+	show("exit", trading.Exits.Names(), trading.Exits.Specs)
 }
 
 func writeCurve(path string, curve []record.Step) error {
