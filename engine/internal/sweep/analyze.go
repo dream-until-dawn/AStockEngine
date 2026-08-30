@@ -152,6 +152,12 @@ func MeasureNoise(rows []Result) Noise {
 }
 
 const (
+	// MinWindowCoveragePPM 参与排名所需的最低窗口覆盖率（百万分之一）。
+	//
+	// 60%：太严会把「只在牛市交易」的策略全筛掉，而那类策略未必是错的；
+	// 太松就等于没设。
+	MinWindowCoveragePPM = 600_000
+
 	phaseIS  int8 = 0
 	phaseOOS int8 = 1
 )
@@ -177,6 +183,14 @@ type ParamAgg struct {
 	// Windows 有效窗口数；Failed 跑失败的窗口数
 	Windows int
 	Failed  int
+	// TotalWindows 这次海选一共切了几个窗口
+	TotalWindows int
+	// ThinCoverage 活下来的窗口太少，**不参与排名**。
+	//
+	// 只在 1 个窗口里过了门槛的参数，它的「OOS 中位数」就是那一个窗口的
+	// 收益 —— 一次运气。让它和跑满 8 个窗口的参数并列，
+	// 排名就变成了「谁运气好」的排名。
+	ThinCoverage bool
 	// Gated 未过硬门槛的窗口数
 	Gated int
 }
@@ -213,8 +227,36 @@ func Aggregate(rows []Result, gate Gate, rank string) map[int32]*ParamAgg {
 		a.OOS = append(a.OOS, r.TotalReturn)
 		scores[r.ParamID] = append(scores[r.ParamID], r.Score(rank))
 	}
+	// 一组参数至少要在**多少个窗口**里活下来，才配参与排名。
+	//
+	// 不设这一条的话，只在 1 个窗口里过了门槛的参数会和跑满 8 个窗口的
+	// 参数并列排名 —— 而前者的「OOS 中位数」就是那一个窗口的收益，
+	// 一次运气而已。实测：三份 A 股海选的前五名全都只有 1 个窗口，
+	// 而且不同参数组的中位数一模一样（它们活下来的是同一个窗口，
+	// 在那个窗口里这些参数根本没起作用）。
+	//
+	// 取窗口总数的 60%：太严会把「只在牛市交易」的策略全筛掉，
+	// 而那类策略未必是错的；太松就等于没设。
+	totalWindows := 0
+	seen := map[int16]bool{}
+	for _, r := range rows {
+		if r.Probe == 0 && r.Phase == phaseOOS && !seen[r.Window] {
+			seen[r.Window] = true
+			totalWindows++
+		}
+	}
+	minWin := (totalWindows*MinWindowCoveragePPM + 999_999) / 1_000_000
+	if minWin < 1 {
+		minWin = 1
+	}
+
 	for id, a := range out {
 		a.Windows = len(a.OOS)
+		a.TotalWindows = totalWindows
+		if a.Windows < minWin {
+			// 窗口太少 —— 留在表里（看得见它被筛掉了），但不参与排名
+			a.ThinCoverage = true
+		}
 		if a.Windows == 0 {
 			continue
 		}
@@ -253,7 +295,7 @@ const MeaningfulThreshold = 1.5
 func Judge(aggs map[int32]*ParamAgg, n Noise) Verdict {
 	meds := make([]float64, 0, len(aggs))
 	for _, a := range aggs {
-		if a.Windows > 0 {
+		if a.Windows > 0 && !a.ThinCoverage {
 			meds = append(meds, a.Median)
 		}
 	}

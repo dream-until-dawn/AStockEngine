@@ -72,6 +72,23 @@ func report(rows []sweep.Result, sets []sweep.ParamSet, sc *sweep.Config) {
 	// ---- 2. 这次海选有没有意义 ----
 	aggs := sweep.Aggregate(rows, sc.Gate, sc.Rank)
 	v := sweep.Judge(aggs, n)
+	var thin, total int
+	for _, a := range aggs {
+		total++
+		if a.ThinCoverage {
+			thin++
+		}
+	}
+	if thin > 0 {
+		// **必须说出来**：被剔掉的那些不是「差」，是「没跑够窗口」。
+		// 不说的话，参与排名的组数会莫名其妙地少一大截。
+		//
+		// 实测这一条把散布削掉三成到六成 —— 也就是说，之前那部分
+		// 「参数有影响」其实是一两个走运窗口贡献的
+		fmt.Printf("\n  %d / %d 组参数活下来的窗口不足 %.0f%%，不参与排名 ——\n"+
+			"  只在一两个窗口里过了门槛的话，它的 OOS 中位数就是那一两次的运气\n",
+			thin, total, float64(sweep.MinWindowCoveragePPM)/10_000)
+	}
 	fmt.Println("\n=== 2. 参数到底有没有影响 ===")
 	fmt.Printf("  全网格逐参数 OOS 中位数的标准差  %s 个百分点\n", ppAbs(v.Spread))
 	fmt.Printf("  噪声基线                        %s 个百分点\n", ppAbs(v.Noise))
@@ -146,7 +163,7 @@ func flatNote(r float64) string {
 func printTopAnyway(aggs map[int32]*sweep.ParamAgg, sc *sweep.Config, why string) {
 	list := make([]*sweep.ParamAgg, 0, len(aggs))
 	for _, a := range aggs {
-		if a.Windows > 0 {
+		if a.Windows > 0 && !a.ThinCoverage {
 			list = append(list, a)
 		}
 	}

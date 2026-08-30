@@ -1,0 +1,62 @@
+{
+  "name": "加密多标的 · 双向规则树 · 熔断轴",
+  "base": "../backtest/crypto_multi_ruletree_hedge.json",
+  "grid": {
+    "strategy.sources[0].params.indicators[0].params.short": [
+      8,
+      12,
+      16
+    ],
+    "strategy.sources[0].params.indicators[0].params.long": [
+      26,
+      34,
+      45
+    ],
+    "strategy.sources[1].params.indicators[0].params.short": [
+      8,
+      12,
+      16
+    ],
+    "strategy.sources[1].params.indicators[0].params.long": [
+      26,
+      34,
+      45
+    ],
+    "risk[0].params.pct": [
+      10,
+      15,
+      25
+    ],
+    "risk[0].params.cooldown_bars": [
+      0,
+      10,
+      20
+    ],
+    "portfolio.leverage": [
+      1,
+      2,
+      3
+    ]
+  },
+  "constraints": [
+    "strategy.sources[0].params.indicators[0].params.short < strategy.sources[0].params.indicators[0].params.long",
+    "strategy.sources[1].params.indicators[0].params.short < strategy.sources[1].params.indicators[0].params.long"
+  ],
+  "walk_forward": {
+    "enabled": true,
+    "is_years": 1.5,
+    "oos_years": 0.5,
+    "step_years": 0.5,
+    "warmup_days": 60,
+    "min_windows": 6
+  },
+  "noise_probe": {
+    "points": 5,
+    "repeats": 5,
+    "perturb_pct": 0.1
+  },
+  "gate": {
+    "min_round_trips": 5
+  },
+  "rank": "excess_over_maxdd"
+}
