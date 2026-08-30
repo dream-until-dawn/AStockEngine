@@ -48,6 +48,17 @@ type Ledger interface {
 	// 浮盈还没落袋，拿它加仓等于用没到手的钱下注。
 	// 已实现的盈亏则照常滚进去（它已经在现金里了）。
 	CostBasisCents() int64
+	// NotionalCapacityCents 这个账户能撑起多大的**名义敞口**。
+	//
+	//	现货   = 已投入本金（没有杠杆，敞口就是本金）
+	//	逐仓   = 已投入本金 × 杠杆
+	//
+	// **它与 CostBasisCents 的区别正是杠杆的意义**：后者是「我投了多少钱」，
+	// 前者是「这些钱能撑多大的仓」。定量按前者切份，才谈得上「用 3 倍敞口」；
+	// 按后者切份的话，杠杆只会让保证金占用变少、闲置现金变多，
+	// 敞口一分都不会变大 —— 实测杠杆 1 到 20，单边成交额从 165,318
+	// 只变到 164,988，而强平从 0 次涨到 139 次。
+	NotionalCapacityCents() int64
 	// EquityCents 按给定标记价重估的总权益
 	EquityCents(marks map[mktdata.InstrumentID]int64) int64
 

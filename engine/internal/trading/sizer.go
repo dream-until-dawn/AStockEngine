@@ -169,9 +169,12 @@ func entrySide(sig Signal, ctx SizeContext) Side {
 
 // sizeBase 按基准口径取出可分配的资金总量。
 //
-//	cost    已投入本金（现金 + 持仓成本）= 权益 − 未实现盈亏
-//	equity  当前权益（浮盈立刻用于加仓）
-//	initial 初始资金（定额下注，不复利）
+//	cost     已投入本金（现金 + 持仓成本）= 权益 − 未实现盈亏
+//	notional 本金 × 杠杆 —— **要让杠杆真的放大敞口，只有这一个选项**。
+//	         其余三个都是本金口径，杠杆只会让保证金占用变少、
+//	         闲置现金变多，敞口一分不变
+//	equity   当前权益（浮盈立刻用于加仓）
+//	initial  初始资金（定额下注，不复利）
 //
 // **默认是 cost**：10000 切 10 份、每份 1000，先买 5 只；这 5 只涨到
 // 11000 之后再买 5 只，仍然是每份 1000 而不是 1100 ——
@@ -179,6 +182,8 @@ func entrySide(sig Signal, ctx SizeContext) Side {
 // 已实现的盈亏照常滚进去（它已经在现金里了）。
 func sizeBase(ctx SizeContext, base string) int64 {
 	switch base {
+	case "notional":
+		return ctx.Ledger().NotionalCapacityCents()
 	case "equity":
 		return ctx.EquityCents()
 	case "initial":
@@ -433,9 +438,10 @@ var equalWeightSpecs = []spec.ParamSpec{
 	{Name: "slots", Kind: spec.ParamInt, Default: 10, Min: 1, Max: 500, Step: 1,
 		Desc: "把资金等分成多少份，同时也是最多持有的标的数"},
 	{Name: "base", Kind: spec.ParamString, DefaultStr: "cost",
-		Options: []string{"cost", "equity", "initial"},
+		Options: []string{"cost", "notional", "equity", "initial"},
 		Desc: "每份的计算基准：" +
 			"cost=已投入本金（现金 + 持仓成本，浮盈不放大后续仓位）；" +
+			"notional=本金 × 杠杆（要让杠杆真的放大敞口就选它，仅保证金账本有别）；" +
 			"equity=当前权益（浮盈立刻用于加仓）；" +
 			"initial=初始资金（定额下注，不复利 —— 旧配置在用，不建议新用）"},
 	{Name: "order_by", Kind: spec.ParamString, DefaultStr: "amount",
@@ -602,9 +608,9 @@ var pctEquitySpecs = []spec.ParamSpec{
 	{Name: "max_positions", Kind: spec.ParamInt, Default: 0, Min: 0, Max: 5000, Step: 1,
 		Desc: "最多同时持有多少只，0 表示不限"},
 	{Name: "base", Kind: spec.ParamString, DefaultStr: "cost",
-		Options: []string{"cost", "equity"},
+		Options: []string{"cost", "notional", "equity"},
 		Desc: "百分比的基准：cost=已投入本金（浮盈不放大后续仓位）；" +
-			"equity=当前权益（浮盈立刻用于加仓）"},
+			"notional=本金 × 杠杆（杠杆放大敞口）；equity=当前权益（浮盈立刻用于加仓）"},
 	{Name: "order_by", Kind: spec.ParamString, DefaultStr: "amount",
 		Options: []string{"amount", "volume", "signal"},
 		Desc: "候选多于空位时先给谁：amount=当日成交额大的优先（默认）；" +
@@ -666,9 +672,9 @@ var strengthWeightedSpecs = []spec.ParamSpec{
 	{Name: "min_strength", Kind: spec.ParamFloat, Default: 0, Min: 0, Max: 1, Step: 0.01,
 		Desc: "低于此信心的信号直接丢弃"},
 	{Name: "base", Kind: spec.ParamString, DefaultStr: "cost",
-		Options: []string{"cost", "equity"},
+		Options: []string{"cost", "notional", "equity"},
 		Desc: "总预算的基准：cost=已投入本金（浮盈不放大后续仓位）；" +
-			"equity=当前权益（浮盈立刻用于加仓）"},
+			"notional=本金 × 杠杆（杠杆放大敞口）；equity=当前权益（浮盈立刻用于加仓）"},
 }
 
 // StrengthWeighted 按信心分配：本步的建仓信号按 Strength 归一化瓜分总预算。

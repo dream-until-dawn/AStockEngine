@@ -270,3 +270,116 @@ func TestBudgetCappedByBuyingPower(t *testing.T) {
 			amount, ctx.pf.BuyingPowerCents())
 	}
 }
+
+// ---- 杠杆要真的放大敞口 ----
+//
+// 杠杆写进配置**不等于**它影响了敞口。四个定量基准里有三个是本金口径
+// （cost / equity / initial），按它们切份的话，杠杆只会让保证金占用变少、
+// 闲置现金变多，**敞口一分不变**。
+//
+// 实测（crypto_hedge，4 槽）：杠杆 1 → 20，单边成交额只从 165,318
+// 变到 164,988，而强平从 0 次涨到 139 次 —— 杠杆全用在「更容易爆」上了。
+
+// TestNotionalCapacityScalesWithLeverage 逐仓账本的敞口上限 = 本金 × 杠杆。
+func TestNotionalCapacityScalesWithLeverage(t *testing.T) {
+	for _, lev := range []int64{1, 2, 3, 10} {
+		m := NewMarginLedger(100_000, lev, 5000)
+		if got, want := m.CostBasisCents(), int64(100_000); got != want {
+			t.Fatalf("杠杆 %d：本金 = %d，想要 %d", lev, got, want)
+		}
+		if got, want := m.NotionalCapacityCents(), 100_000*lev; got != want {
+			t.Errorf("杠杆 %d：敞口上限 = %d，想要 %d", lev, got, want)
+		}
+	}
+}
+
+// TestSpotNotionalCapacityIsCostBasis 现货没有杠杆，敞口上限就是本金。
+func TestSpotNotionalCapacityIsCostBasis(t *testing.T) {
+	pf := NewPortfolio(1_000_000)
+	if pf.NotionalCapacityCents() != pf.CostBasisCents() {
+		t.Errorf("现货的敞口上限应当等于本金")
+	}
+}
+
+// TestBaseNotionalEqualsCostAtLeverageOne 杠杆 1 时 notional 与 cost 必须一模一样。
+//
+// 不一样的话，「换个基准名字」本身就会改变结果 —— 那是两个基准，
+// 不是同一个基准的两种写法。
+func TestBaseNotionalEqualsCostAtLeverageOne(t *testing.T) {
+	mk := func() *fakeSizeCtx {
+		c := newCtx(3, 1_000_000)
+		led := NewMarginLedger(1_000_000, 1, 5000)
+		led.SetValuer(func(_ mktdata.InstrumentID, price, qty int64) int64 {
+			return AmountCents(price, qty)
+		})
+		c.led = led
+		c.mkt = NewCryptoMarket()
+		return c
+	}
+	a := mustSizer(t, "equal_weight",
+		`{"slots":4,"base":"cost","order_by":"signal"}`).Size(enters(1, 2, 3), mk())
+	b := mustSizer(t, "equal_weight",
+		`{"slots":4,"base":"notional","order_by":"signal"}`).Size(enters(1, 2, 3), mk())
+	if len(a) != len(b) {
+		t.Fatalf("笔数不同：cost %d，notional %d", len(a), len(b))
+	}
+	for i := range a {
+		if a[i].Qty != b[i].Qty || a[i].Instrument != b[i].Instrument {
+			t.Fatalf("第 %d 笔不同：cost %+v，notional %+v", i, a[i], b[i])
+		}
+	}
+}
+
+// TestBaseNotionalUsesLeverage 杠杆 3 时每份是本金口径的 3 倍。
+func TestBaseNotionalUsesLeverage(t *testing.T) {
+	mk := func(lev int64) *fakeSizeCtx {
+		c := newCtx(3, 1_000_000)
+		// 申报单位设成 1：100 股一手的话，3 倍预算规整之后不是 3 倍数量
+		// （250→200、750→700，各丢 50），倍数关系会被取整糊掉
+		for i := 1; i <= 3; i++ {
+			c.insts[mktdata.InstrumentID(i)].MinOrderQty = 1
+			c.insts[mktdata.InstrumentID(i)].QtyStep = 1
+		}
+		led := NewMarginLedger(1_000_000, lev, 5000)
+		led.SetValuer(func(_ mktdata.InstrumentID, price, qty int64) int64 {
+			return AmountCents(price, qty)
+		})
+		c.led = led
+		c.mkt = NewCryptoMarket()
+		return c
+	}
+	one := mustSizer(t, "equal_weight",
+		`{"slots":4,"base":"notional","order_by":"signal"}`).Size(enters(1), mk(1))
+	three := mustSizer(t, "equal_weight",
+		`{"slots":4,"base":"notional","order_by":"signal"}`).Size(enters(1), mk(3))
+	if len(one) != 1 || len(three) != 1 {
+		t.Fatalf("都该下出一笔：%+v / %+v", one, three)
+	}
+	if three[0].Qty != one[0].Qty*3 {
+		t.Errorf("杠杆 3 应当开出 3 倍的量：%d vs %d×3", three[0].Qty, one[0].Qty)
+	}
+}
+
+// TestBaseCostIgnoresLeverage 本金口径的基准**不受杠杆影响** —— 这正是问题所在。
+func TestBaseCostIgnoresLeverage(t *testing.T) {
+	mk := func(lev int64) *fakeSizeCtx {
+		c := newCtx(3, 1_000_000)
+		led := NewMarginLedger(1_000_000, lev, 5000)
+		led.SetValuer(func(_ mktdata.InstrumentID, price, qty int64) int64 {
+			return AmountCents(price, qty)
+		})
+		c.led = led
+		c.mkt = NewCryptoMarket()
+		return c
+	}
+	for _, base := range []string{"cost", "initial"} {
+		one := mustSizer(t, "equal_weight",
+			`{"slots":4,"base":"`+base+`","order_by":"signal"}`).Size(enters(1), mk(1))
+		ten := mustSizer(t, "equal_weight",
+			`{"slots":4,"base":"`+base+`","order_by":"signal"}`).Size(enters(1), mk(10))
+		if len(one) != 1 || len(ten) != 1 || one[0].Qty != ten[0].Qty {
+			t.Errorf("base=%s：杠杆不该影响本金口径的份额，得到 %+v / %+v",
+				base, one, ten)
+		}
+	}
+}

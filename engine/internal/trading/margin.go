@@ -262,6 +262,13 @@ func (m *MarginLedger) CostBasisCents() int64 {
 	return v
 }
 
+// NotionalCapacityCents 逐仓：本金 × 杠杆。
+//
+// 这才是「开 3 倍杠杆」在定量上的含义 —— 1000 本金撑 3000 的仓。
+func (m *MarginLedger) NotionalCapacityCents() int64 {
+	return m.CostBasisCents() * m.leverage
+}
+
 // AffordOpen 逐仓：保证金 + 摩擦不得超过**可用余额**。
 //
 // 注意分母是余额而不是购买力：购买力已经把杠杆乘进去了，

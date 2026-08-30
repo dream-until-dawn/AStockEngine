@@ -186,6 +186,9 @@ func (pf *Portfolio) CostBasisCents() int64 {
 	return v
 }
 
+// NotionalCapacityCents 现货没有杠杆，敞口上限就是本金。
+func (pf *Portfolio) NotionalCapacityCents() int64 { return pf.CostBasisCents() }
+
 // AffordOpen 现货：金额 + 摩擦不得超过可动用资金。
 func (pf *Portfolio) AffordOpen(amountCents, frictionCents int64) bool {
 	return amountCents+frictionCents <= pf.BuyingPowerCents()
